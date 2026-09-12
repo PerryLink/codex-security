@@ -8,6 +8,7 @@ import { build } from "esbuild";
 
 const bundle = await build({
   bundle: true,
+  nodePaths: [fileURLToPath(new URL("../node_modules", import.meta.url))],
   entryPoints: [fileURLToPath(new URL("../src/deep-scan/recovery-settings.ts", import.meta.url))],
   platform: "node",
   format: "esm",
