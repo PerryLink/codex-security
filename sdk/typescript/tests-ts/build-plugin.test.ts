@@ -178,6 +178,36 @@ describe("bundled plugin build", () => {
     ]);
     expect(helper.stdout).toBe("[]\n");
     expect(helper.stderr).toBe("");
+    const imported = await execFileAsync(
+      "node",
+      [
+        "--input-type=module",
+        "--eval",
+        `
+        import assert from "node:assert/strict";
+        import { pathToFileURL } from "node:url";
+        const { default: helpers } = await import(pathToFileURL(process.argv[2]).href);
+        const input = {
+          scanId: "synthetic-scan",
+          manifest: { scan: {} },
+          findings: { findings: [] },
+          coverage: {
+            completeness: "complete", surfaces: [], explicitExclusions: [], deferred: [],
+          },
+        };
+        assert.equal(helpers.parseCanonicalScanDraft(input).scanId, input.scanId);
+        assert.throws(() => helpers.parseCanonicalScanDraft({
+          ...input, coverage: { ...input.coverage, completeness: "invalid" },
+        }));
+        assert.equal(process.exitCode, undefined);
+      `,
+        "helper-import-test",
+        join(destination, "helpers.mjs"),
+      ],
+      { cwd: root, env: { ...process.env, NODE_PATH: "" } },
+    );
+    expect(imported.stdout).toBe("");
+    expect(imported.stderr).toBe("");
   });
 
   test("builds from a source snapshot without Git metadata", async () => {
