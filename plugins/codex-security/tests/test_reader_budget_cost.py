@@ -86,3 +86,54 @@ def test_reader_budget_cost_preserves_unknown_totals(
         assert json.loads(saved) == BUDGET_COST
     manifest = json.loads((scan_dir / "scan-manifest.json").read_text())
     assert manifest["scan"]["sealedAt"]
+
+
+@pytest.mark.parametrize("protocol", ["workflow", "selection"])
+def test_reader_budget_rejects_unknown_protocol_before_mutation(
+    workbench_api, monkeypatch, tmp_path, protocol
+):
+    script = str(workbench_api["__file__"])
+    monkeypatch.setattr(workbench_test_support, "SCRIPT", script)
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "home"))
+    state_dir, _, scan_dir, scan_id, _ = budget_scan_fixture(tmp_path)
+    database = state_dir / "workbench.sqlite3"
+    with sqlite3.connect(database) as connection:
+        if protocol == "workflow":
+            connection.execute("UPDATE deep_scan_runs SET workflow_version = 'future/v99'")
+        else:
+            connection.execute(
+                "UPDATE deep_scan_runs SET workflow_version = 'deep-security-scan/v2', "
+                "finalization_input_json = ?",
+                (json.dumps({"version": 99}),),
+            )
+
+    def snapshot():
+        with sqlite3.connect(database) as connection:
+            return list(connection.iterdump()), {
+                str(path.relative_to(scan_dir)): path.read_bytes()
+                for path in scan_dir.rglob("*")
+                if path.is_file()
+            }
+
+    before = snapshot()
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            "-B",
+            script,
+            "complete-budget-exhausted-scan",
+            "--scan-id",
+            scan_id,
+            "--cost-json",
+            json.dumps({"lowerBound": BUDGET_COST}),
+            "--message",
+            BUDGET_WARNING,
+        ],
+        env={**os.environ, "CODEX_SECURITY_STATE_DIR": str(state_dir)},
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode != 0
+    assert "unsupported" in result.stderr.lower()
+    assert snapshot() == before

@@ -1173,9 +1173,11 @@ def complete_budget_exhausted_scan(
         ):
             raise SystemExit("Deep Scan has not exceeded its configured cost limit.")
         run = connection.execute(
-            "SELECT status, terminal_reason, manifest_path FROM deep_scan_runs WHERE scan_id = ?",
+            "SELECT * FROM deep_scan_runs WHERE scan_id = ?",
             (scan_id,),
         ).fetchone()
+        if run is not None:
+            deep_scan.require_supported_deep_scan(run)
         if (
             run is None
             or run["status"] != "succeeded"
