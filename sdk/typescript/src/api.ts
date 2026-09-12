@@ -1960,6 +1960,7 @@ export class CodexSecurity {
           );
         }
         thread = codex.resumeThread(resumeThreadId, threadOptions);
+        observedScanThreadId = resumeThreadId;
         tracker.start(resumeThreadId);
         if (budgetRecovery !== null) budgetRecovery.threadId = resumeThreadId;
         await tracker.refresh().catch(reportTrackingError);
@@ -1983,8 +1984,6 @@ export class CodexSecurity {
       if (postScanPrompt?.trim()) {
         runPostScan = () => thread.runStreamed(postScanPrompt, { signal });
       }
-      observedScanThreadId =
-        typeof resumeThreadId === "string" ? resumeThreadId : undefined;
       const recoverSelectedCompletion = async () => {
         const threadId = observedScanThreadId ?? thread.id;
         if (mode !== "deep" || !threadId || signal.aborted) return null;
@@ -2497,40 +2496,27 @@ export class CodexSecurity {
           return result;
         } catch {}
       }
-      if (
-        activeScan?.mode === "deep" &&
-        options.signal?.aborted &&
-        observedScanThreadId
-      ) {
+      const cancellationThreadId =
+        activeScan?.mode === "deep" && options.signal?.aborted
+          ? observedScanThreadId
+          : undefined;
+      if (activeScan !== null && cancellationThreadId !== undefined) {
         const workbenchOptions = { ...activeScan.options, signal: undefined };
-        if (!selectedDeepFinalization) {
-          const saved = await workbench(workbenchOptions, [
-            "get-deep-scan",
-            "--scan-id",
-            activeScan.id,
-            "--thread-id",
-            observedScanThreadId,
-          ]).catch(() => null);
-          const deep = saved?.["deepScan"];
-          selectedDeepFinalization =
-            isRecord(deep) && isRecord(deep["finalizationInput"]);
-        }
-        if (selectedDeepFinalization) {
-          // The workbench owns the running-state check and repeated cancellation.
-          // A lost cleanup response must preserve the original interruption.
-          await workbench(workbenchOptions, [
-            "cancel-scan",
-            "--scan-id",
-            activeScan.id,
-            "--thread-id",
-            observedScanThreadId,
-          ]).catch(() => undefined);
-        }
+        // The workbench owns the running-state check and repeated cancellation.
+        // Selection may have committed before the SDK received its response.
+        await workbench(workbenchOptions, [
+          "cancel-scan",
+          "--scan-id",
+          activeScan.id,
+          "--thread-id",
+          cancellationThreadId,
+        ]).catch(() => undefined);
       }
       // Publication failures remain resumable. A cost stop or explicit client close
       // still uses the existing failure path to retain partial results and stop work.
       if (
         activeScan !== null &&
+        cancellationThreadId === undefined &&
         ((options.resumeScanId === undefined && !selectedDeepFinalization) ||
           (selectedDeepFinalization &&
             !options.signal?.aborted &&
