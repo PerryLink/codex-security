@@ -134,7 +134,7 @@ async function originalParentSettings(
   }
 }
 
-/** New runs save settings in their creation transaction, before any coordinator claim. */
+/** Read recorded execution settings or original legacy facts. */
 export async function loadDeepScanExecutionSettings(
   scanDir: string,
   original?: Pick<DeepScanRunState, "model" | "reasoningEffort" | "usageOwner" | "createdAt" | "workflowVersion">,
