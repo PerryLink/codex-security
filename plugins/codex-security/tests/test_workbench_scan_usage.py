@@ -668,6 +668,10 @@ def test_completion_counts_deep_sdk_workers_and_descendants(tmp_path: Path) -> N
         "recorded-prefix",
         "current-unreadable",
         "current-mismatched",
+        "external-sqlite",
+        "external-shared-home",
+        "external-missing-copy",
+        "external-missing-child",
         "unavailable",
     ],
 )
@@ -701,6 +705,8 @@ def test_completion_keeps_owner_and_workers_in_their_recorded_homes(
         target = root / "target"
         target.mkdir(parents=True)
         selected_home = current_home if worker_home == "current" else root / "original-home"
+        if worker_home == "external-shared-home":
+            selected_home = tmp_path / "shared-original-home"
         deep = run_workbench(
             root / "state",
             "begin-deep-scan",
@@ -864,6 +870,42 @@ def test_completion_keeps_owner_and_workers_in_their_recorded_homes(
                 recorded_threads,
                 [(f"discovery-{index}", child_id)],
             )
+        elif worker_home in {
+            "external-sqlite",
+            "external-shared-home",
+            "external-missing-copy",
+            "external-missing-child",
+        }:
+            # Native keeps rollouts in its Codex home even when its SQLite
+            # index lives elsewhere and recovery chooses a different index.
+            sessions = selected_home / "sessions" / "2026" / "01" / "01"
+            sessions.mkdir(parents=True, exist_ok=True)
+            for thread_id, path in worker_threads.items():
+                recorded = sessions / f"rollout-{thread_id}.jsonl"
+                path.rename(recorded)
+                worker_threads[thread_id] = recorded
+            _state_graph(
+                {"CODEX_SQLITE_HOME": str(root / "original-external-sqlite")},
+                worker_threads,
+                [(f"discovery-{index}", child_id)],
+            )
+        if worker_home in {"external-missing-copy", "external-missing-child"}:
+            first_id = f"discovery-{index}"
+            with sqlite3.connect(environment["CODEX_STATE_DB"]) as connection:
+                connection.execute(
+                    "INSERT INTO threads VALUES (?, ?)",
+                    (
+                        first_id,
+                        str(root / "missing-copy.jsonl")
+                        if worker_home == "external-missing-copy"
+                        else str(worker_threads[first_id]),
+                    ),
+                )
+                if worker_home == "external-missing-child":
+                    connection.execute(
+                        "INSERT INTO thread_spawn_edges VALUES (?, ?)", (first_id, child_id)
+                    )
+                    worker_threads[child_id].unlink()
         result = _complete_scan(fixture)["scan"]["usage"]
         assert snapshot.read_bytes() == original_bytes
         with sqlite3.connect(fixture.state_dir / "workbench.sqlite3") as connection:
@@ -886,6 +928,20 @@ def test_completion_keeps_owner_and_workers_in_their_recorded_homes(
             assert usage["outputTokens"] == 2
             assert usage["threadCount"] == 1
             assert usage["missingThreadCount"] == 2
+        elif worker_home == "external-missing-child":
+            assert usage == {
+                "coverage": "partial",
+                "source": "codex_rollout",
+                **_counts(index * 70, 0, 12),
+                "threadCount": 3,
+                "missingThreadCount": 1,
+                "warnings": [
+                    "codex_state_unavailable",
+                    "rollout_unavailable",
+                    "scan_root_unavailable",
+                ],
+                "modelUsage": [{"model": None, **_counts(index * 70, 0, 12)}],
+            }
         else:
             assert usage == {
                 "coverage": "complete",
