@@ -137,6 +137,7 @@ from workbench_target_state import backfill_security_targets, ensure_security_ta
 from workbench_validation import (
     bounded_output_text,
     optional_text,
+    parse_budget_scan_cost,
     parse_scan_cost,
     path_within_scope,
     reject_non_finite_json,
@@ -1155,18 +1156,17 @@ def complete_budget_exhausted_scan(
     connection: sqlite3.Connection, args: argparse.Namespace
 ) -> dict[str, Any]:
     scan_id = require_uuid(args.scan_id, "scan-id")
-    cost_json = parse_scan_cost(args.cost_json)
-    if cost_json is None:
-        raise SystemExit("Budget-exhausted scan completion requires the measured scan cost.")
+    cost_json, measured = parse_budget_scan_cost(args.cost_json)
     with scan_completion_lock(scan_id):
         scan = require_scan(connection, scan_id)
         if scan["status"] != "running" or scan["mode"] != "deep" or scan["recipe_json"] is None:
             raise SystemExit("Only a running CLI Deep Scan can complete after its cost limit.")
+        handoff.require_current_continuation(
+            scan, None, error_message="Scan completion is owned by another continuation."
+        )
         recipe = json.loads(scan["recipe_json"], parse_constant=reject_non_finite_json)
         if not isinstance(recipe, dict) or recipe.get("mode") != "deep":
             raise SystemExit("Budget-exhausted scan completion requires a Deep Scan launch recipe.")
-        cost = json.loads(cost_json)
-        measured = cost.get("cost", cost)
         limit = recipe.get("maxCostUsd")
         if (
             not isinstance(limit, (int, float))
@@ -1175,10 +1175,7 @@ def complete_budget_exhausted_scan(
             or measured.get("estimatedUsd", 0) <= limit
         ):
             raise SystemExit("Deep Scan has not exceeded its configured cost limit.")
-        run = connection.execute(
-            "SELECT status, terminal_reason, manifest_path FROM deep_scan_runs WHERE scan_id = ?",
-            (scan_id,),
-        ).fetchone()
+        run = deep_scan.find_supported_deep_scan_run(connection, scan_id)
         if (
             run is None
             or run["status"] != "succeeded"
@@ -1310,7 +1307,10 @@ def budget_exhausted_draft(
             if not isinstance(coverage.get(key), list):
                 raise SystemExit("Budget-exhausted scan contains invalid canonical coverage.")
         if manifest["scan"].get("sealedAt") is not None or manifest["scan"].get("artifacts"):
-            raise SystemExit("Budget-exhausted scan cannot replace an already sealed scan draft.")
+            saved_results.validate_sealed_budget_draft(
+                _WORKBENCH_DB_CONTEXT, scan, scan_dir, manifest
+            )
+            return
     else:
         contract = scan_contract(scan)
         target_contract = contract["target"]
@@ -1444,6 +1444,7 @@ def complete_scan_locked(
 ) -> dict[str, Any]:
     scan = require_scan(connection, scan_id)
     if scan["status"] == "complete":
+        deep_scan.find_supported_deep_scan_run(connection, scan_id)
         scan_dir = require_canonical_scan_directory(Path(scan["scan_dir"]))
         require_recorded_manifest_digest(scan, scan_dir)
         verify_manifest_binding(scan, read_json_object(scan_dir / ARTIFACTS["manifest"]))
@@ -1547,8 +1548,10 @@ def complete_scan_locked(
         wrote = True
         manifest, findings, _ = _write_prepared_scan_finalization(prepared)
     except ContractError as exc:
-        if wrote or (
+        # Replay a validated Deep aggregate after an output write fails.
+        if (wrote and scan["mode"] != "deep") or (
             scan["mode"] == "deep"
+            and not wrote
             and not already_sealed
             and not isinstance(exc, RecoverableContractError)
         ):
@@ -2839,8 +2842,7 @@ def scan_result(
         **scan_usage.stored_scan_cost_fields(scan["cost_json"]),
         "contract": scan_contract(scan),
         "continuationThreadId": scan["continuation_thread_id"],
-        "threadIds": scan_usage._scan_root_thread_ids(connection, scan, None),
-        "executionThreadIds": scan_usage._scan_execution_thread_ids(connection, scan),
+        **scan_usage.scan_execution_fields(connection, scan),
         "failureMessage": scan["failure_message"],
         "findings": [
             finding_result(connection, scan, row, related=relations.get(row["id"], []))
@@ -3402,7 +3404,7 @@ _WORKBENCH_DB_CONTEXT = saved_results.WorkbenchDbContext(
 )
 
 
-def main() -> None:
+def main(*, select_finalization: bool = False) -> None:
     # Workbench callers send UTF-8 even when Windows uses a legacy code page.
     sys.stdin.reconfigure(encoding="utf-8")
     args = parse_args(__doc__)
@@ -3477,7 +3479,7 @@ def main() -> None:
         elif args.command == "commit-deep-scan-dedup":
             result = deep_scan.commit_deep_scan_dedup(connection, args)
         elif args.command == "finish-deep-scan":
-            result = deep_scan.finish_deep_scan(connection, args)
+            result = deep_scan.finish_deep_scan(connection, args, select_finalization)
         elif args.command == "fail-deep-scan":
             result = deep_scan.fail_deep_scan(connection, args)
         elif args.command == "record-deep-scan-publication-failure":
