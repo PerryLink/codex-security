@@ -13,7 +13,7 @@ const bundle = await build({
   format: "esm",
   write: false,
 });
-const { loadOrCaptureDeepScanExecutionSettings } = await import(
+const { loadDeepScanExecutionSettings } = await import(
   `data:text/javascript;base64,${Buffer.from(bundle.outputFiles[0].contents).toString("base64")}`
 );
 
@@ -22,10 +22,9 @@ for (const state of ["absent", "saved", "unsupported"]) {
     const root = await mkdtemp(join(tmpdir(), "reader-settings-"));
     const path = join(root, "artifacts", "deep_discovery", "execution-settings.json");
     try {
-      const settings = { codexPath: join(root, "codex"), codexHome: root, model: "original-model", parentSandbox: { filesystemDenies: [] } };
-      let captures = 0;
-      const capture = async () => { captures++; return settings; };
-      const original = { model: "original-model", reasoningEffort: "high", createdAt: "2026-01-01T00:00:00Z", usageOwner: null };
+      let contextReads = 0;
+      const readLegacyContext = async () => { contextReads++; return { config: {} }; };
+      const original = { workflowVersion: "deep-security-scan/v1", model: "original-model", reasoningEffort: "high", createdAt: "2026-01-01T00:00:00Z", usageOwner: null };
       let bytes;
       if (state !== "absent") {
         await mkdir(join(root, "artifacts", "deep_discovery"), { recursive: true });
@@ -33,13 +32,17 @@ for (const state of ["absent", "saved", "unsupported"]) {
         await writeFile(path, bytes);
       }
       if (state === "unsupported") {
-        await assert.rejects(loadOrCaptureDeepScanExecutionSettings(root, capture, original), /unsupported/);
+        await assert.rejects(loadDeepScanExecutionSettings(root, original, readLegacyContext), /unsupported/);
       } else {
-        const loaded = await loadOrCaptureDeepScanExecutionSettings(root, capture, original);
+        const loaded = await loadDeepScanExecutionSettings(root, original, readLegacyContext);
         assert.equal(loaded.model, "original-model");
-        if (state === "saved") assert.equal(loaded.reasoningEffort, "high");
+        assert.equal(loaded.reasoningEffort, "high");
+        if (state === "absent") {
+          assert.equal(loaded.codexPath, undefined);
+          assert.equal(loaded.codexHome, undefined);
+        }
       }
-      assert.equal(captures, state === "absent" ? 1 : 0);
+      assert.equal(contextReads, state === "absent" ? 1 : 0);
       if (state === "absent") await assert.rejects(stat(path), { code: "ENOENT" });
       else assert.equal(await readFile(path, "utf8"), bytes);
     } finally {

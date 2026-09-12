@@ -432,7 +432,16 @@ async function testDeepScanStdioLifecycle() {
       "the MCP server must remain responsive after canceling one scan"
     );
 
-    let resumedThreadId = "deep-scan-stdio-resumed-thread";
+    const originalThreadId = "deep-scan-stdio-resumed-thread";
+    await mkdir(path.join(codexHome, "sessions"), { recursive: true });
+    await writeFile(path.join(codexHome, "sessions", "original-owner.jsonl"), [
+      { type: "session_meta", timestamp: "2026-01-01T00:00:00Z",
+        payload: { id: originalThreadId, cli_version: "0.154.0", model_provider: "openai" } },
+      { type: "event_msg", timestamp: "2026-01-01T00:00:01Z",
+        payload: { type: "thread_settings_applied", thread_id: originalThreadId,
+          thread_settings: { reasoning_summary: "none", model_provider_id: "openai" } } }
+    ].map(JSON.stringify).join("\n") + "\n");
+    let resumedThreadId = originalThreadId;
     const opened = await server.request(24, "tools/call", toolCall(
       "open_codex_security_workspace",
       { targetPath, scope: ".", mode: "deep" },
@@ -491,6 +500,7 @@ async function testDeepScanStdioLifecycle() {
     assert.equal(partial.userContext, "Original discovery focus");
     const settingsPath = path.join(resumedScan.scanDir, "artifacts", "deep_discovery", "execution-settings.json");
     await assert.rejects(readFile(settingsPath), { code: "ENOENT" });
+    const originalWorkerPids = new Set((await readJsonLines(startLogPath)).slice(restartStartIndex).map((execution) => execution.pid));
     await server.stop();
     assert.throws(() => process.kill(server.pid, 0), "the original MCP server must have exited");
     const paused = await runWorkbench(environment, ["get-scan", "--scan-id", resumedScanId]);
@@ -580,7 +590,10 @@ async function testDeepScanStdioLifecycle() {
       );
       const executions = (await readJsonLines(startLogPath)).slice(restartStartIndex);
       for (const execution of executions) {
-        assert.equal(execution.argv.includes('model_reasoning_summary="none"'), true);
+        const summary = execution.argv.find((argument) => argument.startsWith("model_reasoning_summary="));
+        // Baseline native handoff replaces its owner binding. Without a saved
+        // recipe or snapshot, the old summary is unavailable after that handoff.
+        assert.equal(summary, originalWorkerPids.has(execution.pid) ? 'model_reasoning_summary="none"' : undefined);
         const context = discoveryPromptContext(execution.stdin);
         if (context.workerLabel) assert.equal(context.userContext, "Original discovery focus");
       }
