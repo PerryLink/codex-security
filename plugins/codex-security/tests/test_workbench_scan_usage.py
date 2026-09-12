@@ -591,6 +591,22 @@ def test_completion_counts_deep_sdk_workers_and_descendants(tmp_path: Path) -> N
         environment,
         "deep",
     )
+    # Read an owner binding already persisted by a newer writer release.
+    with sqlite3.connect(state_dir / "workbench.sqlite3") as connection:
+        connection.execute(
+            "UPDATE deep_scan_runs SET usage_owner_json = ? WHERE scan_id = ?",
+            (
+                json.dumps(
+                    {
+                        "threadId": "scan-parent",
+                        "turnId": None,
+                        "startedAt": fixture.started_at.isoformat(),
+                        "dedicated": False,
+                    }
+                ),
+                scan_id,
+            ),
+        )
     counted = fixture.started_at + timedelta(microseconds=1)
     artifact = scan_dir / "artifacts" / "usage-worker"
     artifact.mkdir(parents=True)

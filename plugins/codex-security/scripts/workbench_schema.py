@@ -868,20 +868,6 @@ MIGRATIONS = (
         """,
     ),
     (
-        44,
-        "preserve original deep scan discovery context",
-        """
-        ALTER TABLE deep_scan_runs ADD COLUMN discovery_user_context TEXT;
-        UPDATE deep_scan_runs
-        SET discovery_user_context = (
-            SELECT user_context FROM scans WHERE scans.id = deep_scan_runs.scan_id
-        )
-        WHERE workflow_version IN (
-            'deep-security-scan/v1', 'deep-scan-mcp/v1'
-        );
-        """,
-    ),
-    (
         45,
         "retain deep scan attempts and exact merge inputs",
         """

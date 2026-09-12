@@ -35,6 +35,7 @@ const deepScanOwnershipProbe = [
   "CREATE TABLE workspaces (id TEXT PRIMARY KEY, thread_id TEXT, updated_at TEXT);",
   "CREATE TABLE scans (id TEXT PRIMARY KEY, workspace_id TEXT, mode TEXT, status TEXT, recipe_json TEXT, handoff_status TEXT, handoff_claim_token TEXT, deep_scan_owner_thread_id TEXT, updated_at TEXT);",
   "CREATE TABLE deep_scan_runs (scan_id TEXT PRIMARY KEY, schema_version INTEGER NOT NULL DEFAULT 1, workflow_version TEXT NOT NULL DEFAULT 'deep-scan-mcp/v1');",
+  "CREATE TABLE deep_scan_attempts (scan_id TEXT NOT NULL);",
   "''')",
   "scan_id = '11111111-1111-4111-8111-111111111111'",
   "connection.execute(\"INSERT INTO workspaces VALUES ('workspace', NULL, 'before')\")",

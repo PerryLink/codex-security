@@ -32,7 +32,7 @@ export type WorkbenchRunner = (
   selectFinalization?: boolean,
 ) => Promise<JsonObject>;
 
-const WORKFLOW_VERSION = "deep-security-scan/v2";
+const WORKFLOW_VERSION = "deep-security-scan/v1";
 const MAX_IDEMPOTENT_PERSISTENCE_ATTEMPTS = 3;
 const PERSISTENCE_RETRY_BASE_DELAY_MS = 100;
 

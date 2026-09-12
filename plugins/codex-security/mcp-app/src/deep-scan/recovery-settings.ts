@@ -6,7 +6,6 @@ import { parse as parseToml } from "smol-toml";
 import { scanPreflightCodexConfig } from "../../../../../sdk/typescript/src/preflight-config.js";
 import { resolveCodexProfile, type JsonObject } from "../../../../../sdk/typescript/src/config.js";
 import { readScanLogs } from "../../../../../sdk/typescript/src/scan-logs.js";
-import { writeJsonAtomic } from "./artifacts.js";
 import { resolveCodexPath } from "./executor.js";
 import type { DeepWorkerParentSandbox } from "./parent-sandbox.js";
 import type { DeepScanRunState } from "./types.js";
@@ -147,7 +146,6 @@ export async function loadOrCaptureDeepScanExecutionSettings(
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
     settings = executionSettings(await capture());
-    await writeJsonAtomic(path, { version: 1, settings });
     return settings;
   }
   if (!original || (settings.model !== undefined && settings.reasoningEffort !== undefined
@@ -169,9 +167,6 @@ export async function loadOrCaptureDeepScanExecutionSettings(
     ...(settings.serviceTier === undefined && native.nativeServiceTierAbsent
       ? { nativeServiceTierAbsent: true as const } : {})
   });
-  if (JSON.stringify(recovered) !== JSON.stringify(settings)) {
-    await writeJsonAtomic(path, { version: 1, settings: recovered });
-  }
   return recovered;
 }
 

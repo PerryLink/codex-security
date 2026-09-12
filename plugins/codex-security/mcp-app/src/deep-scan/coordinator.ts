@@ -275,18 +275,6 @@ export class DeepScanCoordinator {
       const schedulerResult = await this.runScheduler();
       if (this.canceled || this.externallyFailed) return;
       this.phase = "terminal";
-      if (this.state.workflowVersion === "deep-security-scan/v2") {
-        if (!this.options.store.selectFinalization) throw new Error("The Deep Scan store cannot select finalization input.");
-        this.state = await this.options.store.selectFinalization({
-          scanId: this.state.scanId,
-          reason: schedulerResult.reason,
-          manifestPath: join(this.state.scanDir, "scan-manifest.json"),
-          resultPath: schedulerResult.resultPath,
-          omittedWorkerIds: schedulerResult.omittedWorkerIds,
-        });
-        await this.completeSelectedFinalization();
-        return;
-      }
       const draft = schedulerResult.result
         ? deepReductionToScanDraft(schedulerResult.result)
         : scanDraftInputSchema.parse({
