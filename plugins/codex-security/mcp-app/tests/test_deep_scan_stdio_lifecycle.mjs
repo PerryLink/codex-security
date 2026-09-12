@@ -500,9 +500,11 @@ async function testDeepScanStdioLifecycle() {
     assert.equal(partial.userContext, "Original discovery focus");
     const settingsPath = path.join(resumedScan.scanDir, "artifacts", "deep_discovery", "execution-settings.json");
     await assert.rejects(readFile(settingsPath), { code: "ENOENT" });
-    const originalWorkerPids = new Set((await readJsonLines(startLogPath)).slice(restartStartIndex).map((execution) => execution.pid));
     await server.stop();
     assert.throws(() => process.kill(server.pid, 0), "the original MCP server must have exited");
+    // A worker can be marked running before its process appends the start log.
+    // Capture the original process set after shutdown has settled those launches.
+    const originalWorkerPids = new Set((await readJsonLines(startLogPath)).slice(restartStartIndex).map((execution) => execution.pid));
     const paused = await runWorkbench(environment, ["get-scan", "--scan-id", resumedScanId]);
     assert.deepEqual([paused.scan.progress.status, paused.scan.progress.phase], ["running", "discovery"]);
     assert.deepEqual(paused.scan.progress.independentReviews, {
