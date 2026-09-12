@@ -22,7 +22,7 @@ import {
   DeepScanStartLock,
   startOrJoinDeepScanCoordinator
 } from "./src/deep-scan/registry.js";
-import { captureDeepScanExecutionSettings, loadOrCaptureDeepScanExecutionSettings, restoredDeepScanWorkerSettings } from "./src/deep-scan/recovery-settings.js";
+import { loadDeepScanExecutionSettings, restoredDeepScanWorkerSettings, type DeepScanLegacySettingsContext } from "./src/deep-scan/recovery-settings.js";
 import { CodexSdkWorkerExecutor } from "./src/deep-scan/executor.js";
 import {
   CODEX_SANDBOX_STATE_META_CAPABILITY,
@@ -753,8 +753,12 @@ export function createCodexSecurityServer(): McpServer {
           store: deepScanStore,
           prepareExecutor: async (run) => new CodexSdkWorkerExecutor({
             ...restoredDeepScanWorkerSettings(
-              await loadOrCaptureDeepScanExecutionSettings(run.scanDir, () =>
-                captureDeepScanExecutionSettings(run, parentSandbox, process.env, { threadId, startedAt: run.createdAt }), run),
+              await loadDeepScanExecutionSettings(run.scanDir, run, async () => {
+                const context = await runWorkbench(["get-scan", "--scan-id", run.scanId]);
+                const recipe = context.recipe as Pick<DeepScanLegacySettingsContext, "config"> | undefined;
+                const scan = context.scan as { executionAttribution?: { owner: DeepScanRunState["usageOwner"] } };
+                return { config: recipe?.config, usageOwner: scan.executionAttribution?.owner };
+              }),
               parentSandbox
             ),
             artifactContext: {

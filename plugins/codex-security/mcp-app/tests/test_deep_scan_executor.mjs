@@ -6,6 +6,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { build } from "esbuild";
+import { parse as parseToml } from "smol-toml";
 
 const executorSource = new URL("../src/deep-scan/executor.ts", import.meta.url);
 const bundle = await build({
@@ -16,7 +17,7 @@ const bundle = await build({
   },
   stdin: {
     // Test the environment snapshot without adding a production export.
-    contents: `${await readFile(executorSource, "utf8")}\nexport { snapshotWorkerEnvironment };\nexport { captureDeepScanExecutionSettings, loadOrCaptureDeepScanExecutionSettings, restoredDeepScanWorkerSettings } from "./recovery-settings.js";`,
+    contents: `${await readFile(executorSource, "utf8")}\nexport { snapshotWorkerEnvironment };\nexport { captureDeepScanExecutionSettings, loadDeepScanExecutionSettings, restoredDeepScanWorkerSettings } from "./recovery-settings.js";\nexport { WorkbenchDeepScanStore } from "./store.js";`,
     loader: "ts",
     resolveDir: path.dirname(fileURLToPath(executorSource)),
     sourcefile: fileURLToPath(executorSource)
@@ -25,7 +26,7 @@ const bundle = await build({
   platform: "node",
   write: false
 });
-const { CodexSdkWorkerExecutor, resolveCodexPath, snapshotWorkerEnvironment, captureDeepScanExecutionSettings, loadOrCaptureDeepScanExecutionSettings, restoredDeepScanWorkerSettings } = await import(
+const { WorkbenchDeepScanStore, CodexSdkWorkerExecutor, resolveCodexPath, snapshotWorkerEnvironment, captureDeepScanExecutionSettings, loadDeepScanExecutionSettings, restoredDeepScanWorkerSettings } = await import(
   `data:text/javascript;base64,${Buffer.from(bundle.outputFiles[0].contents).toString("base64")}`
 );
 const errorsBundle = await build({
@@ -748,22 +749,28 @@ async function testIsolatedReconstructedWorkers() {
   const scans = [];
   try {
     for (const name of ["first", "second"]) {
-      const fixture = await fakeCodexFixture(deniedWorkerPermissionProfile);
+      const uncappedSandbox = { filesystemDenies: trustedParentSandboxWithDenials.filesystemDenies };
+      const currentParentSandbox = name === "first" ? uncappedSandbox : trustedParentSandboxWithDenials;
+      const expectedProfile = structuredClone(deniedWorkerPermissionProfile);
+      delete expectedProfile.filesystem.glob_scan_max_depth;
+      const fixture = await fakeCodexFixture(expectedProfile);
       const codexHome = path.join(fixture.root, "home");
       const configPath = path.join(fixture.root, "scan config.toml");
       const promptPath = path.join(fixture.root, "prompt.md");
       await mkdir(codexHome);
       const config = {
         model: `fixture-${name}-inherited`,
-        model_provider: `fixture-${name}-provider`,
+        model_provider: name === "first" ? "openrouter" : "amazon-bedrock",
         model_reasoning_effort: "medium",
         model_reasoning_summary: "concise",
         service_tier: name === "first" ? "default" : "fast"
       };
       await writeFile(configPath, Object.entries(config).filter(([key]) => name !== "first"
         || !["model_provider", "model_reasoning_summary", "service_tier"].includes(key))
-        .map(([key, value]) => `${key} = ${JSON.stringify(value)}\n`).join(""));
-      await writeFile(promptPath, "CAPTURE_SYNTHETIC_OPENAI_AUTH NULL_USAGE\n");
+        .map(([key, value]) => `${key} = ${JSON.stringify(value)}\n`).join("")
+        + (name === "second" ? '[model_providers.amazon-bedrock.aws]\nregion = "us-west-2"\nprofile = "fixture-profile"\n' : ""));
+      const providerKeys = name === "first" ? ["OPENROUTER_API_KEY"] : ["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN"];
+      await writeFile(promptPath, "CAPTURE_SYNTHETIC_OPENAI_AUTH CAPTURE_SYNTHETIC_PROVIDER_AUTH NULL_USAGE\n");
       const executable = path.join(fixture.root, process.platform === "win32" ? "node.exe" : "node");
       // Keep dynamically linked Node beside its libraries on Unix. Each scan
       // still selects a distinct executable path at the spawn boundary.
@@ -779,6 +786,7 @@ async function testIsolatedReconstructedWorkers() {
           CODEX_SECURITY_CONFIG_PATH: configPath,
           CODEX_API_KEY: `synthetic-${name}-credential`,
           FAKE_CODEX_MARKER: fixture.markerPath,
+          FAKE_CODEX_PROVIDER_ENV_KEYS: JSON.stringify(providerKeys),
           FAKE_CODEX_SCAN_VALUE: name
         }
       };
@@ -787,7 +795,7 @@ async function testIsolatedReconstructedWorkers() {
         model: `fixture-${name}-override`,
         reasoningEffort: "ultra",
         usageOwner: { threadId: `fixture-${name}-owner`, turnId: "original-turn", startedAt: "2026-01-01T00:00:00Z" },
-        parentSandbox: trustedParentSandboxWithDenials
+        parentSandbox: name === "first" ? trustedParentSandboxWithDenials : uncappedSandbox
       };
       await mkdir(path.join(codexHome, "sessions"));
       await writeFile(path.join(codexHome, "sessions", "owner.jsonl"), [
@@ -807,19 +815,55 @@ async function testIsolatedReconstructedWorkers() {
         type: "session_meta", timestamp: "2026-01-01T00:00:00Z",
         payload: { id: `fixture-${name}-observer`, model_provider: "observer-provider" }
       }) + "\n");
-      const saved = await loadOrCaptureDeepScanExecutionSettings(fixture.root, () =>
-        captureDeepScanExecutionSettings(settings, settings.parentSandbox, { ...codexOptions.env, CODEX_CLI_PATH: executable }, { threadId: `fixture-${name}-observer`, startedAt: "2026-01-01T00:01:00Z" }));
+      const saved = await captureDeepScanExecutionSettings(settings, settings.parentSandbox,
+        { ...codexOptions.env, CODEX_CLI_PATH: executable },
+        { threadId: `fixture-${name}-observer`, startedAt: "2026-01-01T00:01:00Z" });
       assert.equal(saved.nativeServiceTierAbsent, name === "first" ? true : undefined);
-      const snapshotPath = path.join(fixture.root, "artifacts", "deep_discovery", "execution-settings.json");
-      // Prior-reader fixture: this snapshot was written by the writer release.
+      const targetPath = path.join(fixture.root, "target");
+      await mkdir(targetPath);
+      const workbenchPath = fileURLToPath(new URL("../../scripts/workbench_db.py", import.meta.url));
+      const runWorkbench = async (args, input, _selectFinalization, withExecutionSettings) => {
+        const pythonArgs = withExecutionSettings ? ["-c",
+          "import runpy, sys; script = sys.argv.pop(1); runpy.run_path(script)['main'](with_execution_settings=True)",
+          workbenchPath, ...args] : [workbenchPath, ...args];
+        const result = spawnSync(process.env.PYTHON?.trim() || "python3", pythonArgs, {
+          env: { ...process.env, CODEX_HOME: codexHome,
+            CODEX_SECURITY_STATE_DIR: path.join(fixture.root, "state") },
+          input, encoding: "utf8", timeout: 30_000
+        });
+        assert.equal(result.status, 0, result.stderr);
+        return JSON.parse(result.stdout);
+      };
+      const store = new WorkbenchDeepScanStore(runWorkbench);
+      const beginInput = { targetPath, threadId: settings.usageOwner.threadId,
+        model: settings.model, reasoningEffort: settings.reasoningEffort,
+        scanRoot: path.join(fixture.root, "scans") };
+      const { run } = await store.begin(beginInput);
+      const recordedScanDir = run.scanDir;
+      const snapshotPath = path.join(recordedScanDir, "artifacts", "deep_discovery", "execution-settings.json");
+      await assert.rejects(readFile(snapshotPath), { code: "ENOENT" });
+      // This prior release reads the later writer's existing snapshot.
       await mkdir(path.dirname(snapshotPath), { recursive: true });
-      await writeFile(snapshotPath, JSON.stringify({ version: 1, settings: saved }));
+      await writeFile(snapshotPath, JSON.stringify({ version: 1, settings: saved }, null, 2) + "\n");
       const snapshot = await readFile(snapshotPath, "utf8");
+      const expectedProvider = name === "first" ? undefined
+        : { "amazon-bedrock": { aws: { region: "us-west-2", profile: "fixture-profile" } } };
+      assert.deepEqual(JSON.parse(snapshot).settings.providerConfig, expectedProvider,
+        "recorded provider selections need no persisted catalog definitions");
+      assert.deepEqual(await loadDeepScanExecutionSettings(recordedScanDir), saved);
+      const claim = await store.claimCoordinator({ scanId: run.scanId, threadId: beginInput.threadId });
+      assert.equal(claim.acquired, true);
+      const observer = await new WorkbenchDeepScanStore(runWorkbench).begin({
+        ...beginInput, model: "observer-model", reasoningEffort: "low"
+      });
+      assert.equal(observer.shouldStart, false);
+      assert.equal(await readFile(snapshotPath, "utf8"), snapshot);
+      assert.equal(observer.run.model, settings.model);
       assert.equal(snapshot.includes("synthetic-"), false);
       const runtimeEnvironment = { ...codexOptions.env };
-      const restored = restoredDeepScanWorkerSettings(saved, settings.parentSandbox, () => runtimeEnvironment);
+      const restored = restoredDeepScanWorkerSettings(saved, currentParentSandbox, () => runtimeEnvironment);
       restored.codexOptions.baseUrl = codexOptions.baseUrl;
-      scans.push({ name, fixture, config, configPath, promptPath, settings, runtimeEnvironment, snapshotPath, snapshot,
+      scans.push({ name, fixture, recordedScanDir, currentParentSandbox, config, configPath, promptPath, settings, runtimeEnvironment, snapshotPath, snapshot, providerKeys, expectedProvider,
         executor: new CodexSdkWorkerExecutor(restored) });
     }
     childProcess.spawn = (command, args, options) => {
@@ -840,23 +884,27 @@ async function testIsolatedReconstructedWorkers() {
           if (phase === "reconstructed") await rm(scan.configPath);
           if (phase === "incomplete") {
             const saved = JSON.parse(scan.snapshot);
-            for (const key of ["model", "reasoningEffort", "modelProvider", "reasoningSummary"]) delete saved.settings[key];
+            for (const key of ["model", "reasoningEffort", "reasoningSummary"]) delete saved.settings[key];
+            // Native history restores the first provider. The second snapshot
+            // retains the provider binding for its saved AWS selectors.
+            if (scan.name === "first") delete saved.settings.modelProvider;
             if (scan.name === "first") delete saved.settings.serviceTier;
             await writeFile(scan.snapshotPath, JSON.stringify(saved));
           }
-          const beforeRead = await readFile(scan.snapshotPath, "utf8");
-          const recorded = await loadOrCaptureDeepScanExecutionSettings(scan.fixture.root, () =>
-            assert.fail("reconstruction must not recapture current settings"), {
+          const snapshotBeforeRead = await readFile(scan.snapshotPath, "utf8");
+          const recorded = await loadDeepScanExecutionSettings(scan.recordedScanDir, {
             ...scan.settings, createdAt: "2026-01-01T00:01:00Z"
           });
-          const restored = restoredDeepScanWorkerSettings(recorded, scan.settings.parentSandbox, () => scan.runtimeEnvironment);
+          const restored = restoredDeepScanWorkerSettings(recorded, scan.currentParentSandbox, () => scan.runtimeEnvironment);
           restored.codexOptions.baseUrl = scan.settings.codexOptions.baseUrl;
           scan.executor = new CodexSdkWorkerExecutor(restored);
-          assert.equal(await readFile(scan.snapshotPath, "utf8"), beforeRead, "the prior reader preserves the stored snapshot bytes");
+          assert.equal(await readFile(scan.snapshotPath, "utf8"), snapshotBeforeRead,
+            "restoring original worker selections must not rewrite saved settings");
         }
       }
       for (const scan of scans) {
         scan.runtimeEnvironment.CODEX_API_KEY = `synthetic-${scan.name}-${phase}`;
+        for (const key of scan.providerKeys) scan.runtimeEnvironment[key] = `synthetic-${scan.name}-${phase}-${key}`;
         scan.runtimeEnvironment.FAKE_CODEX_SCAN_VALUE = `${scan.name}-${phase}`;
         scan.runtimeEnvironment.CODEX_HOME = path.join(scan.fixture.root, "observer-home");
         scan.runtimeEnvironment.CODEX_CLI_PATH = path.join(scan.fixture.root, "observer-codex");
@@ -867,7 +915,7 @@ async function testIsolatedReconstructedWorkers() {
           const result = await scan.executor.run({
             kind, promptPath: scan.promptPath, workingDirectory: scan.fixture.root,
             subagents: scan.name === "first" ? 0 : 2,
-            resumeThreadId, continuationPrompt: "CAPTURE_SYNTHETIC_OPENAI_AUTH NULL_USAGE continuation",
+            resumeThreadId, continuationPrompt: "CAPTURE_SYNTHETIC_OPENAI_AUTH CAPTURE_SYNTHETIC_PROVIDER_AUTH NULL_USAGE continuation",
             signal: new AbortController().signal
           });
           assert.equal(result.threadId, resumeThreadId ?? "fixture-thread-id");
@@ -880,6 +928,8 @@ async function testIsolatedReconstructedWorkers() {
           assert.equal(child.scanValue, `${scan.name}-${phase}`);
           assert.equal(child.configPath, scan.configPath);
           assert.deepEqual(child.openaiAuthentication, { CODEX_API_KEY: `synthetic-${scan.name}-${phase}` });
+          assert.deepEqual(child.providerAuthentication, Object.fromEntries(scan.providerKeys
+            .map((key) => [key, `synthetic-${scan.name}-${phase}-${key}`])));
           assertFlagPair(child.argv, "--model", scan.settings.model);
           for (const key of ["model_provider", "model_reasoning_summary", "service_tier"]) {
             const override = `${key}=${JSON.stringify(scan.config[key])}`;
@@ -892,6 +942,15 @@ async function testIsolatedReconstructedWorkers() {
           const baseUrl = `openai_base_url=${JSON.stringify(scan.settings.codexOptions.baseUrl)}`;
           assert.equal(child.argv.includes(baseUrl), true);
           assert.equal(preflight.argv.includes(baseUrl), true);
+          for (const launch of [child, preflight]) {
+            const provider = launch.argv.filter((argument) => /^model_providers[.=]/u.test(argument));
+            assert.ok(provider.length > 0, "both preflight and worker launch receive provider configuration");
+            const providers = parseToml(provider.join("\n")).model_providers;
+            if (scan.expectedProvider) assert.deepEqual(providers, scan.expectedProvider);
+            else assert.deepEqual(Object.keys(providers.openrouter).sort(), ["base_url", "env_key", "name", "wire_api"]);
+            assert.equal(workerPermissionProfileOverride(launch.argv).includes("glob_scan_max_depth"), false,
+              "a resumed bounded cap must not truncate an original uncapped deny glob, in either order");
+          }
           assertReadOnlyWorkerPolicy(child.argv);
           assertWorkerSubagentPolicy(child.argv, scan.name === "first" ? 0 : 2);
           assert.equal(workerPermissionProfileOverride(child.argv).includes('"/repo/.env"="deny"'), true);
@@ -1815,7 +1874,8 @@ async function fakeCodexFixture(
     "for await (const chunk of process.stdin) stdin += chunk;",
     "const openaiAuthentication = stdin.includes('CAPTURE_SYNTHETIC_OPENAI_AUTH') ? { OPENAI_API_KEY: process.env.OPENAI_API_KEY, CODEX_API_KEY: process.env.CODEX_API_KEY } : undefined;",
     "const bedrockAuthentication = stdin.includes('CAPTURE_SYNTHETIC_BEDROCK_AUTH') ? Object.fromEntries(JSON.parse(process.env.FAKE_CODEX_BEDROCK_ENV_KEYS).map((name) => [name, process.env[name]])) : undefined;",
-    "writeFileSync(process.env.FAKE_CODEX_MARKER, JSON.stringify({ executable: process.execPath, argv: process.argv.slice(2), stdin, cwd: process.cwd(), codexHome: process.env.CODEX_HOME, codexCliPath: process.env.CODEX_CLI_PATH, configPath: process.env.CODEX_SECURITY_CONFIG_PATH, scanValue: process.env.FAKE_CODEX_SCAN_VALUE, deepConfigPath: process.env.CODEX_SECURITY_DEEP_SCAN_CONFIG_PATH, originator: process.env.CODEX_INTERNAL_ORIGINATOR_OVERRIDE, ...(stdin.includes('COMPLETE_THEN_HANG') ? { pid: process.pid } : {}), ...(openaiAuthentication ? { openaiAuthentication } : {}), ...(bedrockAuthentication ? { bedrockAuthentication } : {}) }));",
+    "const providerAuthentication = stdin.includes('CAPTURE_SYNTHETIC_PROVIDER_AUTH') ? Object.fromEntries(JSON.parse(process.env.FAKE_CODEX_PROVIDER_ENV_KEYS).map((name) => [name, process.env[name]])) : undefined;",
+    "writeFileSync(process.env.FAKE_CODEX_MARKER, JSON.stringify({ executable: process.execPath, argv: process.argv.slice(2), stdin, cwd: process.cwd(), codexHome: process.env.CODEX_HOME, codexCliPath: process.env.CODEX_CLI_PATH, configPath: process.env.CODEX_SECURITY_CONFIG_PATH, scanValue: process.env.FAKE_CODEX_SCAN_VALUE, deepConfigPath: process.env.CODEX_SECURITY_DEEP_SCAN_CONFIG_PATH, originator: process.env.CODEX_INTERNAL_ORIGINATOR_OVERRIDE, ...(stdin.includes('COMPLETE_THEN_HANG') ? { pid: process.pid } : {}), ...(openaiAuthentication ? { openaiAuthentication } : {}), ...(bedrockAuthentication ? { bedrockAuthentication } : {}), ...(providerAuthentication ? { providerAuthentication } : {}) }));",
     "if (stdin.includes('COMPLETE_THEN_HANG')) process.on('SIGTERM', () => setTimeout(() => process.exit(0), 100));",
     "if (stdin.includes('THREAD_START_CONFIG_ERROR')) { console.error('Error: thread/start: thread/start failed: agents.max_threads cannot be set when features.multi_agent_v2 is enabled (code -32600)'); process.exit(1); }",
     "if (stdin.includes('CONFIG_ERROR')) { console.error('failed to load configuration: invalid value'); process.exit(2); }",

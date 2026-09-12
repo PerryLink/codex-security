@@ -25,6 +25,11 @@ export interface DeepScanExecutionSettings {
   parentSandbox?: DeepWorkerParentSandbox;
 }
 
+export interface DeepScanLegacySettingsContext {
+  config?: JsonObject;
+  usageOwner?: DeepScanRunState["usageOwner"];
+}
+
 export async function captureDeepScanExecutionSettings(
   original: Pick<DeepScanRunState, "model" | "reasoningEffort" | "usageOwner">,
   parentSandbox: DeepWorkerParentSandbox,
@@ -129,12 +134,13 @@ async function originalParentSettings(
   }
 }
 
-/** Called by the acquired coordinator before it starts any worker. */
-export async function loadOrCaptureDeepScanExecutionSettings(
+/** New runs save settings in their creation transaction, before any coordinator claim. */
+export async function loadDeepScanExecutionSettings(
   scanDir: string,
-  capture: () => Promise<DeepScanExecutionSettings>,
-  original?: Pick<DeepScanRunState, "model" | "reasoningEffort" | "usageOwner" | "createdAt">
-): Promise<DeepScanExecutionSettings> {
+  original?: Pick<DeepScanRunState, "model" | "reasoningEffort" | "usageOwner" | "createdAt" | "workflowVersion">,
+  readLegacyContext?: () => Promise<DeepScanLegacySettingsContext>,
+  environment: NodeJS.ProcessEnv = process.env
+): Promise<Partial<DeepScanExecutionSettings>> {
   const path = join(scanDir, "artifacts", "deep_discovery", "execution-settings.json");
   let settings: DeepScanExecutionSettings;
   try {
@@ -145,8 +151,30 @@ export async function loadOrCaptureDeepScanExecutionSettings(
     settings = executionSettings(saved.settings);
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-    settings = executionSettings(await capture());
-    return settings;
+    if (original?.workflowVersion === "deep-security-scan/v1" || original?.workflowVersion === "deep-scan-mcp/v1") {
+      // Legacy runs predate this file. Their saved recipe and recorded owner
+      // can recover selections, but cannot establish an original executable or
+      // home. Leave those unknown and retain the existing native launch behavior.
+      const context = await readLegacyContext?.();
+      const selected = scanPreflightCodexConfig(resolveCodexProfile(context?.config ?? {}));
+      const owner = original.usageOwner ?? context?.usageOwner;
+      const home = environment.CODEX_HOME || join(homedir(), ".codex");
+      const native = !owner?.threadId ? {} : await originalParentSettings(home, {
+        ...owner, threadId: owner.threadId, startedAt: original.createdAt ?? owner.startedAt
+      });
+      return {
+        model: original.model ?? (selected.model as string | undefined) ?? native.model,
+        reasoningEffort: original.reasoningEffort ?? (selected.model_reasoning_effort as string | undefined) ?? native.reasoningEffort,
+        modelProvider: (selected.model_provider as string | undefined) ?? native.modelProvider,
+        reasoningSummary: (selected.model_reasoning_summary as string | undefined) ?? native.reasoningSummary,
+        serviceTier: (selected.service_tier as string | undefined) ?? native.serviceTier,
+        ...(selected.service_tier === undefined && native.nativeServiceTierAbsent
+          ? { nativeServiceTierAbsent: true as const } : {}),
+        providerConfig: selected.model_provider === "amazon-bedrock"
+          ? selected.model_providers as JsonObject | undefined : undefined
+      };
+    }
+    throw new Error("This Deep Scan has no recorded original execution settings; its executable and Codex home cannot be recovered.");
   }
   if (!original || (settings.model !== undefined && settings.reasoningEffort !== undefined
     && settings.modelProvider !== undefined && settings.reasoningSummary !== undefined
@@ -157,7 +185,9 @@ export async function loadOrCaptureDeepScanExecutionSettings(
   const native = !owner?.threadId ? {} : await originalParentSettings(settings.codexHome, {
     ...owner, threadId: owner.threadId, startedAt: original.createdAt
   });
-  const recovered = executionSettings({
+  // History reads can outlive this coordinator. Project missing selections for
+  // its workers without overwriting a snapshot owned by a newer coordinator.
+  return executionSettings({
     ...settings,
     model: settings.model ?? original.model ?? native.model,
     reasoningEffort: settings.reasoningEffort ?? original.reasoningEffort ?? native.reasoningEffort,
@@ -167,11 +197,10 @@ export async function loadOrCaptureDeepScanExecutionSettings(
     ...(settings.serviceTier === undefined && native.nativeServiceTierAbsent
       ? { nativeServiceTierAbsent: true as const } : {})
   });
-  return recovered;
 }
 
 export function restoredDeepScanWorkerSettings(
-  settings: DeepScanExecutionSettings,
+  settings: Partial<DeepScanExecutionSettings>,
   currentParentSandbox: DeepWorkerParentSandbox,
   environment: () => NodeJS.ProcessEnv = () => process.env
 ): {
@@ -183,6 +212,11 @@ export function restoredDeepScanWorkerSettings(
   const originalSandbox = settings.parentSandbox;
   const depths = [originalSandbox?.globScanMaxDepth, currentParentSandbox.globScanMaxDepth]
     .filter((depth): depth is number => depth !== undefined);
+  // Native depth caps limit deny-glob expansion, not allowed traversal. Keep
+  // the larger finite cap, or no cap when either known policy has uncapped globs.
+  const uncapped = [originalSandbox, currentParentSandbox].some((sandbox) =>
+    sandbox?.globScanMaxDepth === undefined && sandbox?.filesystemDenies.some((path) =>
+      ["*", "?", "[", "]"].some((character) => path.includes(character))));
   return {
     model: settings.model,
     reasoningEffort: settings.reasoningEffort,
@@ -190,33 +224,37 @@ export function restoredDeepScanWorkerSettings(
       filesystemDenies: [...new Set([
         ...(originalSandbox?.filesystemDenies ?? []), ...currentParentSandbox.filesystemDenies
       ])],
-      ...(depths.length === 0 ? {} : { globScanMaxDepth: Math.max(...depths) })
+      ...(uncapped || depths.length === 0 ? {} : { globScanMaxDepth: Math.max(...depths) })
     },
     codexOptions: {
       codexPathOverride: settings.codexPath,
       // The executor reads this property for each launch. API keys can refresh;
       // only the original account home and non-secret selections are bound.
       get env() {
-        return Object.fromEntries(Object.entries({ ...environment(), CODEX_CLI_PATH: settings.codexPath, CODEX_HOME: settings.codexHome })
+        return Object.fromEntries(Object.entries({ ...environment(),
+          ...(settings.codexPath === undefined ? {} : { CODEX_CLI_PATH: settings.codexPath }),
+          ...(settings.codexHome === undefined ? {} : { CODEX_HOME: settings.codexHome }) })
           .filter((entry): entry is [string, string] => entry[1] !== undefined));
       },
-      config: {
+      config: scanPreflightCodexConfig({
         ...(settings.model === undefined ? {} : { model: settings.model }),
         ...(settings.reasoningEffort === undefined ? {} : { model_reasoning_effort: settings.reasoningEffort }),
         ...(settings.modelProvider === undefined ? {} : { model_provider: settings.modelProvider }),
         ...(settings.reasoningSummary === undefined ? {} : { model_reasoning_summary: settings.reasoningSummary }),
         ...(settings.serviceTier === undefined ? {} : { service_tier: settings.serviceTier }),
-        ...(settings.providerConfig === undefined ? {} : { model_providers: settings.providerConfig as NonNullable<CodexOptions["config"]>[string] })
-      }
+        ...(settings.providerConfig === undefined ? {} : { model_providers: settings.providerConfig })
+      }) as NonNullable<CodexOptions["config"]>
     }
   };
 }
 
 function executionSettings(value: DeepScanExecutionSettings): DeepScanExecutionSettings {
-  const provider = scanPreflightCodexConfig({
+  // Catalog provider definitions are reconstructed by the existing launch
+  // projection. Only Bedrock's per-scan AWS selectors need persistence.
+  const provider = value.modelProvider === "amazon-bedrock" ? scanPreflightCodexConfig({
     ...(value.modelProvider === undefined ? {} : { model_provider: value.modelProvider }),
     ...(value.providerConfig === undefined ? {} : { model_providers: value.providerConfig })
-  }).model_providers as JsonObject | undefined;
+  }).model_providers as JsonObject | undefined : undefined;
   const settings: DeepScanExecutionSettings = {
     codexPath: value.codexPath,
     codexHome: value.codexHome,
