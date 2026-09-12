@@ -6,6 +6,7 @@ import sqlite3
 import sys
 import tempfile
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -655,6 +656,178 @@ def test_completion_counts_deep_sdk_workers_and_descendants(tmp_path: Path) -> N
         "warnings": ["scan_owner_turn_unavailable"],
         "modelUsage": [{"model": None, **_counts(27, 0, 7)}],
     }
+
+
+@pytest.mark.parametrize("worker_home", ["recorded", "current", "unavailable"])
+def test_completion_keeps_owner_and_workers_in_their_recorded_homes(
+    tmp_path: Path, worker_home: str
+) -> None:
+    current_home = tmp_path / "current-home"
+    environment = {
+        "CODEX_HOME": str(current_home),
+        "CODEX_SQLITE_HOME": str(current_home / "sqlite"),
+        "CODEX_STATE_DB": str(current_home / "sqlite" / "state_5.sqlite"),
+    }
+    owners = {
+        f"owner-{index}": _rollout(
+            tmp_path,
+            f"owner-{index}",
+            [_event(datetime.now().astimezone(), "turn_context", {"turn_id": "original"})],
+        )
+        for index in (1, 2)
+    }
+    _state_graph(environment, owners, [])
+
+    def complete(index: int) -> dict[str, Any]:
+        root = tmp_path / f"scan-{index}"
+        target = root / "target"
+        target.mkdir(parents=True)
+        selected_home = current_home if worker_home == "current" else root / "original-home"
+        deep = run_workbench(
+            root / "state",
+            "begin-deep-scan",
+            "--thread-id",
+            f"owner-{index}",
+            "--target-path",
+            str(target),
+            "--scan-root",
+            str(root / "scans"),
+            environment=environment,
+        )["deepScan"]
+        scan_id, scan_dir = deep["scanId"], Path(deep["scanDir"])
+        snapshot = scan_dir / "artifacts/deep_discovery/execution-settings.json"
+        assert not snapshot.exists()
+        # These original facts were persisted by a newer writer release.
+        snapshot.parent.mkdir(parents=True, exist_ok=True)
+        snapshot.write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "settings": {
+                        "codexHome": str(selected_home),
+                        "codexPath": sys.executable,
+                    },
+                }
+            )
+        )
+        owner_json = json.dumps(
+            {
+                "threadId": f"owner-{index}",
+                "turnId": "original",
+                "startedAt": deep["createdAt"],
+                "dedicated": False,
+            }
+        )
+        with sqlite3.connect(root / "state" / "workbench.sqlite3") as connection:
+            assert connection.execute(
+                "SELECT usage_owner_json FROM deep_scan_runs WHERE scan_id = ?", (scan_id,)
+            ).fetchone() == (None,)
+            connection.execute(
+                "UPDATE deep_scan_runs SET usage_owner_json = ? WHERE scan_id = ?",
+                (owner_json, scan_id),
+            )
+        original_bytes = snapshot.read_bytes()
+        fixture = ScanFixture(
+            root / "state",
+            target,
+            scan_id,
+            scan_dir,
+            datetime.fromisoformat(deep["createdAt"]),
+            environment,
+            "deep",
+        )
+        counted = fixture.started_at + timedelta(microseconds=1)
+        with owners[f"owner-{index}"].open("a") as stream:
+            stream.write(json.dumps(_token_event(counted, index * 10, 2)) + "\n")
+            stream.write(json.dumps(_event(counted, "turn_context", {"turn_id": "later"})) + "\n")
+            stream.write(json.dumps(_token_event(counted, 9000, 900)) + "\n")
+        worker_threads = {}
+        for kind in ("discovery", "second-discovery"):
+            thread_id = f"{kind}-{index}"
+            artifact = scan_dir / "artifacts" / thread_id
+            artifact.mkdir()
+            prompt = artifact / "prompt.md"
+            prompt.write_text("Review the synthetic target.\n")
+            run_workbench(
+                fixture.state_dir,
+                "upsert-deep-scan-worker",
+                "--scan-id",
+                scan_id,
+                "--worker-id",
+                str(uuid.uuid4()),
+                "--kind",
+                "discovery",
+                "--status",
+                "running",
+                "--prompt-path",
+                str(prompt),
+                "--artifact-dir",
+                str(artifact),
+                "--sdk-thread-id",
+                thread_id,
+                environment=environment,
+            )
+            worker_threads[thread_id] = _rollout(
+                root,
+                thread_id,
+                [
+                    _token_event(counted, index * 20, 3),
+                    _event(counted, "turn_context", {"turn_id": "resumed"}),
+                    _token_event(counted, index * 30, 5),
+                ],
+            )
+        child_id = f"child-{index}"
+        worker_threads[child_id] = _rollout(
+            root,
+            child_id,
+            [_token_event(counted, index * 7, 1)],
+            parent_thread_id=f"discovery-{index}",
+        )
+        if worker_home == "current":
+            with sqlite3.connect(environment["CODEX_STATE_DB"]) as connection:
+                connection.executemany(
+                    "INSERT INTO threads VALUES (?, ?)",
+                    [(key, str(path)) for key, path in worker_threads.items()],
+                )
+                connection.execute(
+                    "INSERT INTO thread_spawn_edges VALUES (?, ?)", (f"discovery-{index}", child_id)
+                )
+        elif worker_home == "recorded":
+            _state_graph(
+                {"CODEX_SQLITE_HOME": str(selected_home)},
+                worker_threads,
+                [(f"discovery-{index}", child_id)],
+            )
+        result = _complete_scan(fixture)["scan"]["usage"]
+        assert snapshot.read_bytes() == original_bytes
+        with sqlite3.connect(fixture.state_dir / "workbench.sqlite3") as connection:
+            assert connection.execute(
+                "SELECT usage_owner_json FROM deep_scan_runs WHERE scan_id = ?", (scan_id,)
+            ).fetchone() == (owner_json,)
+            assert connection.execute("SELECT COUNT(*) FROM deep_scan_attempts").fetchone() == (0,)
+            assert connection.execute(
+                "SELECT COUNT(*) FROM deep_scan_attempt_sessions"
+            ).fetchone() == (0,)
+        return result
+
+    # Both completions share current home B; each scan retains its own worker home A.
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(complete, (1, 2)))
+    for index, usage in enumerate(results, 1):
+        if worker_home == "unavailable":
+            assert usage["coverage"] == "partial"
+            assert usage["inputTokens"] == index * 10
+            assert usage["outputTokens"] == 2
+            assert usage["threadCount"] == 1
+            assert usage["missingThreadCount"] == 2
+        else:
+            assert usage == {
+                "coverage": "complete",
+                "source": "codex_rollout",
+                **_counts(index * 77, 0, 13),
+                "threadCount": 4,
+                "modelUsage": [{"model": None, **_counts(index * 77, 0, 13)}],
+            }
 
 
 def test_completion_preserves_explicit_legacy_cost(tmp_path: Path) -> None:
