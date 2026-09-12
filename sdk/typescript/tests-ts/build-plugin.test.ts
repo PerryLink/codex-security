@@ -284,6 +284,62 @@ describe("bundled plugin build", () => {
     ]);
     expect(helper.stdout).toBe("[]\n");
     expect(helper.stderr).toBe("");
+
+    const repository = await temporaryDirectory();
+    const policy = "Preserve this synthetic inherited security policy.";
+    await writeFixture(
+      repository,
+      "SECURITY.md",
+      `# Synthetic policy\n${policy}\n`,
+    );
+    const alias = join(await temporaryDirectory(), "plugin link");
+    await symlink(
+      root,
+      alias,
+      process.platform === "win32" ? "junction" : "dir",
+    );
+    await mkdir(join(root, "scripts"), { recursive: true });
+    await copyFile(
+      new URL("scripts/launch_codex_security_mcp", source),
+      join(root, "scripts", "launch_codex_security_mcp"),
+    );
+    const node = (
+      await execFileAsync("node", ["--print", "process.execPath"])
+    ).stdout.trim();
+    for (const pluginPath of [root, alias]) {
+      const linkedHelper = join(pluginPath, "mcp", "helpers.mjs");
+      const list = await execFileAsync(
+        process.platform === "win32" ? node : "/bin/sh",
+        [
+          ...(process.platform === "win32"
+            ? [linkedHelper]
+            : [
+                join(pluginPath, "scripts", "launch_codex_security_mcp"),
+                "--helper",
+              ]),
+          "resolve-security-md",
+          "--repo",
+          repository,
+          "--list",
+        ],
+        { env: { ...process.env, CODEX_MCP_NODE_PATH: node, NODE_PATH: "" } },
+      );
+      expect(list.stdout).toBe('["SECURITY.md"]\n');
+      expect(list.stderr).toBe("");
+      const guidance = await execFileAsync(node, [
+        linkedHelper,
+        "resolve-security-md",
+        "--repo",
+        repository,
+        "--scope",
+        repository,
+        "--out",
+        "-",
+      ]);
+      expect(guidance.stdout).toContain(policy);
+      expect(guidance.stderr).toBe("");
+    }
+
   });
 
   test("builds from a source snapshot without Git metadata", async () => {
