@@ -137,6 +137,7 @@ from workbench_target_state import backfill_security_targets, ensure_security_ta
 from workbench_validation import (
     bounded_output_text,
     optional_text,
+    parse_budget_scan_cost,
     parse_scan_cost,
     path_within_scope,
     reject_non_finite_json,
@@ -1155,9 +1156,7 @@ def complete_budget_exhausted_scan(
     connection: sqlite3.Connection, args: argparse.Namespace
 ) -> dict[str, Any]:
     scan_id = require_uuid(args.scan_id, "scan-id")
-    cost_json = parse_scan_cost(args.cost_json)
-    if cost_json is None:
-        raise SystemExit("Budget-exhausted scan completion requires the measured scan cost.")
+    cost_json, measured = parse_budget_scan_cost(args.cost_json)
     with scan_completion_lock(scan_id):
         scan = require_scan(connection, scan_id)
         if scan["status"] != "running" or scan["mode"] != "deep" or scan["recipe_json"] is None:
@@ -1165,8 +1164,6 @@ def complete_budget_exhausted_scan(
         recipe = json.loads(scan["recipe_json"], parse_constant=reject_non_finite_json)
         if not isinstance(recipe, dict) or recipe.get("mode") != "deep":
             raise SystemExit("Budget-exhausted scan completion requires a Deep Scan launch recipe.")
-        cost = json.loads(cost_json)
-        measured = cost.get("cost", cost)
         limit = recipe.get("maxCostUsd")
         if (
             not isinstance(limit, (int, float))
