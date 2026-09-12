@@ -487,16 +487,10 @@ async function testDeepScanStdioLifecycle() {
     const completedDraft = JSON.parse(await readFile(completedWorker.resultManifestPath, "utf8"));
     assert.equal(completedDraft.scanId, resumedScanId);
     assert.deepEqual(completedDraft.findings, []);
-    assert.equal(partial.workflowVersion, "deep-security-scan/v2", "new scans use selected finalization by default");
+    assert.equal(partial.workflowVersion, "deep-security-scan/v1", "the prior reader starts the legacy workflow");
     assert.equal(partial.userContext, "Original discovery focus");
-    assert.equal(partial.usageOwner.threadId, resumedThreadId);
     const settingsPath = path.join(resumedScan.scanDir, "artifacts", "deep_discovery", "execution-settings.json");
-    const originalSettings = await readFile(settingsPath, "utf8");
-    assertNoError(await server.request(30, "tools/call", toolCall(
-      "update_codex_security_scan_context",
-      { scanId: resumedScanId, handoffClaimToken, userContext: "Later result discussion" },
-      resumedThreadId
-    )));
+    await assert.rejects(readFile(settingsPath), { code: "ENOENT" });
     await server.stop();
     assert.throws(() => process.kill(server.pid, 0), "the original MCP server must have exited");
     const paused = await runWorkbench(environment, ["get-scan", "--scan-id", resumedScanId]);
@@ -538,8 +532,6 @@ async function testDeepScanStdioLifecycle() {
       "--claim-token", handoffClaimToken, "--thread-id", resumedThreadId
     ]);
     await writeFile(restartControlPath, "after-restart");
-    // A replacement caller's configuration must not replace the original selection.
-    await writeFile(runtimeConfigPath, 'model_reasoning_summary = "detailed"\n');
 
     const restartedServer = startServer(serverBundlePath, environment);
     try {
@@ -565,14 +557,12 @@ async function testDeepScanStdioLifecycle() {
       });
       assert.equal(finished.status, "succeeded");
       assert.equal(finished.workflowVersion, partial.workflowVersion);
-      assert.equal(finished.finalizationInput.version, 1, "recovery selects a persisted finalization input");
       assert.equal(finished.coordinatorGeneration, partial.coordinatorGeneration + 1);
       assert.equal(finished.dispatchedCount, 2);
       assert.equal(finished.userContext, partial.userContext);
       assert.equal(finished.createdAt, partial.createdAt, "recovery retains the original deadline origin");
       assert.equal(finished.config.maxTimeHours, partial.config.maxTimeHours);
-      assert.deepEqual(finished.usageOwner, partial.usageOwner, "a replacement continuation does not rebind original usage");
-      assert.equal(await readFile(settingsPath, "utf8"), originalSettings);
+      await assert.rejects(readFile(settingsPath), { code: "ENOENT" });
       const successfulDiscoveries = finished.workers.filter((worker) => (
         worker.kind === "discovery" && worker.status === "succeeded"
       ));

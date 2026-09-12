@@ -811,6 +811,9 @@ async function testIsolatedReconstructedWorkers() {
         captureDeepScanExecutionSettings(settings, settings.parentSandbox, { ...codexOptions.env, CODEX_CLI_PATH: executable }, { threadId: `fixture-${name}-observer`, startedAt: "2026-01-01T00:01:00Z" }));
       assert.equal(saved.nativeServiceTierAbsent, name === "first" ? true : undefined);
       const snapshotPath = path.join(fixture.root, "artifacts", "deep_discovery", "execution-settings.json");
+      // Prior-reader fixture: this snapshot was written by the writer release.
+      await mkdir(path.dirname(snapshotPath), { recursive: true });
+      await writeFile(snapshotPath, JSON.stringify({ version: 1, settings: saved }));
       const snapshot = await readFile(snapshotPath, "utf8");
       assert.equal(snapshot.includes("synthetic-"), false);
       const runtimeEnvironment = { ...codexOptions.env };
@@ -841,6 +844,7 @@ async function testIsolatedReconstructedWorkers() {
             if (scan.name === "first") delete saved.settings.serviceTier;
             await writeFile(scan.snapshotPath, JSON.stringify(saved));
           }
+          const beforeRead = await readFile(scan.snapshotPath, "utf8");
           const recorded = await loadOrCaptureDeepScanExecutionSettings(scan.fixture.root, () =>
             assert.fail("reconstruction must not recapture current settings"), {
             ...scan.settings, createdAt: "2026-01-01T00:01:00Z"
@@ -848,7 +852,7 @@ async function testIsolatedReconstructedWorkers() {
           const restored = restoredDeepScanWorkerSettings(recorded, scan.settings.parentSandbox, () => scan.runtimeEnvironment);
           restored.codexOptions.baseUrl = scan.settings.codexOptions.baseUrl;
           scan.executor = new CodexSdkWorkerExecutor(restored);
-          assert.equal(await readFile(scan.snapshotPath, "utf8"), scan.snapshot);
+          assert.equal(await readFile(scan.snapshotPath, "utf8"), beforeRead, "the prior reader preserves the stored snapshot bytes");
         }
       }
       for (const scan of scans) {

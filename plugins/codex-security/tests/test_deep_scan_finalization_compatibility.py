@@ -28,7 +28,7 @@ def test_new_workflow_default_preserves_existing_run_version(
         str(tmp_path / "scans"),
         *(["--workflow-version", legacy_version] if legacy_version else []),
     )["deepScan"]
-    expected_version = legacy_version or "deep-security-scan/v2"
+    expected_version = legacy_version or "deep-security-scan/v1"
     assert created["workflowVersion"] == expected_version
     resumed = run_workbench(
         state,

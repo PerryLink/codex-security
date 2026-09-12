@@ -405,7 +405,7 @@ def test_workbench_serializes_concurrent_first_run_migrations(tmp_path: Path) ->
         {"databasePath": str(state_dir / "workbench.sqlite3")},
     ]
     with sqlite3.connect(state_dir / "workbench.sqlite3") as connection:
-        assert connection.execute("SELECT COUNT(*) FROM schema_migrations").fetchone() == (46,)
+        assert connection.execute("SELECT COUNT(*) FROM schema_migrations").fetchone() == (45,)
 
 
 @pytest.mark.parametrize("previous_history", ["main", "comparison-preview"])
@@ -867,7 +867,6 @@ def test_workbench_creates_single_final_schema(tmp_path: Path) -> None:
             (39, "store dedupe checkpoint bindings in columns"),
             (40, "index finding identity and comparison history"),
             (41, "checkpoint finding severity assessments"),
-            (44, "preserve original deep scan discovery context"),
             (45, "retain deep scan attempts and exact merge inputs"),
             (46, "persist selected deep scan finalization input"),
             (47, "freeze stopped scan checkpoint selections"),
@@ -2001,7 +2000,6 @@ def test_workbench_upgrades_released_database_schema(tmp_path: Path) -> None:
             (39, "store dedupe checkpoint bindings in columns"),
             (40, "index finding identity and comparison history"),
             (41, "checkpoint finding severity assessments"),
-            (44, "preserve original deep scan discovery context"),
             (45, "retain deep scan attempts and exact merge inputs"),
             (46, "persist selected deep scan finalization input"),
             (47, "freeze stopped scan checkpoint selections"),
@@ -2089,7 +2087,6 @@ def test_workbench_upgrades_pre_release_phase_progress_migration(tmp_path: Path)
             (39, "store dedupe checkpoint bindings in columns"),
             (40, "index finding identity and comparison history"),
             (41, "checkpoint finding severity assessments"),
-            (44, "preserve original deep scan discovery context"),
             (45, "retain deep scan attempts and exact merge inputs"),
             (46, "persist selected deep scan finalization input"),
             (47, "freeze stopped scan checkpoint selections"),
@@ -2185,7 +2182,6 @@ def test_workbench_upgrades_pre_release_preflight_progress_migration(tmp_path: P
             (39, "store dedupe checkpoint bindings in columns"),
             (40, "index finding identity and comparison history"),
             (41, "checkpoint finding severity assessments"),
-            (44, "preserve original deep scan discovery context"),
             (45, "retain deep scan attempts and exact merge inputs"),
             (46, "persist selected deep scan finalization input"),
             (47, "freeze stopped scan checkpoint selections"),

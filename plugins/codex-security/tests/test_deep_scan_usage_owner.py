@@ -40,7 +40,28 @@ def test_original_usage_turn_survives_join_and_coordinator_recovery(tmp_path: Pa
         str(tmp_path / "scans"),
         environment=environment,
     )["deepScan"]
-    owner = begun["usageOwner"]
+    # A writer recorded the original turn; joining and recovery only read it.
+    owner = {
+        "threadId": "shared-parent",
+        "turnId": "original-turn",
+        "startedAt": begun["createdAt"],
+        "dedicated": False,
+    }
+    with sqlite3.connect(state / "workbench.sqlite3") as connection:
+        connection.execute(
+            "UPDATE deep_scan_runs SET usage_owner_json = ? WHERE scan_id = ?",
+            (json.dumps(owner), begun["scanId"]),
+        )
+    observed = run_workbench(
+        state,
+        "get-deep-scan",
+        "--scan-id",
+        begun["scanId"],
+        "--thread-id",
+        "shared-parent",
+        environment=environment,
+    )["deepScan"]
+    assert observed["usageOwner"] == owner
     assert owner["threadId"] == "shared-parent"
     assert owner["turnId"] == "original-turn"
     assert owner["dedicated"] is False
@@ -90,6 +111,21 @@ def test_original_usage_turn_survives_join_and_coordinator_recovery(tmp_path: Pa
         ".",
         "--scan-root",
         str(tmp_path / "scans"),
+        environment=environment,
+    )["deepScan"]
+    other_owner = {**owner, "turnId": "later-turn", "startedAt": other["createdAt"]}
+    with sqlite3.connect(state / "workbench.sqlite3") as connection:
+        connection.execute(
+            "UPDATE deep_scan_runs SET usage_owner_json = ? WHERE scan_id = ?",
+            (json.dumps(other_owner), other["scanId"]),
+        )
+    other = run_workbench(
+        state,
+        "get-deep-scan",
+        "--scan-id",
+        other["scanId"],
+        "--thread-id",
+        "shared-parent",
         environment=environment,
     )["deepScan"]
     assert other["usageOwner"]["turnId"] == "later-turn"

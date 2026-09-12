@@ -16,9 +16,7 @@ def snapshot(state_dir: Path) -> str:
         return "\n".join(connection.iterdump())
 
 
-@pytest.mark.parametrize(
-    "version", ["deep-security-scan/v1", "deep-scan-mcp/v1", "deep-security-scan/v2"]
-)
+@pytest.mark.parametrize("version", ["deep-security-scan/v1", "deep-scan-mcp/v1"])
 def test_supported_workflows_keep_their_identity(tmp_path: Path, version: str) -> None:
     target = tmp_path / "target"
     target.mkdir()
@@ -161,7 +159,12 @@ def test_reader_honors_original_context_when_present(tmp_path: Path, original: s
     assert observed["userContext"] == original
 
 
-def test_unsupported_new_workflow_does_not_claim_registered_scan(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "version,message", [("future/v99", "unsupported"), ("deep-security-scan/v2", "newer version")]
+)
+def test_unsupported_new_workflow_does_not_claim_registered_scan(
+    tmp_path: Path, version: str, message: str
+) -> None:
     state = tmp_path / "state"
     target = tmp_path / "target"
     target.mkdir()
@@ -195,9 +198,9 @@ def test_unsupported_new_workflow_does_not_claim_registered_scan(tmp_path: Path)
         "--thread-id",
         "fixture-thread",
         "--workflow-version",
-        "future/v99",
+        version,
         check=False,
     )
     assert rejected["returncode"] != 0
-    assert "unsupported" in str(rejected["stderr"]).lower()
+    assert message in str(rejected["stderr"]).lower()
     assert snapshot(state) == before

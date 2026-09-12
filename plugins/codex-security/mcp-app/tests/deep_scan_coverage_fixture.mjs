@@ -64,7 +64,7 @@ export async function publishCoverageFixture(root, completeness, {
   };
   const store = new WorkbenchDeepScanStore(runWorkbench);
   let { run } = await store.begin({ targetPath, scope: ".", threadId, scanRoot });
-  assert.equal(run.workflowVersion, "deep-security-scan/v2", "new scans use persisted finalization");
+  assert.equal(run.workflowVersion, "deep-security-scan/v1", "the prior reader starts the legacy workflow");
   if (selectedRecovery) {
     ({ run } = await store.claimCoordinator({ scanId: run.scanId, threadId }));
   } else {
@@ -177,7 +177,7 @@ export async function publishCoverageFixture(root, completeness, {
       }
       rawSources.set(resultManifestPath, await readFile(resultManifestPath, "utf8"));
       const committed = await store.commitDedup({ id, scanId: run.scanId, newFindings: materialFindings && index === 0 ? 1 : 0, resultManifestPath });
-      lastReducerReference = committed.committedMerge.resultManifestPath;
+      lastReducerReference = committed.persistedWorkers.find((worker) => worker.id === id).resultManifestPath;
       lastReducerId = id;
     }
     if (legacyAttempts) {

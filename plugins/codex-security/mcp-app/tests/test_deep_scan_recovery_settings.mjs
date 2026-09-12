@@ -35,6 +35,8 @@ try {
   }));
   assert.deepEqual(first, settings);
   const savedPath = join(root, "one", "artifacts", "deep_discovery", "execution-settings.json");
+  await assert.rejects(readFile(savedPath), { code: "ENOENT" });
+  await writeSettingsFixture(join(root, "one"), first);
   const saved = await readFile(savedPath, "utf8");
   assert.equal(saved.includes("synthetic-do-not-persist"), false);
   const [recovered, concurrent] = await Promise.all([
@@ -152,7 +154,7 @@ http_headers = { Authorization = "synthetic-secret" }
     assert.equal(fresh.reasoningSummary, undefined, "fresh native compatibility auto is not an original selection");
     assert.equal(restoreSettings(fresh, { filesystemDenies: [] }).codexOptions.config.model_reasoning_summary, undefined);
     const freshDir = join(root, threadId);
-    await loadSettings(freshDir, async () => fresh);
+    await writeSettingsFixture(freshDir, fresh);
     const freshPath = join(freshDir, "artifacts", "deep_discovery", "execution-settings.json");
     const freshBytes = await readFile(freshPath, "utf8");
     assert.deepEqual(await loadSettings(freshDir, async () => assert.fail(), { usageOwner: owner, createdAt: owner.startedAt }), fresh);
@@ -184,7 +186,7 @@ http_headers = { Authorization = "synthetic-secret" }
   const tierDir = join(root, "missing-tier");
   const { serviceTier: omittedTier, ...withoutTier } = applied;
   assert.equal(omittedTier, "default");
-  await loadSettings(tierDir, async () => withoutTier);
+  await writeSettingsFixture(tierDir, withoutTier);
   const repairedTier = await loadSettings(tierDir, async () => assert.fail(), {
     usageOwner: appliedOwner, createdAt: "2026-01-01T00:01:00Z"
   });
@@ -213,7 +215,7 @@ http_headers = { Authorization = "synthetic-secret" }
   assert.equal(nativeDefaults.reasoningSummary, undefined, "a compatibility summary is not a recorded native default");
   const incompleteDir = join(root, "incomplete");
   const incomplete = { codexPath: process.execPath, codexHome: root, serviceTier: "flex" };
-  await loadSettings(incompleteDir, async () => incomplete);
+  await writeSettingsFixture(incompleteDir, incomplete);
   await writeFile(join(root, "config.toml"), 'model_provider = "observer-provider"\nmodel_reasoning_summary = "detailed"\n');
   const originalRun = { model: "stored-model", reasoningEffort: "ultra", usageOwner: originalOwner,
     createdAt: "2026-01-01T00:01:00Z" };
@@ -221,12 +223,15 @@ http_headers = { Authorization = "synthetic-secret" }
   assert.deepEqual(repaired, { ...incomplete, model: "stored-model", reasoningEffort: "ultra",
     modelProvider: "openai", reasoningSummary: "none" });
   const repairedPath = join(incompleteDir, "artifacts", "deep_discovery", "execution-settings.json");
+  assert.deepEqual(JSON.parse(await readFile(repairedPath, "utf8")).settings, incomplete, "the reader does not persist a settings upgrade");
+  // Replay a full snapshot that the later writer has already upgraded.
+  await writeSettingsFixture(incompleteDir, repaired);
   const repairedBytes = await readFile(repairedPath, "utf8");
   await rm(sessionDirectory, { recursive: true });
   assert.deepEqual(await loadSettings(incompleteDir, async () => assert.fail(), originalRun), repaired);
   assert.equal(await readFile(repairedPath, "utf8"), repairedBytes, "recovered selections survive unavailable history");
   const unknownDir = join(root, "unknown");
-  await loadSettings(unknownDir, async () => incomplete);
+  await writeSettingsFixture(unknownDir, incomplete);
   const unknown = await loadSettings(unknownDir, async () => assert.fail(), { ...originalRun, usageOwner: null });
   assert.equal(unknown.model, "stored-model");
   assert.equal(unknown.modelProvider, undefined, "missing original ownership is not current config");
@@ -238,4 +243,10 @@ http_headers = { Authorization = "synthetic-secret" }
   assert.equal(await readFile(savedPath, "utf8"), unsupported);
 } finally {
   await rm(root, { recursive: true, force: true });
+}
+
+async function writeSettingsFixture(scanDir, settings) {
+  const directory = join(scanDir, "artifacts", "deep_discovery");
+  await mkdir(directory, { recursive: true });
+  await writeFile(join(directory, "execution-settings.json"), JSON.stringify({ version: 1, settings }));
 }

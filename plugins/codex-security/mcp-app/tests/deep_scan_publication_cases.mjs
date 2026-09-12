@@ -1,6 +1,5 @@
 import assert from "node:assert/strict";
-import { createHash } from "node:crypto";
-import { readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { readFile, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 
 export async function testDeepScanPublication({
@@ -109,21 +108,7 @@ export async function testDeepScanPublication({
 
   async function testSaturationIgnoresDiscoveryCancellationWriteFailure() {
     const fixture = await fixtureRun({ workers: 2, subagents: 0, stopAfterNoNew: 2, maxDiscoveryRuns: 6 });
-    fixture.run.workflowVersion = "deep-security-scan/v2";
     const store = new FakeStore(fixture.run);
-    store.selectFinalization = async (input) => {
-      const checkpointRoot = path.join(path.dirname(input.resultPath), "checkpoints");
-      const [name] = await readdir(checkpointRoot);
-      const checkpoint = path.join(checkpointRoot, name);
-      const bytes = await readFile(checkpoint);
-      store.run.finalizationInput = {
-        version: 1, resultPath: path.relative(fixture.run.scanDir, checkpoint),
-        resultSha256: createHash("sha256").update(bytes).digest("hex"),
-        terminalReason: input.reason, omittedWorkerIds: input.omittedWorkerIds,
-        selectedAt: "2026-01-01T00:00:00Z",
-      };
-      return structuredClone(store.run);
-    };
     const executor = new FakeExecutor({ blockDedup: true, blockDiscoveryAfterCalls: 2 });
     const updateWorker = store.updateWorker.bind(store);
     const rejectedCancellations = new Set();
@@ -163,8 +148,9 @@ export async function testDeepScanPublication({
       worker.kind === "dedup" && worker.status === "succeeded"
     ));
     const { coverage, ...publishedReduction } = completed[0];
+    assert.equal(coverage.reviews.length, 2, "both completed audits retain source coverage in the publication");
     assert.deepEqual(
-      { ...publishedReduction, sourceCoverage: coverage },
+      publishedReduction,
       JSON.parse(await readFile(acceptedReducer.resultManifestPath, "utf8")),
       "the accepted aggregate still reaches publication when redundant cancellation writes fail",
     );

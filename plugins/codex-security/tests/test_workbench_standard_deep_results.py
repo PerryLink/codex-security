@@ -1399,10 +1399,24 @@ def test_failure_preserves_last_committed_reducer_without_parent_draft(tmp_path:
     draft = json.loads(result_path.read_text())
     draft["findings"] = json.loads((contract_dir / "findings.json").read_text())["findings"]
     result_path.write_text(json.dumps(draft))
-    _, reducer_path, _ = committed_standard_reducer(
+    reducer_id, reducer_path, _ = committed_standard_reducer(
         state_dir, codex_home, scan_dir, scan_id, worker_id, result_path
     )
     reduced = json.loads(reducer_path.read_text())
+    # The later writer retained this accepted reference before result.json changed.
+    import hashlib
+
+    accepted = write_checkpoint(reducer_path.parent / "checkpoints", reduced)
+    with sqlite3.connect(state_dir / "workbench.sqlite3") as connection:
+        connection.execute("PRAGMA foreign_keys = ON")
+        connection.execute(
+            "INSERT INTO deep_scan_attempts "
+            "(scan_id, worker_id, attempt, status, started_at, completed_at, "
+            "accepted_result_path, accepted_result_sha256) "
+            "SELECT scan_id, id, attempt, status, created_at, completed_at, ?, ? "
+            "FROM deep_scan_workers WHERE id = ?",
+            (str(accepted), hashlib.sha256(accepted.read_bytes()).hexdigest(), reducer_id),
+        )
     accepted_summary = reduced["findings"][0]["summary"]
     reduced["findings"][0]["summary"] = (
         "The reducer retained additional independently reviewed evidence."

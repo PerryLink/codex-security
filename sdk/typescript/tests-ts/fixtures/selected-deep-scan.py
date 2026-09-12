@@ -64,4 +64,17 @@ with sqlite3.connect(payload["database"]) as connection:
                 )
             # The committed immutable reference survives loss of the replaceable output.
             result.unlink()
+    # A prior writer selected this aggregate before the public reader resumed it.
+    selection = {
+        "version": 1,
+        "resultPath": accepted.relative_to(scan_dir).as_posix(),
+        "resultSha256": digest,
+        "terminalReason": payload["terminalReason"],
+        "omittedWorkerIds": [],
+        "selectedAt": timestamp,
+    }
+    connection.execute(
+        "UPDATE deep_scan_runs SET finalization_input_json = ?, terminal_reason = ? WHERE scan_id = ?",
+        (json.dumps(selection), payload["terminalReason"], scan_id),
+    )
 print(json.dumps({"resultPath": str(result), "acceptedPath": str(accepted)}))

@@ -359,6 +359,9 @@ for (const { outcome, budgetCompletionFault, cancellationFault } of cases) {
                           scanDir,
                           database: join(stateDir, "workbench.sqlite3"),
                           draft,
+                          terminalReason: loseCompletionResponse
+                            ? "capped"
+                            : "saturated",
                         }),
                         encoding: "utf8",
                         env: environment,
