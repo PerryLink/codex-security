@@ -2659,7 +2659,7 @@ describe("recorded Deep worker homes", () => {
     ["prefix-last", false],
     ["prefix-last", true],
   ] as const)(
-    "prices copied response records (%s, attribution: %s)",
+    "prices copied response records (%s, attribution: %j)",
     async (copy, attributed) => {
       const home = await codexHome();
       const recordedHome = await codexHome();

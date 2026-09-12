@@ -4773,7 +4773,7 @@ describe("CodexSecurity orchestration", () => {
     ["standard", true],
     ["deep", true],
   ] as const)(
-    "enforces priced usage with an unpriced remainder (%s, raised limit: %s)",
+    "enforces priced usage with an unpriced remainder (%s, raised limit: %j)",
     async (mode, raised) => {
       const root = await temporaryDirectory();
       const repository = join(root, "repository");
@@ -7484,7 +7484,7 @@ if ([basename(process.argv[1]), ...process.argv.slice(2)].join(" ") !== "login s
     ["deep", false],
     ["deep", true],
   ] as const)(
-    "isolates concurrent managed %s sessions at the Codex child boundary (capture=%s)",
+    "isolates concurrent managed %s sessions at the Codex child boundary (capture=%j)",
     async (mode, captureSummary) => {
       const clients: TestClient[] = [];
       try {
