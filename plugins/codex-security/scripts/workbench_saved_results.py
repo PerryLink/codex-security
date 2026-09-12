@@ -349,9 +349,11 @@ def _saved_results_changed(db: Any, connection: Any, scan: Any) -> bool:
         published_sources = _source_digests(
             manifest_scan.get("preservedSources", {}), "Published scan"
         )
-        if _worker_checkpoint_heads(
-            scan_dir, workers, scan["id"], accepted_digests
-        ) != manifest_scan.get("preservedCheckpointHeads", {}):
+        if (
+            "preservedCheckpointHeads" in manifest_scan
+            and _worker_checkpoint_heads(scan_dir, workers, scan["id"], accepted_digests)
+            != manifest_scan["preservedCheckpointHeads"]
+        ):
             return True
         current_sources = dict(published_sources)
         for path in paths:
@@ -372,11 +374,15 @@ def _saved_results_changed(db: Any, connection: Any, scan: Any) -> bool:
 
 def _recovery_source_digests(
     db: Any, connection: Any, scan: Any
-) -> tuple[dict[str, str], bool, dict[str, str]]:
+) -> tuple[dict[str, str], bool, dict[str, str] | None]:
     scan_dir = db.require_canonical_scan_directory(Path(scan["scan_dir"]))
     frozen_sources: dict[str, str] | None = None
     include_parent = True
     raw_frozen_sources = scan["retained_source_digests_json"]
+    raw_checkpoint_heads = scan["retained_checkpoint_heads_json"]
+    checkpoint_heads = (
+        json.loads(raw_checkpoint_heads) if raw_checkpoint_heads is not None else None
+    )
     if raw_frozen_sources is not None:
         frozen_sources = _source_digests(json.loads(raw_frozen_sources), "Saved stopped-scan")
         include_parent = False
@@ -394,6 +400,8 @@ def _recovery_source_digests(
         if scan["seal_manifest_digest"] is not None or (
             manifest_scan.get("sealedAt") is not None or manifest_scan.get("artifacts") is not None
         ):
+            if checkpoint_heads is None:
+                checkpoint_heads = manifest_scan.get("preservedCheckpointHeads")
             if "preservedSources" in manifest_scan:
                 published_sources = _source_digests(
                     manifest_scan["preservedSources"], "Published scan"
@@ -412,7 +420,6 @@ def _recovery_source_digests(
 
     workers = _saved_workers(connection, scan["id"])
     accepted_digests = _accepted_source_digests(connection, scan["id"])
-    checkpoint_heads = _worker_checkpoint_heads(scan_dir, workers, scan["id"], accepted_digests)
     paths = dict(_saved_result_paths(scan_dir, workers))
     recovery_sources = dict(frozen_sources or {})
     for relative, expected_digest in recovery_sources.items():
@@ -440,6 +447,14 @@ def _recovery_source_digests(
             )
         except (ContractError, OSError, ValueError):
             continue
+    if checkpoint_heads is not None and (
+        recovery_sources != frozen_sources
+        or _worker_checkpoint_heads(scan_dir, workers, scan["id"], accepted_digests)
+        != checkpoint_heads
+    ):
+        raise SystemExit(
+            "This stopped scan requires a newer version to select recovery checkpoints."
+        )
     return recovery_sources, include_parent, checkpoint_heads
 
 
@@ -588,10 +603,6 @@ def merge_saved_results(
 ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]] | None:
     """Read only bound parent/worker files; return an unsealed loss-preserving union."""
     initial_warnings = set(warnings)
-    if checkpoint_heads is None:
-        checkpoint_heads = _worker_checkpoint_heads(
-            scan_dir, workers, scan_id, accepted_source_digests
-        )
     parent: dict[str, Any] | None = None
     parent_manifest: dict[str, Any] | None = None
     if frozen_source_digests is None or allow_frozen_legacy_parent:
@@ -680,7 +691,7 @@ def merge_saved_results(
             continue
         if worker["kind"] != "discovery":
             continue
-        head = checkpoint_heads.get(output)
+        head = (checkpoint_heads or {}).get(output)
         if head is not None:
             paths[head] = worker["id"]
             current_results.add(head)
@@ -702,7 +713,7 @@ def merge_saved_results(
         )
         for name in archived_attempts:
             archived = (attempts / name).as_posix()
-            archived_head = checkpoint_heads.get(archived)
+            archived_head = (checkpoint_heads or {}).get(archived)
             if archived_head is not None:
                 paths[archived_head] = worker["id"]
                 current_results.add(archived_head)
@@ -793,7 +804,7 @@ def merge_saved_results(
         and parent_manifest["scan"].get("sealedAt")
         and parent_manifest["scan"].get("status") == binding["status"]
         and parent_manifest["scan"].get("preservedSources") == source_digests
-        and parent_manifest["scan"].get("preservedCheckpointHeads", {}) == checkpoint_heads
+        and parent_manifest["scan"].get("preservedCheckpointHeads") == checkpoint_heads
         and all(warning in initial_warnings for warning in warnings)
     ):
         return None
@@ -825,7 +836,8 @@ def merge_saved_results(
     for key in ("sealedAt", "artifacts"):
         manifest["scan"].pop(key, None)
     manifest["scan"]["preservedSources"] = source_digests
-    manifest["scan"]["preservedCheckpointHeads"] = checkpoint_heads
+    if checkpoint_heads is not None:
+        manifest["scan"]["preservedCheckpointHeads"] = checkpoint_heads
     coverage = (
         copy.deepcopy(parent["coverage"])
         if parent and parent["coverage"]
@@ -1292,7 +1304,10 @@ def preserve_scan_results_locked(
         frozen_source_digests = _source_digests(
             json.loads(raw_frozen_sources), "Saved stopped-scan"
         )
-        checkpoint_heads = json.loads(scan["retained_checkpoint_heads_json"] or "{}")
+        raw_checkpoint_heads = scan["retained_checkpoint_heads_json"]
+        checkpoint_heads = (
+            json.loads(raw_checkpoint_heads) if raw_checkpoint_heads is not None else None
+        )
     scan_dir = db.require_canonical_scan_directory(Path(scan["scan_dir"]))
     deep_run = connection.execute(
         "SELECT * FROM deep_scan_runs WHERE scan_id = ?", (scan_id,)
@@ -1348,15 +1363,11 @@ def preserve_scan_results_locked(
             db.index_findings(connection, scan_id, findings, scan["completed_at"])
             connection.execute(
                 "UPDATE scans SET seal_manifest_digest = ?, retained_source_digests_json = ?, "
-                "retained_checkpoint_heads_json = ?, "
                 "completion_warnings_json = ?, "
                 "updated_at = ? WHERE id = ? AND status = 'failed'",
                 (
                     digest,
                     json.dumps(retained_sources, sort_keys=True),
-                    json.dumps(
-                        manifest["scan"].get("preservedCheckpointHeads", {}), sort_keys=True
-                    ),
                     json.dumps(list(dict.fromkeys(warnings))),
                     timestamp,
                     scan_id,
@@ -1383,7 +1394,9 @@ def preserve_scan_results_locked(
         db.verify_manifest_binding(scan, existing)
         if existing_scan.get("status") == outcome:
             existing_sources = existing_scan.get("preservedSources")
-            existing_heads = existing_scan.get("preservedCheckpointHeads", {})
+            existing_heads = existing_scan.get("preservedCheckpointHeads")
+            if checkpoint_heads is None:
+                checkpoint_heads = existing_heads
             if frozen_source_digests is None:
                 if not isinstance(existing_sources, dict) or not all(
                     isinstance(relative, str) and isinstance(digest, str)
@@ -1449,14 +1462,10 @@ def preserve_scan_results_locked(
         frozen_source_digests = retained_sources
         with connection:
             connection.execute(
-                "UPDATE scans SET retained_source_digests_json = ?, "
-                "retained_checkpoint_heads_json = ? "
+                "UPDATE scans SET retained_source_digests_json = ? "
                 "WHERE id = ? AND retained_source_digests_json IS NULL",
                 (
                     json.dumps(retained_sources, sort_keys=True),
-                    json.dumps(
-                        documents[0]["scan"].get("preservedCheckpointHeads", {}), sort_keys=True
-                    ),
                     scan_id,
                 ),
             )
