@@ -1310,7 +1310,10 @@ def budget_exhausted_draft(
             if not isinstance(coverage.get(key), list):
                 raise SystemExit("Budget-exhausted scan contains invalid canonical coverage.")
         if manifest["scan"].get("sealedAt") is not None or manifest["scan"].get("artifacts"):
-            raise SystemExit("Budget-exhausted scan cannot replace an already sealed scan draft.")
+            saved_results.validate_sealed_budget_draft(
+                _WORKBENCH_DB_CONTEXT, scan, scan_dir, manifest
+            )
+            return
     else:
         contract = scan_contract(scan)
         target_contract = contract["target"]

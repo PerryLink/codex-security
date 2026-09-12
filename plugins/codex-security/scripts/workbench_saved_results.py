@@ -80,6 +80,21 @@ class WorkbenchDbContext:
     workspace_state: Callable[..., dict[str, Any]]
 
 
+def validate_sealed_budget_draft(
+    db: WorkbenchDbContext, scan: sqlite3.Row, scan_dir: Path, manifest: dict[str, Any]
+) -> None:
+    # The seal can reach disk before parent completion commits. Validate
+    # it without changing bytes; the existing finalizer commits replay.
+    try:
+        _prepare_scan_finalization(
+            scan_dir,
+            expected_coverage_mode=db.expected_coverage_mode(scan),
+            completion_binding=db.workbench_completion_binding(scan, scan["started_at"], manifest),
+        )
+    except ContractError as exc:
+        raise SystemExit(str(exc)) from exc
+
+
 def _encoded(value: Any) -> bytes:
     return json.dumps(
         value, ensure_ascii=True, allow_nan=False, sort_keys=True, separators=(",", ":")
