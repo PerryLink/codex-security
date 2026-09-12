@@ -1,4 +1,4 @@
-import { resolve } from "node:path";
+import { existsSync, realpathSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 export { parseCanonicalScanDraft } from "./src/artifact-scan-draft.js";
 import { resolveSecurityMdCommand } from "./src/helpers/resolve-security-md";
@@ -7,7 +7,11 @@ import { windowsBinding } from "./src/native";
 
 // Importing the bundled helper from the SDK does not invoke its CLI adapter.
 const entryPath = import.meta.url.startsWith("file:") ? fileURLToPath(import.meta.url) : import.meta.url;
-if (process.argv[1] && resolve(process.argv[1]) === entryPath) runHelper();
+const invokedPath = process.argv[1];
+if (
+  invokedPath && existsSync(invokedPath)
+  && realpathSync(invokedPath) === realpathSync(entryPath)
+) runHelper();
 
 function runHelper(): void {
   let commandLine = process.argv.slice(2);
