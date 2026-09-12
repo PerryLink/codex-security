@@ -206,16 +206,6 @@ export class DeepScanWorkerRunner {
       return { type: "discovery", status: "canceled", workerId };
     }
 
-    if (this.options.signal.aborted) {
-      await this.persistWorkerCancellation({
-        workerId,
-        kind: "discovery",
-        promptPath,
-        artifactDir
-      }, outcome.attempt, outcome.threadId);
-      return { type: "discovery", status: "canceled", workerId };
-    }
-
     const acceptance = {
       id: workerId,
       scanId: run.scanId,
@@ -370,29 +360,9 @@ export class DeepScanWorkerRunner {
       };
     }
     if (outcome.status === "canceled") throw abortError();
-    if (this.options.signal.aborted) {
-      await this.persistWorkerCancellation({
-        workerId: reducerId,
-        kind: "dedup",
-        promptPath,
-        artifactDir
-      }, outcome.attempt, outcome.threadId);
-      throw abortError(this.options.signal.reason);
-    }
-
     if (!reducerValidation) {
       throw new Error(`${reducerId} completed without validated reducer artifacts.`);
     }
-    if (this.options.signal.aborted) {
-      await this.persistWorkerCancellation({
-        workerId: reducerId,
-        kind: "dedup",
-        promptPath,
-        artifactDir
-      }, outcome.attempt, outcome.threadId);
-      throw abortError(this.options.signal.reason);
-    }
-
     const commit = {
       id: reducerId,
       scanId: run.scanId,
