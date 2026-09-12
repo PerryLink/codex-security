@@ -339,7 +339,6 @@ describe("bundled plugin build", () => {
       expect(guidance.stdout).toContain(policy);
       expect(guidance.stderr).toBe("");
     }
-
   });
 
   test("builds from a source snapshot without Git metadata", async () => {
