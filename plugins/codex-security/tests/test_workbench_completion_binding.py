@@ -86,6 +86,8 @@ def test_deep_completion_returns_sealed_coverage_on_replay(
     coverage_path.write_text(json.dumps(coverage))
     completed = run_workbench(state_dir, "complete-scan", "--scan-id", scan_id)
     canonical = json.loads(coverage_path.read_text())
+    assert canonical["completeness"] == completeness
+    assert len(canonical["deferred"]) == (1 if completeness == "partial" else 0)
     expected = {
         "completeness": canonical["completeness"],
         "surfaceCount": len(canonical["surfaces"]),
