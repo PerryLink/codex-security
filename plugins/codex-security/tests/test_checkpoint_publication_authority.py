@@ -2,12 +2,120 @@ from __future__ import annotations
 
 import copy
 import json
+import uuid
 from argparse import Namespace
 
 import pytest
 from test_deep_scan_successful_publication import add_worker
 from test_deep_scan_successful_publication import publication_scan as publication_scan
-from workbench_test_support import write_checkpoint
+from test_workbench_standard_deep_results import deep_scan_fixture, worker_paths
+from workbench_test_support import run_workbench, write_checkpoint, write_completed_contract
+
+
+def test_public_stop_retains_accepted_partial_evidence_and_newer_rejection(tmp_path):
+    state, home, target, scan_dir, scan_id = deep_scan_fixture(tmp_path, workers=2)
+    environment = {"CODEX_HOME": str(home)}
+    contract = tmp_path / "contract"
+    contract.mkdir()
+    write_completed_contract(contract, scan_id, target, relative_path="app.py")
+    finding = json.loads((contract / "findings.json").read_text())["findings"][0]
+    deferred = {
+        "candidateId": "pending-query",
+        "reason": "Validation is pending.",
+        "paths": ["app.py"],
+    }
+    coverage = {
+        "completeness": "partial",
+        "surfaces": [],
+        "explicitExclusions": [],
+        "deferred": [deferred],
+    }
+    workers = []
+    for accepted in (True, False):
+        name = "accepted" if accepted else "interrupted"
+        prompt, output, result = worker_paths(scan_dir, name)
+        worker_id = str(uuid.uuid4())
+        worker_args = (
+            "upsert-deep-scan-worker",
+            "--scan-id",
+            scan_id,
+            "--worker-id",
+            worker_id,
+            "--kind",
+            "discovery",
+            "--prompt-path",
+            str(prompt),
+            "--artifact-dir",
+            str(output),
+            "--attempt",
+            "1",
+        )
+        run_workbench(state, *worker_args, "--status", "running", environment=environment)
+        current = copy.deepcopy(finding)
+        current["identity"]["anchor"] = name
+        current["extensions"] = {"candidateId": name}
+        draft = {"scanId": scan_id, "complete": True, "findings": [current], "coverage": coverage}
+        result.write_text(json.dumps(draft))
+        write_checkpoint(output / "checkpoints", draft)
+        if accepted:
+            run_workbench(
+                state,
+                *worker_args,
+                "--status",
+                "succeeded",
+                "--result-manifest-path",
+                str(result),
+                environment=environment,
+            )
+        else:
+            rejected = {
+                **draft,
+                "complete": False,
+                "findings": [],
+                "coverage": {
+                    **coverage,
+                    "surfaces": [
+                        {
+                            "candidateId": name,
+                            "label": "Reviewed candidate",
+                            "disposition": "rejected",
+                            "receiptRefs": [],
+                        }
+                    ],
+                },
+            }
+            head = write_checkpoint(output / "checkpoints", rejected)
+            (output / "checkpoint-head.json").write_text(json.dumps({"checkpoint": head.name}))
+        workers.append(worker_id)
+
+    stopped = run_workbench(
+        state,
+        "fail-deep-scan",
+        "--scan-id",
+        scan_id,
+        "--message",
+        "Original worker failure.",
+        "--deep-status",
+        "interrupted",
+        environment=environment,
+    )["deepScan"]
+    assert stopped["status"] == "interrupted"
+    scan = run_workbench(state, "get-scan", "--scan-id", scan_id)["scan"]
+    assert scan["findingCount"] == 1
+    findings = json.loads((scan_dir / "findings.json").read_text())["findings"]
+    assert [item["identity"]["anchor"] for item in findings] == ["accepted"]
+    retained_coverage = json.loads((scan_dir / "coverage.json").read_text())
+    assert retained_coverage["completeness"] == "partial"
+    assert any(item.get("candidateId") == "pending-query" for item in retained_coverage["deferred"])
+    assert any(
+        item.get("candidateId") == "interrupted" and item["disposition"] == "rejected"
+        for item in retained_coverage["surfaces"]
+    )
+    assert scan["failureMessage"] == "Original worker failure."
+    assert {worker["id"]: worker["status"] for worker in stopped["workers"]} == {
+        workers[0]: "succeeded",
+        workers[1]: "canceled",
+    }
 
 
 @pytest.mark.parametrize("archived", [False, True], ids=["current", "archived"])
@@ -111,9 +219,9 @@ def test_newer_checkpoint_disposition_precedes_older_archived_head(
     scan = publication_scan()
     (scan.scan_dir / "findings.json").write_text(json.dumps({"findings": []}))
     result = add_worker(workbench_db, scan, status="canceled")
-    old = result.parent / "attempts" / "attempt-1"
+    old = result.parent / "attempts" / "attempt-2"
     save_disposition(scan, old, "rejected" if disposition == "reported" else "reported")
-    current = result.parent / "attempts" / "attempt-2" if archived else result.parent
+    current = result.parent / "attempts" / "attempt-10" if archived else result.parent
     draft = save_disposition(scan, current, disposition)
     (current / "result.json").write_text(json.dumps(draft))
 
@@ -129,19 +237,42 @@ def test_newer_checkpoint_disposition_precedes_older_archived_head(
 def test_frozen_stopped_replay_ignores_later_worker_head_changes(
     workbench_api, workbench_db, publication_scan, monkeypatch, head_change
 ):
+    import finalize_scan_contract
+
     scan = publication_scan()
     (scan.scan_dir / "findings.json").write_text(json.dumps({"findings": []}))
     result = add_worker(workbench_db, scan, status="canceled")
     previous = save_disposition(scan, result.parent, "reported")
     result.write_text(json.dumps(previous))
     save_disposition(scan, result.parent, "rejected")
-    saved = workbench_api["saved_results"]
+    checkpoint_name = json.loads((result.parent / "checkpoint-head.json").read_text())["checkpoint"]
+    directory = result.parent.relative_to(scan.scan_dir).as_posix()
+    expected_heads = {directory: f"{directory}/checkpoints/{checkpoint_name}"}
+    original_outputs = {
+        name: (scan.scan_dir / name).read_bytes()
+        for name in ("findings.json", "coverage.json", "scan-manifest.json")
+    }
+    write_bytes = finalize_scan_contract.write_scan_local_bytes
+    failed_writes = []
 
-    def fail_before_publication(*args, **kwargs):
-        raise OSError("Synthetic publication interruption")
+    def fail_coverage_write(directory, relative, payload, **kwargs):
+        if relative != "coverage.json" or failed_writes:
+            return write_bytes(directory, relative, payload, **kwargs)
+        # Exercise the real writer after findings have reached disk. Remove the
+        # temporary obstruction before the publisher restores its old outputs.
+        failed_writes.append(json.loads((directory / "findings.json").read_text()))
+        path = directory / relative
+        previous_bytes = path.read_bytes()
+        path.unlink()
+        path.mkdir()
+        try:
+            return write_bytes(directory, relative, payload, **kwargs)
+        finally:
+            path.rmdir()
+            path.write_bytes(previous_bytes)
 
     with monkeypatch.context() as patch:
-        patch.setattr(saved, "_write_prepared_scan_finalization", fail_before_publication)
+        patch.setattr(finalize_scan_contract, "write_scan_local_bytes", fail_coverage_write)
         workbench_api["fail_scan"](
             workbench_db,
             Namespace(
@@ -149,8 +280,22 @@ def test_frozen_stopped_replay_ignores_later_worker_head_changes(
             ),
         )
     row = workbench_db.execute("SELECT * FROM scans WHERE id = ?", (scan.scan_id,)).fetchone()
+    assert len(failed_writes) == 1
+    assert "scanId" in failed_writes[0]
+    assert row["status"] == "failed"
+    assert row["failure_message"] == "Audit stopped."
     assert row["retained_source_digests_json"]
     assert row["seal_manifest_digest"] is None
+    assert all(
+        (scan.scan_dir / name).read_bytes() == contents
+        for name, contents in original_outputs.items()
+    )
+    original_sources = row["retained_source_digests_json"]
+    original_run = dict(
+        workbench_db.execute(
+            "SELECT * FROM deep_scan_runs WHERE scan_id = ?", (scan.scan_id,)
+        ).fetchone()
+    )
     head = result.parent / "checkpoint-head.json"
     if head_change == "replaced":
         save_disposition(scan, result.parent, "reported")
@@ -169,6 +314,21 @@ def test_frozen_stopped_replay_ignores_later_worker_head_changes(
     assert replayed["findingCount"] == 0
     assert json.loads((scan.scan_dir / "findings.json").read_text())["findings"] == []
     assert json.loads(result.read_text()) == previous
+    row = workbench_db.execute("SELECT * FROM scans WHERE id = ?", (scan.scan_id,)).fetchone()
+    assert row["failure_message"] == "Audit stopped."
+    assert row["retained_source_digests_json"] == original_sources
+    assert json.loads(row["retained_checkpoint_heads_json"]) == expected_heads
+    assert row["seal_manifest_digest"]
+    manifest = json.loads((scan.scan_dir / "scan-manifest.json").read_text())
+    assert manifest["scan"]["preservedCheckpointHeads"] == expected_heads
+    assert (
+        dict(
+            workbench_db.execute(
+                "SELECT * FROM deep_scan_runs WHERE scan_id = ?", (scan.scan_id,)
+            ).fetchone()
+        )
+        == original_run
+    )
 
 
 def test_explicit_recovery_observes_head_change_between_existing_checkpoints(
