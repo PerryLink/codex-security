@@ -24,11 +24,17 @@ def test_cost_completion_retains_independent_unmerged_surfaces_and_receipts(
             "label": "Filesystem boundary",
             "disposition": "needs_follow_up",
             "notes": "Filesystem race remains untested.",
+            "reason": "The caller's filesystem policy is unknown.",
         },
         {
             "label": "Template boundary",
             "disposition": "needs_follow_up",
             "notes": "Template caller policy remains untested.",
+        },
+        {
+            "label": "Configuration boundary",
+            "disposition": "rejected",
+            "reason": "The input comes only from trusted application configuration.",
         },
     ]
     receipts = {}
@@ -106,8 +112,8 @@ def test_cost_completion_retains_independent_unmerged_surfaces_and_receipts(
     coverage = json.loads((scan.scan_dir / "coverage.json").read_text())
     assert coverage["completeness"] == "partial"
     actual = coverage["surfaces"]
-    assert [(item["label"], item["notes"]) for item in actual] == [
-        (item["label"], item["notes"]) for item in surfaces
+    assert [(item["label"], item.get("notes"), item.get("reason")) for item in actual] == [
+        (item["label"], item.get("notes"), item.get("reason")) for item in surfaces
     ]
     assert len({item["id"] for item in actual}) == len(surfaces)
     for original, retained in zip(surfaces, actual, strict=True):
@@ -126,7 +132,10 @@ def test_cost_completion_retains_independent_unmerged_surfaces_and_receipts(
         assert obligation["surfaceIds"] == [item["id"] for item in actual]
     assert {"workerId": worker_id, "attempt": 1, "completeness": "partial"} in coverage["reviews"]
     report = (scan.scan_dir / "report.md").read_text()
-    assert all(surface["notes"] in report for surface in surfaces)
+    for surface in surfaces:
+        for field in ("notes", "reason"):
+            if field in surface:
+                assert surface[field] in report
     assert deferred["reason"] in report
     assert json.loads((scan.scan_dir / "findings.json").read_text())["findings"] == []
     assert tuple(workbench_db.execute(counter_query).fetchone()) == counters
