@@ -5,6 +5,7 @@ import type { readSavedScanLogs } from "./scan-logs.js";
 // maximum string length even though each session and event fits comfortably.
 export async function* scanLogsJson(
   logs: Awaited<ReturnType<typeof readSavedScanLogs>>,
+  cta?: unknown,
 ): AsyncGenerator<Uint8Array> {
   yield Buffer.from(
     `{\n  "scanId": ${JSON.stringify(logs.scanId)},\n  "threadId": ${JSON.stringify(logs.threadId)}`,
@@ -21,6 +22,10 @@ export async function* scanLogsJson(
       first = false;
     }
     yield Buffer.from(first ? "]" : "\n  ]");
+  }
+  if (cta !== undefined) {
+    const formatted = Formatter.format(cta, "json").replaceAll("\n", "\n  ");
+    yield Buffer.from(`,\n  "cta": ${formatted}`);
   }
   yield Buffer.from("\n}\n");
 }

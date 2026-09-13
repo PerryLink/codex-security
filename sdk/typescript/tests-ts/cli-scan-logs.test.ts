@@ -67,6 +67,60 @@ function withoutDuration(text: string) {
 }
 
 describe("saved logs JSON output", () => {
+  test("preserves the stale installed-skills CTA after saved logs", async () => {
+    const f = await fixture();
+    const previousDataHome = process.env["XDG_DATA_HOME"];
+    try {
+      const dataHome = join(f.state, "data");
+      const skillPath = join(f.state, "skills", "codex-security-scans");
+      await mkdir(join(dataHome, "incur"), { recursive: true });
+      await mkdir(skillPath, { recursive: true });
+      await writeFile(
+        join(skillPath, "SKILL.md"),
+        "Previously installed skill.",
+      );
+      await writeFile(
+        join(dataHome, "incur", "codex-security.json"),
+        JSON.stringify({
+          hash: "previous-command-hash",
+          skills: ["codex-security-scans"],
+          paths: [skillPath],
+        }),
+      );
+      process.env["XDG_DATA_HOME"] = dataHome;
+      for (const args of [
+        ["--json"],
+        ["--format", "json"],
+        ["--format=json"],
+      ]) {
+        const stdout = capture();
+        const stderr = capture();
+        expect(
+          await main(
+            ["scans", "logs", "scan-1", ...args],
+            stdout.stream,
+            stderr.stream,
+            f.deps,
+          ),
+        ).toBe(0);
+        const expected = await referenceOutput(["--json"], f.logs);
+        expect(Object.keys(JSON.parse(expected))).toEqual([
+          "scanId",
+          "threadId",
+          "sessions",
+          "events",
+          "cta",
+        ]);
+        expect(stdout.text()).toBe(expected);
+        expect(stderr.text()).toBe("");
+      }
+    } finally {
+      if (previousDataHome === undefined) delete process.env["XDG_DATA_HOME"];
+      else process.env["XDG_DATA_HOME"] = previousDataHome;
+      await rm(f.state, { recursive: true, force: true });
+    }
+  });
+
   test.each(
     [
       [],

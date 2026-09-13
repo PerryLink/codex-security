@@ -1774,7 +1774,7 @@ export async function main(
   let exitCode = 0;
   let frameworkExit: number | undefined;
   let frameworkOutput = "";
-  let streamedLogs: AsyncIterable<Uint8Array> | undefined;
+  let streamedLogs: Awaited<ReturnType<typeof readSavedScanLogs>> | undefined;
   let renderedHistory: string | undefined;
   let renderedPublication: string | undefined;
   let renderedPolicy: string | undefined;
@@ -2143,7 +2143,7 @@ export async function main(
                 ),
               )
             ) {
-              streamedLogs = scanLogsJson(logs);
+              streamedLogs = logs;
             }
             return logs as unknown as JsonObject;
           },
@@ -5702,9 +5702,17 @@ export async function main(
   if (frameworkOutput.length === 0 && streamedLogs === undefined)
     return exitCode;
   try {
+    // Incur can add a stale-skills CTA after the logs handler returns.
+    const logOutput =
+      streamedLogs === undefined
+        ? undefined
+        : scanLogsJson(
+            streamedLogs,
+            frameworkOutput ? JSON.parse(frameworkOutput).cta : undefined,
+          );
     await writeCliOutput(
       output,
-      streamedLogs ??
+      logOutput ??
         renderedPolicy ??
         renderedPatch ??
         renderedPublication ??
