@@ -1,3 +1,4 @@
+import { join } from "node:path";
 import { isDeepStrictEqual } from "node:util";
 import {
   parsePersistedScanDraft,
@@ -90,7 +91,26 @@ export async function readDiscoveryAuditDraft(
     expectedScanId,
     parsePersistedScanDraft
   );
+  if (result.complete !== false) await validateWriteupFiles(artifacts, result);
   return result;
+}
+
+async function validateWriteupFiles(
+  artifacts: DeepScanArtifacts,
+  result: Pick<ScanDraftInput, "findings">,
+): Promise<void> {
+  for (const [index, finding] of result.findings.entries()) {
+    const reportPath = (finding.writeup as { reportPath: string } | undefined)?.reportPath;
+    if (!reportPath) continue;
+    try {
+      await requireRegularFile(join(artifacts.scanDir, reportPath), artifacts.scanDir, false);
+    } catch (cause) {
+      throw new Error(
+        `findings[${index}].writeup.reportPath: expected a file inside the scan directory: ${reportPath}`,
+        { cause },
+      );
+    }
+  }
 }
 
 /** Validate the complete aggregate and derive convergence from stable finding identities. */
@@ -133,11 +153,14 @@ export async function validateReducerArtifacts(input: {
 
   if (input.sources) {
     result = reconcileDeepReduction(result, input.sources.discoveries, input.sources.previous);
+  } else {
+    validateRetainedFindings(result, [], previous);
+  }
+  await validateWriteupFiles(artifacts, result);
+  if (input.sources) {
     const persisted = deepReductionForPersistence(result, input.persistSourceCoverage);
     await saveScanDraftCheckpoint({ root: artifactDir, repoRoot: artifacts.scanDir, layout: "reducer" }, persisted);
     await writeJsonAtomic(resultPath, persisted);
-  } else {
-    validateRetainedFindings(result, [], previous);
   }
   const previousFindingIds = new Set((previous?.findings ?? []).map(scanFindingIdentity));
   return {
