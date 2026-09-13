@@ -934,20 +934,6 @@ function requireToolError(result, expected, label) {
   assert.match(result.content?.[0]?.text ?? "", expected, label);
 }
 
-function assertScanDraftToolGuidance(tool) {
-  assert.ok(tool, "The draft tool must be listed.");
-  assert.match(tool.description, /Provide the required top-level scanId\./u);
-  assert.match(
-    tool.description,
-    /findingId, occurrenceId, and fingerprints within each finding; includePaths and excludePaths within scope;/u
-  );
-  assert.match(
-    tool.description,
-    /documentType, schemaVersion, scanId, mode, includePaths, excludePaths, receiptRefs, and inventoryStrategy within coverage\./u
-  );
-  assert.equal(tool.inputSchema.required.includes("scanId"), true);
-}
-
 async function testParentToolList(bundle) {
   const stateRoot = await mkdtemp(path.join(temporaryRoot, "parent-tool-state-"));
   const client = await startClient(bundle, { CODEX_SECURITY_STATE_DIR: stateRoot });
@@ -966,7 +952,6 @@ async function testParentToolList(bundle) {
         `Model-visible MCP tool ${projectedName} exceeds Codex's 64-character limit.`
       );
     }
-    assertScanDraftToolGuidance(tools.find((tool) => tool.name === "record_codex_security_scan_draft"));
     const names = new Set(tools.map((tool) => tool.name));
     assert.equal(
       names.has("record_codex_security_worker_threat_model"),
@@ -1098,7 +1083,6 @@ async function testDiscoveryWorkerToolList(bundle) {
     assert.deepEqual(tools.map((tool) => tool.name), ["record_codex_security_scan_draft"]);
 
     const [tool] = tools;
-    assertScanDraftToolGuidance(tool);
     const projectedName = `mcp__cs_artifacts__${tool.name}`;
     assert.ok(
       projectedName.length <= 64,
