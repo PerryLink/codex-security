@@ -936,18 +936,15 @@ function requireToolError(result, expected, label) {
 
 function assertScanDraftToolGuidance(tool) {
   assert.ok(tool, "The draft tool must be listed.");
-  assert.match(tool.description, /Pass the required top-level scanId\./u);
+  assert.match(tool.description, /Provide the required top-level scanId\./u);
   assert.match(
     tool.description,
-    /Omit workbench-owned scope\.includePaths and scope\.excludePaths\./u
+    /findingId, occurrenceId, and fingerprints within each finding; includePaths and excludePaths within scope;/u
   );
-  assert.match(tool.description, /Omit coverage\.scanId and other coverage metadata:/u);
-  for (const field of [
-    "documentType", "schemaVersion", "mode", "includePaths", "excludePaths",
-    "receiptRefs", "inventoryStrategy", "findingId", "occurrenceId", "fingerprints"
-  ]) {
-    assert.ok(tool.description.includes(field), `The draft guidance must identify ${field}.`);
-  }
+  assert.match(
+    tool.description,
+    /documentType, schemaVersion, scanId, mode, includePaths, excludePaths, receiptRefs, and inventoryStrategy within coverage\./u
+  );
   assert.equal(tool.inputSchema.required.includes("scanId"), true);
 }
 
