@@ -1,6 +1,5 @@
 import { publishSelectedDeepScan } from "./finalization.js";
 import { randomUUID } from "node:crypto";
-import { promises as fs } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import {
   createDeepScanArtifacts,
@@ -52,10 +51,6 @@ type AcceptedReducer = Omit<SuccessfulDedupOutcome, "result">;
 interface SchedulerResult {
   reason: DeepScanTerminalReason;
   omittedWorkerIds: string[];
-  canceledWorkerIds: string[];
-  accepted: AcceptedDiscovery[];
-  mergedWorkerIds: string[];
-  reducers: AcceptedReducer[];
   result?: DeepReductionInput;
   resultPath?: string;
 }
@@ -618,12 +613,6 @@ export class DeepScanCoordinator {
         .filter((worker) => worker.kind === "discovery" && worker.mergeState === "merged")
         .map((worker) => worker.id)
     );
-    const mergedDiscoveries: AcceptedDiscovery[] = recovered.filter((worker) => (
-      mergedIds.has(worker.id)
-    ));
-    const canceledWorkerIds = (this.state.persistedWorkers ?? [])
-      .filter((worker) => worker.kind === "discovery" && worker.status === "canceled")
-      .map((worker) => worker.id);
     const omittedWorkerIds: string[] = [];
     const recoveredReducers = await this.recoverCompletedReducers(recovered);
     const reducerOutcomes = recoveredReducers.reducers;
@@ -716,16 +705,12 @@ export class DeepScanCoordinator {
         const workerId = entries[index]?.[0];
         if (workerId) active.delete(workerId);
         if (result.status === "rejected") {
-          if (workerId) removeValue(canceledWorkerIds, workerId);
           firstFailure ??= result.reason;
           continue;
         }
         const outcome = result.value;
         if (outcome.status === "failed") {
-          if (outcome.replaceableFailureKind) {
-            canceledWorkerIds.push(outcome.workerId);
-          } else {
-            removeValue(canceledWorkerIds, outcome.workerId);
+          if (!outcome.replaceableFailureKind) {
             firstFailure ??= outcome.error;
           }
         } else if (outcome.status === "succeeded") {
@@ -737,9 +722,6 @@ export class DeepScanCoordinator {
           } else if (!buffer.some((worker) => worker.id === outcome.worker.id)) {
             buffer.push(outcome.worker);
           }
-          removeValue(canceledWorkerIds, outcome.worker.id);
-        } else {
-          canceledWorkerIds.push(outcome.workerId);
         }
       }
       return firstFailure;
@@ -759,10 +741,7 @@ export class DeepScanCoordinator {
       }
       this.state = outcome.run;
       previousReducerResultPath = outcome.resultPath;
-      mergedDiscoveries.push(...outcome.consumed);
-      const { result: acceptedResult, ...metadata } = outcome;
-      latestResult = acceptedResult;
-      reducerOutcomes.push(metadata);
+      latestResult = outcome.result;
       return undefined;
     };
 
@@ -848,7 +827,6 @@ export class DeepScanCoordinator {
             const consecutiveErrors = outcome.consecutiveErrors
               ?? (this.state.consecutiveErrors ?? 0) + 1;
             this.state = { ...this.state, consecutiveErrors };
-            canceledWorkerIds.push(outcome.workerId);
             this.log({
               event: "discovery_worker_replaced",
               scanId: this.state.scanId,
@@ -875,7 +853,6 @@ export class DeepScanCoordinator {
           throw outcome.error;
         }
         if (outcome.status === "canceled") {
-          canceledWorkerIds.push(outcome.workerId);
           if (
             !this.abortController.signal.aborted
             && !this.discoveryAbortController.signal.aborted
@@ -916,17 +893,13 @@ export class DeepScanCoordinator {
       reducerFailures = 0;
       this.state = outcome.run;
       previousReducerResultPath = outcome.resultPath;
-      mergedDiscoveries.push(...outcome.consumed);
-      const { result: acceptedResult, ...metadata } = outcome;
-      latestResult = acceptedResult;
-      reducerOutcomes.push(metadata);
+      latestResult = outcome.result;
       if (
         !this.discoveryDeadlineReached
         && outcome.run.noNewStreak >= config.stopAfterNoNew
         && buffer.length === 0
       ) {
         stopReason = "saturated";
-        canceledWorkerIds.push(...active.keys());
         this.abortController.abort("deep_scan_saturated");
       }
     }
@@ -947,10 +920,6 @@ export class DeepScanCoordinator {
     return {
       reason: stopReason ?? "capped",
       omittedWorkerIds: unique(omittedWorkerIds),
-      canceledWorkerIds: unique(canceledWorkerIds),
-      accepted,
-      mergedWorkerIds: unique(mergedDiscoveries.map((worker) => worker.id)),
-      reducers: reducerOutcomes,
       result: latestResult,
       resultPath: previousReducerResultPath,
     };
@@ -1141,12 +1110,6 @@ function workerLabelSequence(worker: PersistedDeepScanWorker, kind: "discovery" 
 
 function unique(values: string[]): string[] {
   return [...new Set(values)];
-}
-
-function removeValue(values: string[], value: string): void {
-  for (let index = values.length - 1; index >= 0; index -= 1) {
-    if (values[index] === value) values.splice(index, 1);
-  }
 }
 
 function cloneState(state: DeepScanRunState): DeepScanRunState {
