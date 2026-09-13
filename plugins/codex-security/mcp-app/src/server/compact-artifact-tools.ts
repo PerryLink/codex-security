@@ -203,7 +203,7 @@ export function registerScanDraftTools(
   registerCompactTool(server, {
     name: "record_codex_security_scan_draft",
     title: "Record Codex Security Scan Draft",
-    description: "Save semantic findings and coverage as an unsealed draft. Use complete:false for progress checkpoints, then complete:true for the final result; keep unvalidated candidates in coverage.deferred.",
+    description: "Save semantic findings and coverage as an unsealed draft. Use complete:false for progress checkpoints, then complete:true for the final result; keep unvalidated candidates in coverage.deferred. Pass the required top-level scanId. Omit workbench-owned scope.includePaths and scope.excludePaths. Omit coverage.scanId and other coverage metadata: documentType, schemaVersion, mode, includePaths, excludePaths, receiptRefs, inventoryStrategy. Omit findingId, occurrenceId, and fingerprints from findings.",
     inputSchema: scanDraftInputSchema,
     readOnly: false,
     handler: async (value, requestContext) => {
@@ -297,7 +297,7 @@ export function registerCompactWorkerArtifactTools(
     registerCompactTool(server, {
       name: "record_codex_security_scan_draft",
       title: "Record Codex Security Scan Draft",
-      description: "Save this Standard worker's semantic findings and coverage. Use complete:false for progress checkpoints, then complete:true for its final result; keep unvalidated candidates in coverage.deferred.",
+      description: "Save this Standard worker's semantic findings and coverage. Use complete:false for progress checkpoints, then complete:true for its final result; keep unvalidated candidates in coverage.deferred. Pass the required top-level scanId. Omit workbench-owned scope.includePaths and scope.excludePaths. Omit coverage.scanId and other coverage metadata: documentType, schemaVersion, mode, includePaths, excludePaths, receiptRefs, inventoryStrategy. Omit findingId, occurrenceId, and fingerprints from findings.",
       inputSchema: scanDraftInputSchema,
       readOnly: false,
       handler: async (value) => recordCodexSecurityWorkerScanDraft(

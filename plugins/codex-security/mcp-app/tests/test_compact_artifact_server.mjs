@@ -934,6 +934,23 @@ function requireToolError(result, expected, label) {
   assert.match(result.content?.[0]?.text ?? "", expected, label);
 }
 
+function assertScanDraftToolGuidance(tool) {
+  assert.ok(tool, "The draft tool must be listed.");
+  assert.match(tool.description, /Pass the required top-level scanId\./u);
+  assert.match(
+    tool.description,
+    /Omit workbench-owned scope\.includePaths and scope\.excludePaths\./u
+  );
+  assert.match(tool.description, /Omit coverage\.scanId and other coverage metadata:/u);
+  for (const field of [
+    "documentType", "schemaVersion", "mode", "includePaths", "excludePaths",
+    "receiptRefs", "inventoryStrategy", "findingId", "occurrenceId", "fingerprints"
+  ]) {
+    assert.ok(tool.description.includes(field), `The draft guidance must identify ${field}.`);
+  }
+  assert.equal(tool.inputSchema.required.includes("scanId"), true);
+}
+
 async function testParentToolList(bundle) {
   const stateRoot = await mkdtemp(path.join(temporaryRoot, "parent-tool-state-"));
   const client = await startClient(bundle, { CODEX_SECURITY_STATE_DIR: stateRoot });
@@ -952,6 +969,7 @@ async function testParentToolList(bundle) {
         `Model-visible MCP tool ${projectedName} exceeds Codex's 64-character limit.`
       );
     }
+    assertScanDraftToolGuidance(tools.find((tool) => tool.name === "record_codex_security_scan_draft"));
     const names = new Set(tools.map((tool) => tool.name));
     assert.equal(
       names.has("record_codex_security_worker_threat_model"),
@@ -1083,6 +1101,7 @@ async function testDiscoveryWorkerToolList(bundle) {
     assert.deepEqual(tools.map((tool) => tool.name), ["record_codex_security_scan_draft"]);
 
     const [tool] = tools;
+    assertScanDraftToolGuidance(tool);
     const projectedName = `mcp__cs_artifacts__${tool.name}`;
     assert.ok(
       projectedName.length <= 64,
@@ -1108,6 +1127,18 @@ async function testDiscoveryWorkerToolList(bundle) {
         deferred: []
       }
     };
+
+    for (const arguments_ of [
+      { ...input, scope: { includePaths: ["src"], excludePaths: [] } },
+      { ...input, coverage: { ...input.coverage, scanId } }
+    ]) {
+      requireToolError(
+        await client.callTool({ name: tool.name, arguments: arguments_ }),
+        /expected never/,
+        "The draft description must not change rejection of workbench-owned metadata."
+      );
+      await assert.rejects(readFile(resultPath), { code: "ENOENT" });
+    }
 
     requireToolError(
       await client.callTool({
