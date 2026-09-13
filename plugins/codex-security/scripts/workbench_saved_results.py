@@ -1451,6 +1451,21 @@ def retain_unmerged_budget_coverage(
         # A committed budget draft can be replayed before the scan is sealed.
         # These IDs and provenance identify the same immutable accepted review.
         items = coverage.setdefault(field, [])
+        if "id" in item:
+            for index, existing in enumerate(items):
+                existing_provenance = (
+                    existing.get("provenance") if isinstance(existing, dict) else None
+                )
+                if (
+                    isinstance(existing_provenance, dict)
+                    and existing.get("id") == item["id"]
+                    and all(
+                        existing_provenance.get(key) == value for key, value in provenance.items()
+                    )
+                ):
+                    # Refresh an older projection from the same accepted bytes.
+                    items[index] = item
+                    return
         if item not in items:
             items.append(item)
 

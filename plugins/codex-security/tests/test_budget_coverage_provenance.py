@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import sqlite3
 from argparse import Namespace
 
 import pytest
@@ -12,8 +13,15 @@ from test_workbench_db import BUDGET_COST
 
 
 @pytest.mark.parametrize("explicit_ids", [True, False], ids=["named-surfaces", "omitted-ids"])
+@pytest.mark.parametrize("legacy_replay", [False, True], ids=["fresh", "legacy-draft-replay"])
 def test_cost_completion_retains_independent_unmerged_surfaces_and_receipts(
-    workbench_api, workbench_db, publication_scan, explicit_ids
+    workbench_api,
+    workbench_db,
+    publication_scan,
+    explicit_ids,
+    legacy_replay,
+    tmp_path,
+    monkeypatch,
 ):
     scan = publication_scan()
     worker_id = add_worker(workbench_db, scan).parent.name
@@ -76,6 +84,19 @@ def test_cost_completion_retains_independent_unmerged_surfaces_and_receipts(
                 "completeness": "partial",
                 "surfaces": surfaces,
                 "deferred": [deferred],
+                "explicitExclusions": [
+                    {
+                        "pattern": "vendor/",
+                        "reason": "External dependencies were excluded.",
+                        "provenance": source_provenance,
+                    }
+                ],
+                "openQuestions": [
+                    {
+                        "question": "Which deployment controls apply?",
+                        "provenance": source_provenance,
+                    }
+                ],
             },
         }
     ).encode()
@@ -115,14 +136,53 @@ def test_cost_completion_retains_independent_unmerged_surfaces_and_receipts(
     for name in ("scan-manifest.json", "findings.json", "coverage.json"):
         (scan.scan_dir / name).unlink()
 
-    workbench_api["complete_budget_exhausted_scan"](
-        workbench_db,
-        Namespace(
-            scan_id=scan.scan_id,
-            cost_json=json.dumps(BUDGET_COST),
-            message="Scan reached its original cost limit.",
-        ),
+    budget = workbench_api["complete_budget_exhausted_scan"]
+    args = Namespace(
+        scan_id=scan.scan_id,
+        cost_json=json.dumps(BUDGET_COST),
+        message="Scan reached its original cost limit.",
     )
+    if legacy_replay:
+        saved = budget.__globals__["saved_results"]
+        retain = saved.retain_unmerged_budget_coverage
+
+        def legacy_projection(*args):
+            retain(*args)
+            # Older writers kept host identity but omitted source descriptions.
+            for field in ("surfaces", "explicitExclusions", "deferred", "openQuestions"):
+                for item in args[2].get(field, []):
+                    if item.get("provenance", {}).get("workerId") == worker_id:
+                        for key in descriptions:
+                            item["provenance"].pop(key, None)
+
+        def interrupt_before_seal(*args):
+            raise RuntimeError("Publication interrupted after the budget draft committed.")
+
+        database = tmp_path / "interrupted-budget.sqlite3"
+        with sqlite3.connect(database) as connection:
+            connection.row_factory = sqlite3.Row
+            connection.execute("PRAGMA foreign_keys = ON")
+            workbench_db.backup(connection)
+            with monkeypatch.context() as patch:
+                patch.setattr(saved, "retain_unmerged_budget_coverage", legacy_projection)
+                patch.setitem(budget.__globals__, "complete_scan_locked", interrupt_before_seal)
+                with pytest.raises(RuntimeError, match="budget draft committed"):
+                    budget(connection, args)
+        # Reconnect to the committed old draft and run the real public completion.
+        with sqlite3.connect(database) as connection:
+            connection.row_factory = sqlite3.Row
+            connection.execute("PRAGMA foreign_keys = ON")
+            assert (
+                connection.execute("SELECT status FROM deep_scan_runs").fetchone()[0] == "succeeded"
+            )
+            assert connection.execute("SELECT status FROM scans").fetchone()[0] == "running"
+            assert (
+                connection.execute("SELECT seal_manifest_digest FROM scans").fetchone()[0] is None
+            )
+            budget(connection, args)
+            connection.backup(workbench_db)
+    else:
+        budget(workbench_db, args)
 
     assert workbench_db.execute("SELECT status FROM scans").fetchone()[0] == "complete"
     coverage = json.loads((scan.scan_dir / "coverage.json").read_text())
@@ -146,6 +206,14 @@ def test_cost_completion_retains_independent_unmerged_surfaces_and_receipts(
         assert path.read_bytes() == receipt_contents
     obligation = next(item for item in coverage["deferred"] if item["reason"] == deferred["reason"])
     assert obligation["provenance"] == {**descriptions, "workerId": worker_id, "attempt": 1}
+    assert sum(item["reason"] == deferred["reason"] for item in coverage["deferred"]) == 1
+    for field in ("surfaces", "explicitExclusions", "deferred", "openQuestions"):
+        assert len({item["id"] for item in coverage[field]}) == len(coverage[field])
+    for field in ("explicitExclusions", "openQuestions"):
+        assert len(coverage[field]) == 1
+        item = coverage[field][0]
+        assert item["id"] == f"{worker_id}-attempt-1-{field}-1"
+        assert item["provenance"] == {**descriptions, "workerId": worker_id, "attempt": 1}
     if explicit_ids:
         assert obligation["surfaceIds"] == [item["id"] for item in actual]
     assert {"workerId": worker_id, "attempt": 1, "completeness": "partial"} in coverage["reviews"]
