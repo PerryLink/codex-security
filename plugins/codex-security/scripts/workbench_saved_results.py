@@ -1452,6 +1452,7 @@ def retain_unmerged_budget_coverage(
         # These IDs and provenance identify the same immutable accepted review.
         items = coverage.setdefault(field, [])
         if "id" in item:
+            matches = []
             for index, existing in enumerate(items):
                 existing_provenance = (
                     existing.get("provenance") if isinstance(existing, dict) else None
@@ -1463,9 +1464,14 @@ def retain_unmerged_budget_coverage(
                         existing_provenance.get(key) == value for key, value in provenance.items()
                     )
                 ):
-                    # Refresh an older projection from the same accepted bytes.
-                    items[index] = item
-                    return
+                    matches.append(index)
+            if matches:
+                # Refresh older projections from the same accepted bytes, even
+                # if an interrupted writer saved more than one copy.
+                items[matches[0]] = item
+                for index in reversed(matches[1:]):
+                    del items[index]
+                return
         if item not in items:
             items.append(item)
 

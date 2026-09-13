@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import sqlite3
@@ -13,13 +14,13 @@ from test_workbench_db import BUDGET_COST
 
 
 @pytest.mark.parametrize("explicit_ids", [True, False], ids=["named-surfaces", "omitted-ids"])
-@pytest.mark.parametrize("legacy_replay", [False, True], ids=["fresh", "legacy-draft-replay"])
+@pytest.mark.parametrize("replay", ["fresh", "legacy", "duplicated"])
 def test_cost_completion_retains_independent_unmerged_surfaces_and_receipts(
     workbench_api,
     workbench_db,
     publication_scan,
     explicit_ids,
-    legacy_replay,
+    replay,
     tmp_path,
     monkeypatch,
 ):
@@ -142,7 +143,7 @@ def test_cost_completion_retains_independent_unmerged_surfaces_and_receipts(
         cost_json=json.dumps(BUDGET_COST),
         message="Scan reached its original cost limit.",
     )
-    if legacy_replay:
+    if replay != "fresh":
         saved = budget.__globals__["saved_results"]
         retain = saved.retain_unmerged_budget_coverage
 
@@ -150,8 +151,15 @@ def test_cost_completion_retains_independent_unmerged_surfaces_and_receipts(
             retain(*args)
             # Older writers kept host identity but omitted source descriptions.
             for field in ("surfaces", "explicitExclusions", "deferred", "openQuestions"):
-                for item in args[2].get(field, []):
+                items = args[2].get(field, [])
+                for item in list(items):
                     if item.get("provenance", {}).get("workerId") == worker_id:
+                        if replay == "duplicated" and any(
+                            key in item["provenance"] for key in descriptions
+                        ):
+                            # A second interrupted writer appended the described
+                            # projection beside the old item before sealing.
+                            items.append(copy.deepcopy(item))
                         for key in descriptions:
                             item["provenance"].pop(key, None)
 
