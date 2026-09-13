@@ -123,7 +123,7 @@ async function testResponseLoss(responseLosses) {
     assert.deepEqual(recovered.map(worker => worker.resultPath), [discovery.worker.resultPath, second.worker.resultPath]);
     await rm(path.join(path.dirname(merged.resultPath), "..", "result.json"));
     const reducers = await resumed.recoverCompletedReducers(recovered);
-    assert.equal(reducers.reducers[0].resultPath, merged.resultPath);
+    assert.equal(reducers.resultPath, merged.resultPath);
     assert.deepEqual(reducers.result, merged.result);
     assert.equal(await readFile(merged.resultPath, "utf8"), beforeRecovery, "recovery cannot rewrite accepted bytes");
 

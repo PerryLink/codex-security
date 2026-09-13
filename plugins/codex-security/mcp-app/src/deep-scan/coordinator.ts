@@ -17,8 +17,7 @@ import { DeepScanWorkerRunner } from "./worker-runner.js";
 import type {
   AcceptedDiscovery,
   DedupOutcome,
-  DiscoveryOutcome,
-  SuccessfulDedupOutcome
+  DiscoveryOutcome
 } from "./worker-runner.js";
 import {
   boundedDeepScanErrorPair,
@@ -45,8 +44,6 @@ type SchedulerOutcome = DiscoveryOutcome | DedupOutcome;
 type SchedulerSettlement =
   | { status: "fulfilled"; outcome: SchedulerOutcome }
   | { status: "rejected"; error: unknown };
-
-type AcceptedReducer = Omit<SuccessfulDedupOutcome, "result">;
 
 interface SchedulerResult {
   reason: DeepScanTerminalReason;
@@ -615,11 +612,10 @@ export class DeepScanCoordinator {
     );
     const omittedWorkerIds: string[] = [];
     const recoveredReducers = await this.recoverCompletedReducers(recovered);
-    const reducerOutcomes = recoveredReducers.reducers;
     let latestResult = recoveredReducers.result;
     let buffer: AcceptedDiscovery[] = recovered.filter((worker) => !mergedIds.has(worker.id));
     let reducer: Promise<DedupOutcome> | undefined;
-    let previousReducerResultPath = reducerOutcomes.at(-1)?.resultPath;
+    let previousReducerResultPath = recoveredReducers.resultPath;
     let dispatched = this.state.dispatchedCount;
     let workerSequence = Math.max(
       dispatched,
@@ -959,18 +955,17 @@ export class DeepScanCoordinator {
 
   private async recoverCompletedReducers(
     discoveries: AcceptedDiscovery[]
-  ): Promise<{ reducers: AcceptedReducer[]; result?: DeepReductionInput }> {
+  ): Promise<{ result?: DeepReductionInput; resultPath?: string }> {
     const discoveriesById = new Map(discoveries.map((worker) => [worker.id, worker]));
     const inputs = this.state.persistedDedupInputs ?? [];
-    const outcomes: AcceptedReducer[] = [];
     let latestResult: DeepReductionInput | undefined;
+    let latestResultPath: string | undefined;
     const completedReducers = (this.state.persistedWorkers ?? [])
       .filter((worker) => worker.kind === "dedup" && worker.status === "succeeded")
       .sort((left, right) => (
         workerLabelSequence(left, "dedup") - workerLabelSequence(right, "dedup")
         || left.id.localeCompare(right.id)
       ));
-    let noNewStreak = 0;
     for (const worker of completedReducers) {
       // A later merge claim can retain a legacy aggregate's accepted reference.
       const resultPath = worker.acceptedResultPath
@@ -997,12 +992,12 @@ export class DeepScanCoordinator {
       }
       const accepted = consumed as AcceptedDiscovery[];
       const claim = this.state.persistedMergeClaims?.find((item) => item.workerId === worker.id);
-      const { newFindings, result } = await validateReducerArtifacts({
+      const { result } = await validateReducerArtifacts({
         artifacts: this.artifacts,
         artifactDir: worker.artifactDir,
         resultPath,
         reducerId: worker.id,
-        previousReducerResultPath: claim ? claim.previousResultPath : outcomes.at(-1)?.resultPath
+        previousReducerResultPath: claim ? claim.previousResultPath : latestResultPath
       }, this.state.scanId);
       if (result.sourceCoverage === undefined) {
         const context = {
@@ -1021,19 +1016,9 @@ export class DeepScanCoordinator {
         result.sourceCoverage = aggregateSourceCoverage(sources.discoveries, latestResult ?? null);
       }
       latestResult = result;
-      noNewStreak = newFindings > 0 ? 0 : noNewStreak + accepted.length;
-      outcomes.push({
-        type: "dedup",
-        id: worker.id,
-        consumed: accepted,
-        resultPath,
-        newFindings,
-        attempt: worker.attempt,
-        ...(worker.threadId ? { threadId: worker.threadId } : {}),
-        run: { ...this.state, noNewStreak }
-      });
+      latestResultPath = resultPath;
     }
-    return { reducers: outcomes, result: latestResult };
+    return { result: latestResult, resultPath: latestResultPath };
   }
 
   private reducerReady(
