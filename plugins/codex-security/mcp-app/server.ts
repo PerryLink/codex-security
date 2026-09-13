@@ -1162,12 +1162,16 @@ export function createCodexSecurityServer(): McpServer {
     _meta: modelActionMeta
   }, async ({ scanId, handoffClaimToken }) => {
     try {
-      return scanActionResult(await runWorkbench([
+      const result = await runWorkbench([
         "complete-scan",
         "--scan-id",
         scanId,
         ...optionalArg("--claim-token", handoffClaimToken)
-      ]), "Validated and indexed the completed Codex Security scan.");
+      ]);
+      const coverage = result.coverageSummary as JsonObject;
+      return scanActionResult(result,
+        `Validated and indexed the completed Codex Security scan. Canonical coverage: ${coverage.completeness}; ${coverage.surfaceCount} surfaces; ${coverage.deferredCount} deferred items; ${coverage.explicitExclusionCount} explicit exclusions.`
+      );
     } catch (error) {
       throw new Error(completionFailureMessage(error));
     }

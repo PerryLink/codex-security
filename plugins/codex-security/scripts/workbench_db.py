@@ -1340,6 +1340,19 @@ def budget_exhausted_draft(
     )
 
 
+def completed_scan_context(
+    connection: sqlite3.Connection, scan_id: str, coverage: dict[str, Any]
+) -> dict[str, Any]:
+    context = scan_context(connection, scan_id)
+    context["coverageSummary"] = {
+        "completeness": coverage["completeness"],
+        "surfaceCount": len(coverage["surfaces"]),
+        "deferredCount": len(coverage.get("deferred", [])),
+        "explicitExclusionCount": len(coverage.get("explicitExclusions", [])),
+    }
+    return context
+
+
 def complete_scan_locked(
     connection: sqlite3.Connection,
     scan_id: str,
@@ -1356,7 +1369,7 @@ def complete_scan_locked(
         require_recorded_manifest_digest(scan, scan_dir)
         verify_manifest_binding(scan, read_json_object(scan_dir / ARTIFACTS["manifest"]))
         try:
-            manifest, _, _ = finalize_scan(
+            manifest, _, coverage = finalize_scan(
                 scan_dir,
                 expected_coverage_mode=expected_coverage_mode(scan),
             )
@@ -1367,7 +1380,7 @@ def complete_scan_locked(
         pin_legacy_manifest_digest(connection, scan["id"], manifest_digest)
         if cost_json is not None and scan["recipe_json"] is not None:
             scan_usage.reconcile_completed_scan_cost(connection, scan, cost_json)
-        return scan_context(connection, scan["id"])
+        return completed_scan_context(connection, scan["id"], coverage)
     if scan["status"] != "running":
         raise SystemExit("Only a running scan can be completed.")
     handoff.require_current_continuation(
@@ -1453,7 +1466,7 @@ def complete_scan_locked(
         )
         add_warning()
         wrote = True
-        manifest, findings, _ = _write_prepared_scan_finalization(prepared)
+        manifest, findings, coverage = _write_prepared_scan_finalization(prepared)
     except ContractError as exc:
         # Replay a validated Deep aggregate after an output write fails.
         if (wrote and scan["mode"] != "deep") or (
@@ -1502,7 +1515,7 @@ def complete_scan_locked(
         scan = require_scan(connection, scan["id"])
         if scan["status"] == "complete":
             connection.commit()
-            return scan_context(connection, scan["id"])
+            return completed_scan_context(connection, scan["id"], coverage)
         if scan["status"] != "running":
             raise SystemExit("Only a running scan can be completed.")
         deep_scan.require_deep_scan_ready_for_parent_completion(connection, scan)
@@ -1553,7 +1566,7 @@ def complete_scan_locked(
     except BaseException:
         connection.rollback()
         raise
-    context = scan_context(connection, scan["id"])
+    context = completed_scan_context(connection, scan["id"], coverage)
     context["targetWarnings"] = target_warnings
     return context
 
