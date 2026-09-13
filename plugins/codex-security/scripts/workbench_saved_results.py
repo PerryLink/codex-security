@@ -1457,7 +1457,14 @@ def retain_unmerged_budget_coverage(
     for field in ("surfaces", "explicitExclusions", "deferred", "openQuestions"):
         for index, original in enumerate(source.get(field, [])):
             item = copy.deepcopy(original if isinstance(original, dict) else {"question": original})
+            source_provenance = item.get("provenance")
+            if not isinstance(source_provenance, dict):
+                source_provenance = {}
+            # Keep source descriptions; the accepted owner supplies identity.
+            for key in ("workerId", "attempt", "sourceId", "candidateId"):
+                source_provenance.pop(key, None)
             item["provenance"] = {
+                **source_provenance,
                 **provenance,
                 **({"sourceId": item["id"]} if "id" in item else {}),
                 **({"candidateId": item["candidateId"]} if "candidateId" in item else {}),

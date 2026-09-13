@@ -34,6 +34,7 @@ export async function publishCoverageFixture(root, completeness, {
   legacyAttempts = false,
   splitSeededReducers = false,
   selectedRecovery = false,
+  sourceProvenance,
 } = {}) {
   const runtimePath = path.join(root, "fixture-runtime.mjs");
   await writeFile(runtimePath, bundled.outputFiles[0].contents);
@@ -101,6 +102,11 @@ export async function publishCoverageFixture(root, completeness, {
       deferred: pending ? [{ id: "same-id", candidateId: "candidate-1", reason: index === 0 ? "Verify entry boundaries." : "Verify symbolic links.", paths: ["source.py"], surfaceIds: ["shared-surface"] }] : [],
       openQuestions: pending ? [{ question: `Deployment question ${index + 1}.` }] : [],
     };
+    if (sourceProvenance !== undefined) {
+      for (const field of ["surfaces", "explicitExclusions", "deferred", "openQuestions"]) {
+        for (const item of coverage[field]) item.provenance = structuredClone(sourceProvenance);
+      }
+    }
     await mkdir(path.join(artifactDir, "artifacts"), { recursive: true });
     await writeFile(path.join(artifactDir, "artifacts", "review.md"), "Synthetic review evidence.\n");
     const resultPath = path.join(artifactDir, "result.json");

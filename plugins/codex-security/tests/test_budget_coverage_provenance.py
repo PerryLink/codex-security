@@ -19,6 +19,18 @@ def test_cost_completion_retains_independent_unmerged_surfaces_and_receipts(
     worker_id = add_worker(workbench_db, scan).parent.name
     output = scan.scan_dir / "artifacts/deep_discovery/workers/discovery-0001/output"
     output.mkdir(parents=True)
+    descriptions = {
+        "source": "source-review",
+        "worker": "focused-reviewer",
+        "task": "Check the filesystem boundary.",
+    }
+    source_provenance = {
+        **descriptions,
+        "workerId": "worker-local-label",
+        "attempt": 99,
+        "sourceId": "worker-local-source",
+        "candidateId": "worker-local-candidate",
+    }
     surfaces = [
         {
             "label": "Filesystem boundary",
@@ -39,6 +51,7 @@ def test_cost_completion_retains_independent_unmerged_surfaces_and_receipts(
     ]
     receipts = {}
     for index, surface in enumerate(surfaces, start=1):
+        surface["provenance"] = source_provenance
         if explicit_ids:
             surface["id"] = f"source-surface-{index}"
         relative = f"artifacts/review-{index}.md"
@@ -47,7 +60,10 @@ def test_cost_completion_retains_independent_unmerged_surfaces_and_receipts(
         receipt.parent.mkdir(exist_ok=True)
         receipts[receipt] = f"Independent review receipt {index}.\n".encode()
         receipt.write_bytes(receipts[receipt])
-    deferred = {"reason": "Both independent validation tasks remain unfinished."}
+    deferred = {
+        "reason": "Both independent validation tasks remain unfinished.",
+        "provenance": source_provenance,
+    }
     if explicit_ids:
         deferred["surfaceIds"] = [surface["id"] for surface in surfaces]
     contents = json.dumps(
@@ -118,6 +134,7 @@ def test_cost_completion_retains_independent_unmerged_surfaces_and_receipts(
     assert len({item["id"] for item in actual}) == len(surfaces)
     for original, retained in zip(surfaces, actual, strict=True):
         assert retained["provenance"] == {
+            **descriptions,
             "workerId": worker_id,
             "attempt": 1,
             **({"sourceId": original["id"]} if explicit_ids else {}),
@@ -128,6 +145,7 @@ def test_cost_completion_retains_independent_unmerged_surfaces_and_receipts(
     for path, receipt_contents in receipts.items():
         assert path.read_bytes() == receipt_contents
     obligation = next(item for item in coverage["deferred"] if item["reason"] == deferred["reason"])
+    assert obligation["provenance"] == {**descriptions, "workerId": worker_id, "attempt": 1}
     if explicit_ids:
         assert obligation["surfaceIds"] == [item["id"] for item in actual]
     assert {"workerId": worker_id, "attempt": 1, "completeness": "partial"} in coverage["reviews"]
