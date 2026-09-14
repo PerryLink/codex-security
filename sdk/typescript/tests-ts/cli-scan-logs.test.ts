@@ -31,8 +31,33 @@ async function fixture() {
     join(home, "sessions", "rollout.jsonl"),
     events.map((event) => JSON.stringify(event)).join("\n"),
   );
-  const scan = { scanId: "scan-1", continuationThreadId: "thread-1" };
-  const logs = await readSavedScanLogs(scan, home);
+  const originalHome = join(state, "original-home");
+  const scanDir = join(state, "scan");
+  const settingsDirectory = join(scanDir, "artifacts", "deep_discovery");
+  await mkdir(settingsDirectory, { recursive: true });
+  await mkdir(join(originalHome, "sessions"), { recursive: true });
+  await writeFile(
+    join(settingsDirectory, "execution-settings.json"),
+    JSON.stringify({
+      version: 1,
+      settings: {
+        codexHome: originalHome,
+        codexPath: join(originalHome, "codex"),
+      },
+    }),
+  );
+  await writeFile(
+    join(originalHome, "sessions", "worker.jsonl"),
+    JSON.stringify({ type: "session_meta", payload: { id: "worker" } }) + "\n",
+  );
+  const scan = {
+    scanId: "scan-1",
+    continuationThreadId: "thread-1",
+    mode: "deep",
+    scanDir,
+    executionThreadIds: ["worker"],
+  };
+  const logs = await readSavedScanLogs(scan, [home, originalHome]);
   const deps = dependencies({
     environment: { CODEX_SECURITY_STATE_DIR: state },
     onWorkbench: () => ({ scan }),
@@ -67,6 +92,28 @@ function withoutDuration(text: string) {
 }
 
 describe("saved logs JSON output", () => {
+  test("loads the recorded worker home through the saved logs command", async () => {
+    const f = await fixture();
+    try {
+      const stdout = capture();
+      expect(
+        await main(
+          ["scans", "logs", "scan-1", "--json"],
+          stdout.stream,
+          capture().stream,
+          f.deps,
+        ),
+      ).toBe(0);
+      expect(
+        JSON.parse(stdout.text()).sessions.map(
+          ({ threadId }: { threadId: string }) => threadId,
+        ),
+      ).toEqual(["thread-1", "worker"]);
+    } finally {
+      await rm(f.state, { recursive: true, force: true });
+    }
+  });
+
   test("preserves the stale installed-skills CTA after saved logs", async () => {
     const f = await fixture();
     const previousDataHome = process.env["XDG_DATA_HOME"];

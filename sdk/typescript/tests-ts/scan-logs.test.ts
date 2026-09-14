@@ -82,6 +82,90 @@ function commandEvent(command: string, id: string, timestamp?: string) {
 }
 
 describe("saved scan logs", () => {
+  test.each(["current", "original"])(
+    "reads recovered Deep workers from the recorded home with the owner in the %s home",
+    async (ownerHome) => {
+      const current = await temporaryHome();
+      const original = await temporaryHome();
+      const scanDir = await temporaryHome();
+      const settingsDirectory = join(scanDir, "artifacts", "deep_discovery");
+      await mkdir(settingsDirectory, { recursive: true });
+      await writeFile(
+        join(settingsDirectory, "execution-settings.json"),
+        JSON.stringify({
+          version: 1,
+          settings: { codexHome: original, codexPath: join(original, "codex") },
+        }),
+      );
+      const startedAt = "2026-08-11T12:00:00.000Z";
+      const timestamp = "2026-08-11T12:01:00.000Z";
+      await writeSession(
+        ownerHome === "current" ? current : original,
+        "owner",
+        [
+          {
+            type: "turn_context",
+            timestamp,
+            payload: { turn_id: "scan-turn" },
+          },
+          commandEvent("scan owner", "owner-call", timestamp),
+          {
+            type: "turn_context",
+            timestamp,
+            payload: { turn_id: "later-turn" },
+          },
+          commandEvent("unrelated owner turn", "other-turn", timestamp),
+        ],
+      );
+      for (const id of ["discovery", "resumed-discovery", "reducer"]) {
+        await writeSession(original, id, [commandEvent(id, id, timestamp)]);
+      }
+      await writeSession(
+        original,
+        "worker-child",
+        [commandEvent("worker child", "child-call", timestamp)],
+        "discovery",
+      );
+      // Keep the existing first-home preference for duplicate active rollouts.
+      await writeSession(current, "reducer", [
+        commandEvent("current reducer", "current-reducer-call", timestamp),
+      ]);
+      for (const home of [current, original]) {
+        await writeSession(home, "unrelated", [
+          commandEvent("unrelated scan", "unrelated-call", timestamp),
+        ]);
+      }
+      const result = await readSavedScanLogs(
+        {
+          scanId: "scan-1",
+          mode: "deep",
+          scanDir,
+          continuationThreadId: "owner",
+          executionAttribution: {
+            formatVersion: 1,
+            executionThreadIds: ["discovery", "resumed-discovery", "reducer"],
+            owner: { threadId: "owner", turnId: "scan-turn", startedAt },
+            startedAt,
+            completedAt: "2026-08-11T12:02:00.000Z",
+          },
+        },
+        current,
+      );
+      expect(result.sessions.map(({ threadId }) => threadId).sort()).toEqual([
+        "discovery",
+        "owner",
+        "reducer",
+        "resumed-discovery",
+        "worker-child",
+      ]);
+      expect(
+        result.events.filter(({ threadId }) => threadId === "reducer"),
+      ).toHaveLength(2);
+      expect(JSON.stringify(result)).toContain("current reducer");
+      expect(JSON.stringify(result)).not.toContain("unrelated");
+    },
+  );
+
   test("collects known desktop and CLI threads across active and archived homes without duplicates", async () => {
     const desktop = await temporaryHome();
     const cli = await temporaryHome();
