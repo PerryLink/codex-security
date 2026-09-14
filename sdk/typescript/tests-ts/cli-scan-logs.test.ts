@@ -47,8 +47,17 @@ async function fixture() {
     }),
   );
   await writeFile(
-    join(originalHome, "sessions", "worker.jsonl"),
+    join(home, "sessions", "worker.jsonl"),
     JSON.stringify({ type: "session_meta", payload: { id: "worker" } }) + "\n",
+  );
+  await writeFile(
+    join(originalHome, "sessions", "worker.jsonl"),
+    [
+      { type: "session_meta", payload: { id: "worker" } },
+      { type: "event_msg", payload: { message: "recorded worker suffix" } },
+    ]
+      .map((event) => JSON.stringify(event) + "\n")
+      .join(""),
   );
   const scan = {
     scanId: "scan-1",
@@ -92,7 +101,7 @@ function withoutDuration(text: string) {
 }
 
 describe("saved logs JSON output", () => {
-  test("loads the recorded worker home through the saved logs command", async () => {
+  test("loads the same-thread recorded worker suffix through the saved logs command", async () => {
     const f = await fixture();
     try {
       const stdout = capture();
@@ -109,6 +118,13 @@ describe("saved logs JSON output", () => {
           ({ threadId }: { threadId: string }) => threadId,
         ),
       ).toEqual(["thread-1", "worker"]);
+      expect(JSON.parse(stdout.text()).events).toContainEqual({
+        threadId: "worker",
+        event: {
+          type: "event_msg",
+          payload: { message: "recorded worker suffix" },
+        },
+      });
     } finally {
       await rm(f.state, { recursive: true, force: true });
     }

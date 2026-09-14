@@ -113,6 +113,7 @@ export async function findScanSession(
 
 export async function readScanLogs(options: ScanLogOptions) {
   const logs = new Map<string, SessionLog>();
+  const sessionPaths = new Map<string, string[]>();
   const homes = new Set(
     typeof options.codexHome === "string"
       ? [options.codexHome]
@@ -126,7 +127,12 @@ export async function readScanLogs(options: ScanLogOptions) {
   for (const directory of ["sessions", "archived_sessions"]) {
     for (const home of homes) {
       for await (const session of scanSessions(home, directory)) {
-        if (!logs.has(session.threadId)) logs.set(session.threadId, session);
+        const paths = sessionPaths.get(session.threadId);
+        if (paths) paths.push(session.path);
+        else {
+          logs.set(session.threadId, session);
+          sessionPaths.set(session.threadId, [session.path]);
+        }
       }
     }
   }
@@ -172,7 +178,14 @@ export async function readScanLogs(options: ScanLogOptions) {
   const sessions: SessionLog[] = [];
   for (const threadId of included) {
     const session = logs.get(threadId);
-    if (session !== undefined) sessions.push(session);
+    if (session !== undefined) {
+      // Compare only scan-owned logs. Keep traversal order unless a later copy
+      // contains every recorded event followed by additional events.
+      for (const path of sessionPaths.get(threadId)!.slice(1)) {
+        if (await extendsSessionLog(path, session.path)) session.path = path;
+      }
+      sessions.push(session);
+    }
   }
   const events: Record<string, unknown>[] = [];
   for (const session of sessions) {
@@ -233,6 +246,24 @@ export async function readScanLogs(options: ScanLogOptions) {
     })),
     events,
   };
+}
+
+async function extendsSessionLog(
+  path: string,
+  previousPath: string,
+): Promise<boolean> {
+  const previous = sessionEvents(previousPath);
+  try {
+    for await (const event of sessionEvents(path)) {
+      const recorded = await previous.next();
+      if (recorded.done) return true;
+      if (JSON.stringify(event) !== JSON.stringify(recorded.value))
+        return false;
+    }
+    return false;
+  } finally {
+    await previous.return(undefined);
+  }
 }
 
 function belongsToScan(
