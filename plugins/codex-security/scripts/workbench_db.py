@@ -1353,6 +1353,21 @@ def completed_scan_context(
     return context
 
 
+def validate_completed_scan_artifacts(scan: sqlite3.Row) -> None:
+    scan_dir = require_canonical_scan_directory(Path(scan["scan_dir"]))
+    require_recorded_manifest_digest(scan, scan_dir)
+    verify_manifest_binding(scan, read_json_object(scan_dir / ARTIFACTS["manifest"]))
+    try:
+        manifest = _prepare_scan_finalization(
+            scan_dir,
+            expected_coverage_mode=expected_coverage_mode(scan),
+        )[2]
+    except ContractError as exc:
+        raise SystemExit(str(exc)) from exc
+    verify_manifest_binding(scan, manifest)
+    published_manifest_digest(scan_dir, manifest)
+
+
 def complete_scan_locked(
     connection: sqlite3.Connection,
     scan_id: str,
@@ -3388,6 +3403,13 @@ def main(*, select_finalization: bool = False, with_execution_settings: bool = F
             result = start_headless_standard_scan(connection, args)
         elif args.command == "begin-deep-scan":
             result = deep_scan.begin_deep_scan(connection, args)
+            if (
+                result["deepScan"]["status"] == "succeeded"
+                and result["deepScan"]["finalizationInput"] is not None
+            ):
+                scan = require_scan(connection, result["deepScan"]["scanId"])
+                if scan["status"] == "complete":
+                    validate_completed_scan_artifacts(scan)
         elif args.command == "get-deep-scan":
             result = deep_scan.get_deep_scan(connection, args)
         elif args.command == "claim-deep-scan-coordinator":
