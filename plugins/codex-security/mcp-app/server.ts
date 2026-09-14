@@ -817,7 +817,12 @@ export function createCodexSecurityServer(): McpServer {
               ...(handoffClaimToken === undefined ? {} : { handoffClaimToken })
             }, runWorkbench, signal, publication);
           },
-          onFinalized: completeSelectedParent,
+          onFinalized: async (run) => {
+            try { await completeSelectedParent(run); }
+            catch (error) {
+              throw new Error(deepScanInvocationFailureMessage(error), { cause: error });
+            }
+          },
           onStopped: async (run) => {
             await runWorkbench([
               "preserve-scan-results", "--scan-id", run.scanId,

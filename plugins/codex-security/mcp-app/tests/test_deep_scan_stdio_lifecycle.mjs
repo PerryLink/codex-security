@@ -33,7 +33,7 @@ const parentSandboxState = {
 if (process.platform === "win32") {
   console.log("deep scan stdio lifecycle test skipped on Windows (POSIX fake Codex executable)");
 } else {
-  for (const mode of ["detached", "joined", "remote", "failure", "lost-response"]) {
+  for (const mode of ["detached", "joined", "remote", "failure", "active-failure", "lost-response"]) {
     await testDeepScanDetachedCompletion(mode);
   }
   await testDeepScanStdioLifecycle();
@@ -63,7 +63,7 @@ async function testDeepScanDetachedCompletion(mode) {
     "[deep_scan]\nworkers = 1\nsubagents = 0\nstop_after_no_new = 1\nmax_discovery_runs = 2\n");
   await writeFile(controlPath, "wait-for-completion");
   await writePythonWrapper(pythonWrapperPath);
-  if (mode !== "detached") await writeFile(finalizerControlPath, mode === "joined" || mode === "remote" ? "wait" : mode);
+  if (mode !== "detached") await writeFile(finalizerControlPath, mode === "joined" || mode === "remote" ? "wait" : mode === "active-failure" ? "failure" : mode);
   await writeFakeCodex(fakeCodexPath);
   if (!installedPluginRoot) await bundleServer(serverBundlePath);
   const environment = {
@@ -105,7 +105,7 @@ async function testDeepScanDetachedCompletion(mode) {
       await waitFor(() => remote.stderrEvents().some((event) => event.event === "coordinator_joined"),
         "remote request to observe the existing owner");
     }
-    server.notify("notifications/cancelled", { requestId: 2, reason: "detach original observer" });
+    if (mode !== "active-failure") server.notify("notifications/cancelled", { requestId: 2, reason: "detach original observer" });
     await delay(150);
     const detached = await getDeepScan({ environment, scanId, threadId });
     const originalPublicScan = await runWorkbench(environment, ["get-scan", "--scan-id", scanId]);
@@ -152,16 +152,24 @@ async function testDeepScanDetachedCompletion(mode) {
       assert.equal((await readJsonLines(finalizerLogPath)).length, 1);
       await rm(finalizerControlPath);
     }
-    if (mode === "failure" || mode === "lost-response") {
+    if (mode === "failure" || mode === "active-failure" || mode === "lost-response") {
       await waitFor(() => server.stderrEvents().some((event) => event.event === "coordinator_publication_pending"),
         "public finalization failure to remain pending");
+      if (mode === "active-failure") {
+        const failed = await server.waitForResponse(2);
+        assert.equal(failed.result?.isError, true);
+        const message = failed.result.content.map((item) => item.text).join(" ");
+        assert.match(message, /injected complete-scan failure/);
+        assert.match(message, /Do not call start_codex_security_deep_scan again in this response/);
+        assert.match(message, /no final|Do not.*final/i);
+      }
       const pending = await getDeepScan({ environment, scanId, threadId });
       assert.equal(pending.status, "succeeded");
       assert.equal(pending.terminalReason, finished.terminalReason);
       assert.deepEqual(pending.finalizationInput, finished.finalizationInput);
       assert.equal((await readJsonLines(finalizerLogPath)).length, 1, "the owner does not add a retry layer");
       const beforeReplay = await runWorkbench(environment, ["get-scan", "--scan-id", scanId]);
-      assert.equal(beforeReplay.scan.progress.status, mode === "failure" ? "running" : "complete");
+      assert.equal(beforeReplay.scan.progress.status, mode !== "lost-response" ? "running" : "complete");
       const manifestBeforeReplay = await readFile(path.join(finished.scanDir, "scan-manifest.json"));
       const rejoined = await server.request(5, "tools/call", toolCall("start_codex_security_deep_scan", { scanId }, threadId));
       assertNoError(rejoined);
@@ -184,7 +192,7 @@ async function testDeepScanDetachedCompletion(mode) {
     assert.deepEqual(publicScan.scan.executionAttribution.owner, originalPublicScan.scan.executionAttribution.owner);
     assert.equal(publicScan.scan.executionAttribution.owner.threadId, threadId);
     assert.equal((await readJsonLines(startLogPath)).length, 3, "completion and replay launch no extra model workers");
-    assert.equal((await readJsonLines(finalizerLogPath)).length, mode === "failure" || mode === "lost-response" ? 2 : 1);
+    assert.equal((await readJsonLines(finalizerLogPath)).length, mode === "failure" || mode === "active-failure" || mode === "lost-response" ? 2 : 1);
     assertProcessAlive(server.pid);
     console.log("native selected completion passed", mode, scanId);
   } catch (error) {
