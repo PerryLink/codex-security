@@ -1213,7 +1213,9 @@ def claim_deep_scan_coordinator_locked(
         )
         run = require_deep_scan_run(connection, scan_id)
         require_supported_deep_scan(run)
-        selected_parent = run["status"] == "succeeded" and deep_scan_finalization_input(run) is not None
+        selected_parent = (
+            run["status"] == "succeeded" and deep_scan_finalization_input(run) is not None
+        )
         if selected_parent and scan["status"] == "complete":
             connection.commit()
             return {
@@ -1222,7 +1224,9 @@ def claim_deep_scan_coordinator_locked(
             }
         if not selected_parent:
             run, _ = require_running_deep_scan(connection, scan_id)
-        elif run["cancel_requested"] or scan["status"] != "running" or scan["canceled_at"] is not None:
+        elif (
+            run["cancel_requested"] or scan["status"] != "running" or scan["canceled_at"] is not None
+        ):
             raise SystemExit("Only a running scan can complete its selected Deep Scan result.")
         timestamp = now()
         if args.coordinator_generation is not None:
