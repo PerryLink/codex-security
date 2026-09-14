@@ -42,6 +42,8 @@ export interface DeduplicationSourceTool {
 
 /** Serializable model assignment; the SDK retains all result validation. */
 export interface DeduplicationReviewRequest {
+  /** Exact SDK assignment in prompt order; screening anchor is first. */
+  findingIds: readonly string[];
   checkpointKey: string;
   /** Model-visible namespace for submit_decisions and submit_error. */
   resultToolNamespace: string;
@@ -105,6 +107,8 @@ export interface DeduplicateRecordsOptions {
 }
 
 export interface BoundDeduplicationPairOutcome extends DeduplicationPairOutcome {
+  /** Acknowledged reviews explaining this pair; prior-only outcomes have none. */
+  checkpointKeys: string[];
   bindingDigest: string;
 }
 
@@ -114,7 +118,7 @@ export interface DeduplicateRecordsResult extends DetailedDeduplicationResult {
 }
 
 // Changes to record review semantics invalidate saved host review bindings.
-const RECORD_REVIEW_CONTRACT_VERSION = 2;
+const RECORD_REVIEW_CONTRACT_VERSION = 3;
 
 function freeze<T>(value: T): T {
   if (value !== null && typeof value === "object") {
@@ -218,10 +222,17 @@ export async function deduplicateRecords(
     });
   }
   const checkpointKeys = new Set<string>();
+  const pairCheckpointKeys = new Map<string, Set<string>>();
+  const pairKey = (ids: readonly string[]) => JSON.stringify([...ids].sort());
   const runner = {
     async run<T>(review: CodexReview<T>): Promise<T> {
       await assertSourceUnchanged();
+      if (!review.findingIds)
+        throw new CodexSecurityError(
+          "Record review is missing its SDK assignment.",
+        );
       const request = {
+        findingIds: [...review.findingIds],
         resultToolNamespace,
         stage: review.stage,
         model: review.model,
@@ -249,7 +260,16 @@ export async function deduplicateRecords(
           ),
         assertSourceUnchanged,
       });
-      if (options.checkpointStore) checkpointKeys.add(key);
+      if (options.checkpointStore) {
+        checkpointKeys.add(key);
+        const [anchor, ...neighbors] = request.findingIds;
+        for (const neighbor of neighbors) {
+          const pair = pairKey([anchor!, neighbor]);
+          const keys = pairCheckpointKeys.get(pair) ?? new Set<string>();
+          keys.add(key);
+          pairCheckpointKeys.set(pair, keys);
+        }
+      }
       return result;
     },
   };
@@ -298,6 +318,12 @@ export async function deduplicateRecords(
     pairOutcomes: result.pairOutcomes.map((outcome) => ({
       ...outcome,
       bindingDigest: pairBinding(outcome.findingIds),
+      checkpointKeys:
+        outcome.origin === "prior"
+          ? []
+          : [
+              ...(pairCheckpointKeys.get(pairKey(outcome.findingIds)) ?? []),
+            ].sort(),
     })),
     checkpointKeys: [...checkpointKeys].sort(),
   };

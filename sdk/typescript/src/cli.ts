@@ -1740,6 +1740,15 @@ export async function main(
   errorOutput: Writable = process.stderr,
   dependencies: CliDependencies = DEFAULT_DEPENDENCIES,
 ): Promise<number> {
+  if (
+    argv.includes("--records") &&
+    !argv.includes("--help") &&
+    !argv.includes("-h")
+  ) {
+    const { runRecordDedupeCli } =
+      await import("./deduplication/records-cli.js");
+    return await runRecordDedupeCli(argv, output, errorOutput);
+  }
   argv = normalizeScanImportArguments(defaultListCommand(argv));
   const policyFullOutput =
     argv[cliCommandIndex(argv)] === "policy" && argv.includes("--full-output");
@@ -3821,10 +3830,16 @@ export async function main(
     })
     .command("dedupe", {
       description:
-        "Review a saved scan with local Codex and save duplicate groups to the findings API.",
+        "Review a saved scan with local Codex, or use --records for host-driven record deduplication.",
       destructive: true,
       mcp: false,
       options: z.object({
+        records: z
+          .boolean()
+          .optional()
+          .describe(
+            "Use headless JSON-RPC record deduplication over stdin/stdout; takes no other execution flags.",
+          ),
         concurrency: z
           .number()
           .int()

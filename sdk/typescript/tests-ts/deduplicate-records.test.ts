@@ -713,3 +713,55 @@ test("invalid or colliding result namespaces fail before source access", async (
     "reserved result namespaces",
   );
 });
+
+test.each([true, false])(
+  "pair checkpoints retain exact SDK assignments across cache reuse (SAME=%s)",
+  async (same) => {
+    const store = new Checkpoints();
+    const input = {
+      ...options([finding(1), finding(2), finding(3)]),
+      checkpointStore: store,
+    };
+    input.reviewRunner = {
+      async run(request) {
+        expect(request.findingIds).toEqual(
+          assigned(request).map((value) => value.findingId),
+        );
+        return submission(request, same);
+      },
+    };
+    const fresh = await deduplicateRecords(input);
+    for (const outcome of fresh.pairOutcomes) {
+      expect(outcome.checkpointKeys).toHaveLength(same ? 3 : 2);
+      for (const key of outcome.checkpointKeys) {
+        expect(fresh.checkpointKeys).toContain(key);
+        const binding = store.bindings.get(key) as {
+          version: number;
+          request: DeduplicationReviewRequest;
+        };
+        expect(binding.version).toBe(3);
+        expect(binding.request.findingIds).toContain(outcome.findingIds[0]);
+        expect(binding.request.findingIds).toContain(outcome.findingIds[1]);
+        if (binding.request.stage === "screening")
+          expect(outcome.findingIds).toContain(binding.request.findingIds[0]!);
+      }
+    }
+    input.reviewRunner = {
+      async run() {
+        throw new Error("Review should be restored from the host checkpoint");
+      },
+    };
+    const resumed = await deduplicateRecords(input);
+    expect(resumed.pairOutcomes).toEqual(fresh.pairOutcomes);
+    const prior = await deduplicateRecords({
+      ...input,
+      priorDecisions: fresh.pairOutcomes,
+    });
+    expect(
+      prior.pairOutcomes.every(
+        (outcome) =>
+          outcome.origin === "prior" && outcome.checkpointKeys.length === 0,
+      ),
+    ).toBe(true);
+  },
+);

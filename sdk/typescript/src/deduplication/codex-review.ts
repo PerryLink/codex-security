@@ -46,6 +46,8 @@ const reviewErrorSchema = z
   .strict();
 
 export interface CodexReview<T> {
+  /** SDK-assigned records, in prompt order, when this is a record review. */
+  findingIds?: readonly string[];
   stage: DeduplicationReviewStage;
   model: string;
   effort: string;
