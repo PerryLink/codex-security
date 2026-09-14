@@ -146,6 +146,7 @@ async function testDeepScanDetachedCompletion(mode) {
       // A remote observer retains the aggregate-ready response. It cannot run
       // the owning process's public finalizer, even after Deep itself succeeds.
       const observed = await remote.waitForResponse(2);
+      await waitForJsonLines(finalizerLogPath, 1);
       assertNoError(observed);
       assert.equal(observed.result.structuredContent.manifestPath, path.join(finished.scanDir, "scan-manifest.json"));
       assert.equal((await readJsonLines(finalizerLogPath)).length, 1);
