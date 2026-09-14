@@ -16,6 +16,7 @@ import {
 import {
   CodexDeduplicationReviewer,
   requireFinding,
+  pairKey,
 } from "./deduplication-reviewer.js";
 import {
   DEFAULT_RESULT_TOOL_NAMESPACE,
@@ -73,11 +74,6 @@ export interface DeduplicationReviewRunner {
   ): Promise<unknown>;
 }
 
-export interface DeduplicationCandidateProvider {
-  /** Return complete candidate records; the supplied observation is authoritative. */
-  potentialDuplicates(finding: Finding): Promise<readonly Finding[]>;
-}
-
 /** Reuse an earlier pair outcome only with its original immutable-input binding. */
 export interface PriorDeduplicationDecision {
   findingIds: readonly [string, string];
@@ -87,7 +83,11 @@ export interface PriorDeduplicationDecision {
 
 export interface DeduplicateRecordsOptions {
   observations: readonly Finding[];
-  candidateProvider: DeduplicationCandidateProvider;
+  candidates: readonly Finding[];
+  candidateRelationships: readonly {
+    observationId: string;
+    candidateIds: readonly string[];
+  }[];
   reviewRunner: DeduplicationReviewRunner;
   /** Host-established repository identities and exact revisions, without credentials. */
   sourceManifest: JsonObject;
@@ -187,7 +187,7 @@ export async function deduplicateRecords(
     sourceTools,
   });
   // A finding ID cannot silently acquire another record's evidence in the union
-  // of neighborhoods. Freeze before giving any record to a provider or reviewer.
+  // of neighborhoods. Snapshot the complete batch before any host callback.
   const records = new Map<string, { finding: Finding; digest: string }>();
   function register(input: Finding): Finding {
     requireFinding(input);
@@ -201,7 +201,40 @@ export async function deduplicateRecords(
     if (!existing) records.set(finding.findingId, { finding, digest });
     return existing?.finding ?? finding;
   }
-  const observations = options.observations.map(register);
+  const observations = new Set(
+    options.observations.map(register).map(({ findingId }) => findingId),
+  );
+  const candidates = new Map(
+    options.candidates
+      .map(register)
+      .map((finding) => [finding.findingId, finding]),
+  );
+  const neighborhoods = new Map<string, Finding[]>();
+  for (const {
+    observationId,
+    candidateIds,
+  } of options.candidateRelationships) {
+    if (!observations.has(observationId) || neighborhoods.has(observationId))
+      throw new CodexSecurityError(
+        "Candidate relationships must name each observation once.",
+      );
+    const neighbors = new Set(
+      candidateIds.map((id) => {
+        const candidate = candidates.get(id);
+        if (!candidate)
+          throw new CodexSecurityError(
+            "Candidate relationship names a missing candidate record.",
+          );
+        return candidate;
+      }),
+    );
+    neighbors.delete(records.get(observationId)!.finding);
+    neighborhoods.set(observationId, [...neighbors]);
+  }
+  if (neighborhoods.size !== observations.size)
+    throw new CodexSecurityError(
+      "Candidate relationships must name each observation once.",
+    );
   const assertSourceUnchanged = async () => {
     options.signal?.throwIfAborted();
     await options.verifySource(sourceManifest);
@@ -224,7 +257,6 @@ export async function deduplicateRecords(
   }
   const checkpointKeys = new Set<string>();
   const pairCheckpointKeys = new Map<string, Set<string>>();
-  const pairKey = (ids: readonly string[]) => JSON.stringify([...ids].sort());
   const runner = {
     async run<T>(review: CodexReview<T>): Promise<T> {
       await assertSourceUnchanged();
@@ -277,42 +309,30 @@ export async function deduplicateRecords(
   const core = new FindingDeduplicator(
     {
       async potentialDuplicates(id) {
-        const finding = records.get(id)!.finding;
-        const candidates =
-          await options.candidateProvider.potentialDuplicates(finding);
-        options.signal?.throwIfAborted();
-        const neighbors = new Map<string, Finding>();
-        for (const candidate of candidates) {
-          const registered = register(candidate);
-          if (registered.findingId !== id)
-            neighbors.set(registered.findingId, registered);
-        }
-        return { finding, potentialDuplicates: [...neighbors.values()] };
+        return {
+          finding: records.get(id)!.finding,
+          potentialDuplicates: neighborhoods.get(id)!,
+        };
       },
     },
     new CodexDeduplicationReviewer(runner, resultToolNamespace),
     options.signal,
     concurrency,
   );
-  const result = await core.runDetailed(
-    observations.map((finding) => finding.findingId),
-    () => {
-      for (const prior of priorDecisions) {
-        if (
-          prior.findingIds.length !== 2 ||
-          !["SAME", "DISTINCT"].includes(prior.decision)
-        )
-          throw new CodexSecurityError(
-            "Prior decisions require one assigned pair and a SAME or DISTINCT decision.",
-          );
-        if (prior.bindingDigest !== pairBinding(prior.findingIds))
-          throw new CodexSecurityError(
-            "Prior decision does not match the current record/source binding.",
-          );
-      }
-      return priorDecisions;
-    },
-  );
+  for (const prior of priorDecisions) {
+    if (
+      prior.findingIds.length !== 2 ||
+      !["SAME", "DISTINCT"].includes(prior.decision)
+    )
+      throw new CodexSecurityError(
+        "Prior decisions require one assigned pair and a SAME or DISTINCT decision.",
+      );
+    if (prior.bindingDigest !== pairBinding(prior.findingIds))
+      throw new CodexSecurityError(
+        "Prior decision does not match the current record/source binding.",
+      );
+  }
+  const result = await core.runDetailed([...observations], priorDecisions);
   await assertSourceUnchanged();
   return {
     ...result,

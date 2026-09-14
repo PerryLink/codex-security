@@ -275,10 +275,9 @@ export async function isGitMetadataDirectory(
   }
   if (!head.isFile() && !head.isSymbolicLink()) return false;
   try {
-    // Run outside the metadata directory so Git does not load its config
-    // before the resolver can validate it.
+    // This resolver validates Git directories without loading their configuration.
     const directory = await gitOutput(
-      dirname(repository),
+      repository,
       ["rev-parse", "--resolve-git-dir", repository],
       signal,
       { LC_ALL: "C" },

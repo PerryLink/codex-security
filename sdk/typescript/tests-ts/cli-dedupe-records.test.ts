@@ -31,6 +31,7 @@ function finding(n: number): Finding {
 const first = finding(1),
   second = finding(2);
 const params = {
+  protocolVersion: 1,
   observations: [first],
   candidates: [second],
   candidateRelationships: [
@@ -67,15 +68,6 @@ function session() {
     messages.shift() ?? (await new Promise((resolve) => waiting.push(resolve)));
   const reply = (message: Message, result: unknown) =>
     send({ jsonrpc: "2.0", id: message.id, result });
-  const initialize = async (checkpoints = false) => {
-    send({
-      jsonrpc: "2.0",
-      id: "initialize",
-      method: "initialize",
-      params: { protocolVersion: 1, checkpoints },
-    });
-    expect((await next()).result).toEqual({ protocolVersion: 1 });
-  };
   const run = (options: unknown = params) =>
     send({ jsonrpc: "2.0", id: "run", method: "run", params: options });
   const close = () => {
@@ -89,7 +81,6 @@ function session() {
     send,
     next,
     reply,
-    initialize,
     run,
     close,
   };
@@ -123,9 +114,9 @@ async function drive(
   const s = session(),
     methods: string[] = [];
   try {
-    await s.initialize(true);
     s.run({
       ...params,
+      checkpoints: true,
       ...(options.priorDecisions
         ? { priorDecisions: options.priorDecisions }
         : {}),
@@ -198,11 +189,10 @@ test("runs the SDK and reuses host-persisted validated checkpoints", async () =>
     pairOutcomes: [{ origin: "prior", checkpointKeys: [] }],
   });
 });
-test("preloaded relationships produce the same results and checkpoints as the SDK provider", async () => {
+test("CLI and SDK batches produce identical results and checkpoints", async () => {
   const directCheckpoints = new Map<string, unknown>();
   const direct = await deduplicateRecords({
     ...params,
-    candidateProvider: { potentialDuplicates: async () => [second] },
     reviewRunner: { run: async (request) => reviewResult(request) },
     verifySource: async () => {},
     checkpointStore: {
@@ -256,7 +246,6 @@ test.each([
   async (change) => {
     const s = session();
     try {
-      await s.initialize();
       s.run({ ...params, ...change });
       const response = await s.next();
       expect(response.id).toBe("run");
@@ -271,7 +260,6 @@ test.each([
 test("an explicit empty neighborhood does not compare unrelated preloaded candidates", async () => {
   const s = session();
   try {
-    await s.initialize();
     s.run({
       ...params,
       candidateRelationships: [
@@ -330,7 +318,6 @@ test.each(["orphan", "malformed", "duplicate"])(
   async (kind) => {
     const s = session();
     try {
-      await s.initialize();
       s.run();
       const callback = await s.next();
       expect(callback.method).toBe("source.verify");
@@ -358,7 +345,6 @@ test.each(["cancel", "eof", "host-error", "bad-ack"])(
   async (kind) => {
     const s = session();
     try {
-      await s.initialize();
       s.run();
       const callback = await s.next();
       if (kind === "cancel") s.send({ jsonrpc: "2.0", method: "cancel" });
@@ -383,7 +369,6 @@ test.each(["cancel", "eof", "host-error", "bad-ack"])(
 test("correlates concurrent callbacks independently of reply order", async () => {
   const s = session();
   try {
-    await s.initialize();
     s.run({
       ...params,
       observations: [first, second],
@@ -425,7 +410,6 @@ test("correlates concurrent callbacks independently of reply order", async () =>
 test("rejects undeclared run options", async () => {
   const s = session();
   try {
-    await s.initialize();
     s.run({ ...params, repositoryPath: "/synthetic/repository" });
     expect(await s.done).toBe(2);
     expect((await s.next()).error).toBeDefined();
@@ -438,33 +422,20 @@ test("rejects execution flags before reading stdin", async () => {
   expect(
     await runRecordDedupeCli(
       ["dedupe", "--records", "--concurrency", "2"],
-      {
+      new Writable({
         write() {
           throw new Error("No protocol output expected");
         },
-      },
-      {
-        write(text) {
+      }),
+      new Writable({
+        write(text, _encoding, callback) {
           error += text;
+          callback();
         },
-      },
+      }),
     ),
   ).toBe(2);
   expect(error).toContain("run request");
-});
-
-test("closed output terminates pending callbacks", async () => {
-  const input = new PassThrough();
-  const done = runRecordDedupeProtocol(input, {
-    write() {
-      throw new Error("Closed output");
-    },
-  });
-  input.write(
-    '{"jsonrpc":"2.0","id":"init","method":"initialize","params":{"protocolVersion":1}}\n',
-  );
-  expect(await done).toBe(2);
-  input.destroy();
 });
 
 test("unsupported protocol version fails before callback dispatch", async () => {
@@ -472,13 +443,13 @@ test("unsupported protocol version fails before callback dispatch", async () => 
   try {
     s.send({
       jsonrpc: "2.0",
-      id: "init",
-      method: "initialize",
-      params: { protocolVersion: 2 },
+      id: "run",
+      method: "run",
+      params: { ...params, protocolVersion: 2 },
     });
     expect(await s.done).toBe(2);
     const error = await s.next();
-    expect(error.id).toBe("init");
+    expect(error.id).toBe("run");
     expect(error.error?.code).toBe(-32600);
     expect(error.result).toBeUndefined();
   } finally {
@@ -489,7 +460,6 @@ test("unsupported protocol version fails before callback dispatch", async () => 
 test("input stream errors fail the active run through readline", async () => {
   const s = session();
   try {
-    await s.initialize();
     s.run();
     expect((await s.next()).method).toBe("source.verify");
     s.input.destroy(new Error("Synthetic input failure"));
@@ -529,19 +499,7 @@ test.each(["success", "cancel"])(
           return;
         }
         callback();
-        if (message.id === "init") {
-          send({
-            jsonrpc: "2.0",
-            id: "run",
-            method: "run",
-            params: {
-              ...params,
-              observations: [],
-              candidates: [],
-              candidateRelationships: [],
-            },
-          });
-        } else if (mode === "cancel") {
+        if (mode === "cancel") {
           send({ jsonrpc: "2.0", method: "cancel" });
         } else {
           expect(message.method).toBe("source.verify");
@@ -557,9 +515,14 @@ test.each(["success", "cancel"])(
     try {
       send({
         jsonrpc: "2.0",
-        id: "init",
-        method: "initialize",
-        params: { protocolVersion: 1 },
+        id: "run",
+        method: "run",
+        params: {
+          ...params,
+          observations: [],
+          candidates: [],
+          candidateRelationships: [],
+        },
       });
       await finalWrite;
       await Promise.resolve();
@@ -594,11 +557,11 @@ test("invalid command diagnostics handle asynchronous output failure", async () 
     expect(
       await runRecordDedupeCli(
         ["dedupe", "--records", "--concurrency", "2"],
-        {
+        new Writable({
           write() {
             throw new Error("No protocol output expected");
           },
-        },
+        }),
         diagnostics,
       ),
     ).toBe(2);
@@ -610,20 +573,16 @@ test("invalid command diagnostics handle asynchronous output failure", async () 
   }
 });
 
-test.each([false, true])(
-  "unidentifiable input errors use null without repeating initialize (initialized=%s)",
-  async (initialized) => {
-    const s = session();
-    try {
-      if (initialized) await s.initialize();
-      s.input.write("{malformed-json\n");
-      expect(await s.done).toBe(2);
-      const error = await s.next();
-      expect(error.id).toBeNull();
-      expect(error.error?.code).toBe(-32600);
-      expect(error.result).toBeUndefined();
-    } finally {
-      s.close();
-    }
-  },
-);
+test("unidentifiable input errors use null", async () => {
+  const s = session();
+  try {
+    s.input.write("{malformed-json\n");
+    expect(await s.done).toBe(2);
+    const error = await s.next();
+    expect(error.id).toBeNull();
+    expect(error.error?.code).toBe(-32600);
+    expect(error.result).toBeUndefined();
+  } finally {
+    s.close();
+  }
+});

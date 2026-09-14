@@ -443,7 +443,7 @@ try {
          sourceManifest: { repository: "synthetic" },
          scopeKey: "package-smoke",
          verifySource: async () => {},
-         candidateProvider: { potentialDuplicates: async () => { throw new Error("Unexpected retrieval"); } },
+         candidates: [], candidateRelationships: [],
          reviewRunner: { run: async () => { throw new Error("Unexpected review"); } },
        });
        assert.deepEqual(deduped.uniqueFindingIds, []);
@@ -825,7 +825,7 @@ try {
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { createInterface } from "node:readline";
-for (const mode of ["success", "cancel", "blocked-diagnostics", "invalid-initialize"]) {
+for (const mode of ["success", "cancel", "blocked-diagnostics"]) {
   const child = spawn(process.execPath, [process.argv[1], "dedupe", "--records"], {
     stdio: ["pipe", "pipe", "pipe"]
   });
@@ -839,18 +839,14 @@ for (const mode of ["success", "cancel", "blocked-diagnostics", "invalid-initial
     child.stderr.setEncoding("utf8").on("data", value => diagnostics += value);
   }
   const send = message => child.stdin.write(JSON.stringify(message) + "\\n");
-  send({jsonrpc:"2.0", id:"init", method:"initialize", params:{protocolVersion:mode === "invalid-initialize" ? 2 : 1}});
+  send({jsonrpc:"2.0", id:"run", method:"run", params:{
+    protocolVersion:1, observations:[], candidates:[], candidateRelationships:[],
+    scopeKey:"synthetic-scope", sourceManifest:{}
+  }});
   try {
     for await (const line of createInterface({input:child.stdout})) {
       const message = JSON.parse(line);
-      if (message.id === "init") {
-        if (mode === "invalid-initialize") { response = message; continue; }
-        assert.deepEqual(message.result, {protocolVersion:1});
-        send({jsonrpc:"2.0", id:"run", method:"run", params:{
-          observations:[], candidates:[], candidateRelationships:[],
-          scopeKey:"synthetic-scope", sourceManifest:{}
-        }});
-      } else if (message.id === "run") {
+      if (message.id === "run") {
         response = message;
       } else if (mode === "cancel") {
         send({jsonrpc:"2.0", method:"cancel"});
@@ -866,10 +862,7 @@ for (const mode of ["success", "cancel", "blocked-diagnostics", "invalid-initial
     const expectedExit = mode === "success" ? 0 : mode === "cancel" ? 130 : 2;
     assert.equal(await closed, expectedExit, diagnostics);
     assert.ok(response);
-    if (mode === "invalid-initialize") {
-      assert.equal(response.id, "init");
-      assert.equal(response.error.code, -32600);
-    } else if (mode === "cancel") assert.equal(response.error.code, -32800);
+    if (mode === "cancel") assert.equal(response.error.code, -32800);
     else if (mode === "blocked-diagnostics") assert.equal(response.error.code, -32000);
     else assert.deepEqual(response.result.pairOutcomes, []);
   } finally {

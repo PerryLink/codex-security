@@ -90,13 +90,13 @@ function options(
 ): DeduplicateRecordsOptions {
   return {
     observations: findings,
-    candidateProvider: {
-      async potentialDuplicates(anchor) {
-        return findings.filter(
-          (candidate) => candidate.findingId !== anchor.findingId,
-        );
-      },
-    },
+    candidates: findings,
+    candidateRelationships: findings.map((anchor) => ({
+      observationId: anchor.findingId,
+      candidateIds: findings
+        .filter((candidate) => candidate.findingId !== anchor.findingId)
+        .map((candidate) => candidate.findingId),
+    })),
     reviewRunner: {
       async run(request) {
         return submission(request);
@@ -153,6 +153,24 @@ test("public record API reviews complete records without artifacts or a findings
   expect(result.checkpointKeys).toEqual([]);
 });
 
+test("snapshots the complete batch before source callbacks and ignores repeated or self nominations", async () => {
+  const input = options();
+  const expected = await deduplicateRecords(input);
+  input.candidateRelationships = input.candidateRelationships.map(
+    ({ observationId, candidateIds }) => ({
+      observationId,
+      candidateIds: [observationId, ...candidateIds, ...candidateIds],
+    }),
+  );
+  input.verifySource = async () => {
+    input.candidates[0]!.title = "Changed after the batch was accepted";
+    input.candidates = [];
+    input.candidateRelationships = [];
+    input.verifySource = async () => {};
+  };
+  expect(await deduplicateRecords(input)).toEqual(expected);
+});
+
 test("empty or isolated records do not invoke a reviewer", async () => {
   for (const observations of [[], [finding(1)]]) {
     const input = options(observations);
@@ -169,13 +187,12 @@ test("empty or isolated records do not invoke a reviewer", async () => {
 
 test("conflicting candidate identities fail before any model review", async () => {
   const input = options();
-  input.candidateProvider = {
-    async potentialDuplicates(anchor) {
-      return [
-        { ...anchor, title: "Different evidence under the same identifier" },
-      ];
+  input.candidates = [
+    {
+      ...input.observations[0]!,
+      title: "Different evidence under the same identifier",
     },
-  };
+  ];
   input.reviewRunner = {
     async run() {
       throw new Error("No review should run");
@@ -252,11 +269,13 @@ test("prior DISTINCT survives missing nominations and exposes the raw SAME bridg
   };
   const prior = await deduplicateRecords(previous);
   const current = options([middle]);
-  current.candidateProvider = {
-    async potentialDuplicates() {
-      return [left, right];
+  current.candidates = [left, right];
+  current.candidateRelationships = [
+    {
+      observationId: middle.findingId,
+      candidateIds: [left.findingId, right.findingId],
     },
-  };
+  ];
   current.priorDecisions = prior.pairOutcomes;
   const result = await deduplicateRecords(current);
   expect(

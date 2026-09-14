@@ -129,7 +129,6 @@ export type {
   BoundDeduplicationPairOutcome,
   DeduplicateRecordsOptions,
   DeduplicateRecordsResult,
-  DeduplicationCandidateProvider,
   DeduplicationCheckpointStore,
   DeduplicationReviewRequest,
   DeduplicationReviewRunner,
