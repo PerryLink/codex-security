@@ -1170,6 +1170,8 @@ def coordinator_lease_is_live(
     try:
         heartbeat = json.loads(heartbeat_path.read_text(encoding="utf-8"))
         if heartbeat["coordinatorGeneration"] == run["coordinator_generation"]:
+            if heartbeat.get("released") is True:
+                return False
             heartbeat_time = max(heartbeat_time, _parse_timestamp(heartbeat["updatedAt"]))
     except (OSError, KeyError, TypeError, ValueError):
         pass
@@ -1209,7 +1211,19 @@ def claim_deep_scan_coordinator_locked(
             args.claim_token,
             error_message="Deep Scan orchestration is owned by another continuation.",
         )
-        run, _ = require_running_deep_scan(connection, scan_id)
+        run = require_deep_scan_run(connection, scan_id)
+        require_supported_deep_scan(run)
+        selected_parent = run["status"] == "succeeded" and deep_scan_finalization_input(run) is not None
+        if selected_parent and scan["status"] == "complete":
+            connection.commit()
+            return {
+                **deep_scan_result(connection, scan_id),
+                "coordinatorDisposition": "observing",
+            }
+        if not selected_parent:
+            run, _ = require_running_deep_scan(connection, scan_id)
+        elif run["cancel_requested"] or scan["status"] != "running" or scan["canceled_at"] is not None:
+            raise SystemExit("Only a running scan can complete its selected Deep Scan result.")
         timestamp = now()
         if args.coordinator_generation is not None:
             require_current_coordinator(run, args)
@@ -1240,7 +1254,7 @@ def claim_deep_scan_coordinator_locked(
             """
             UPDATE deep_scan_runs
             SET coordinator_generation = coordinator_generation + ?, updated_at = ?
-            WHERE scan_id = ? AND status = 'running'
+            WHERE scan_id = ? AND status IN ('running', 'succeeded')
             """,
             (int(args.coordinator_generation != run["coordinator_generation"]), timestamp, scan_id),
         )

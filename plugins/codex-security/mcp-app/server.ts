@@ -757,7 +757,9 @@ export function createCodexSecurityServer(): McpServer {
       const completingLocally = begun.run.status === "succeeded"
         && begun.run.finalizationInput
         && deepScanCoordinators.get(begun.run.scanId);
-      if (immediate && !completingLocally) return { begun, immediate, sdkOwned };
+      const recoverableSelection = begun.run.status === "succeeded"
+        && begun.run.finalizationInput && !sdkOwned;
+      if (immediate && !completingLocally && !recoverableSelection) return { begun, immediate, sdkOwned };
       const started = await startOrJoinDeepScanCoordinator({
         begin: begun,
         registry: deepScanCoordinators,
@@ -822,6 +824,11 @@ export function createCodexSecurityServer(): McpServer {
               ], undefined, false, false, signal);
             }
             catch (error) {
+              if (!signal.aborted) {
+                await deepScanStore.releaseCoordinator(run.scanId).catch((releaseError) => {
+                  logDeepScanEvent({ event: "coordinator_release_failed", scanId: run.scanId, reason: boundedErrorData(releaseError).message });
+                });
+              }
               throw new Error(deepScanInvocationFailureMessage(error), { cause: error });
             }
           },
@@ -840,8 +847,7 @@ export function createCodexSecurityServer(): McpServer {
       invocationFailure: toolErrorResult(deepScanInvocationFailureMessage(error))
     }));
     if ("invocationFailure" in preparation) return preparation.invocationFailure;
-    // A remote terminal result is aggregate readiness, not ownership of parent completion.
-    // Explicit completion can replay the selected result after an owner is lost.
+    // SDK completion belongs to the host; native selected results use the existing lease.
     if (preparation.immediate) return preparation.immediate;
     const { begun, coordinator, joined } = preparation;
     if (joined) {

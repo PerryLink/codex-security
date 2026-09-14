@@ -164,7 +164,7 @@ export class WorkbenchDeepScanStore implements DeepScanStore {
     ]));
     const generation = this.coordinatorLeases.get(scanId)?.run.coordinatorGeneration;
     if (
-      run.status !== "running"
+      (run.status !== "running" && !(run.status === "succeeded" && run.finalizationInput))
       || (generation !== undefined
         && run.coordinatorGeneration !== undefined
         && run.coordinatorGeneration > generation)
@@ -211,13 +211,27 @@ export class WorkbenchDeepScanStore implements DeepScanStore {
       throw new Error("Deep Scan coordinator lease belongs to another continuation.");
     }
     const updatedAt = new Date().toISOString();
-    await writeJsonAtomic(join(
-      lease.run.scanDir,
+    await this.writeCoordinatorHeartbeat(lease.run, updatedAt);
+    return { ...lease.run, updatedAt };
+  }
+
+  async releaseCoordinator(scanId: string): Promise<void> {
+    const lease = this.coordinatorLeases.get(scanId);
+    if (!lease) return;
+    this.coordinatorLeases.delete(scanId);
+    await this.writeCoordinatorHeartbeat(lease.run, new Date().toISOString(), true);
+  }
+
+  private writeCoordinatorHeartbeat(run: DeepScanRunState, updatedAt: string, released = false): Promise<void> {
+    // Serialize with pending heartbeats so a late write cannot renew a released lease.
+    const operation = this.writeTail.then(() => writeJsonAtomic(join(
+      run.scanDir,
       "artifacts",
       "deep_discovery",
-      `coordinator-heartbeat-${lease.run.coordinatorGeneration}.json`
-    ), { coordinatorGeneration: lease.run.coordinatorGeneration, updatedAt });
-    return { ...lease.run, updatedAt };
+      `coordinator-heartbeat-${run.coordinatorGeneration}.json`
+    ), { coordinatorGeneration: run.coordinatorGeneration, updatedAt, ...(released ? { released: true } : {}) }));
+    this.writeTail = operation.then(() => undefined, () => undefined);
+    return operation;
   }
 
   async cancel(scanId: string, threadId: string): Promise<JsonObject> {
