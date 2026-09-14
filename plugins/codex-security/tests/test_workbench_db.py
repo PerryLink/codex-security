@@ -454,7 +454,7 @@ def test_budget_exhaustion_preserves_unvalidated_discovery_as_deferred_work(
     assert "User input reaches a SQL statement" in coverage["deferred"][0]["reason"]
     assert coverage["surfaces"][0]["disposition"] == "needs_follow_up"
     report = (scan_dir / "report.md").read_text()
-    assert "No findings were validated before the scan reached its cost limit" in report
+    assert "No findings are included in this partial report" in report
     assert "User input reaches a SQL statement" in report
 
 
@@ -594,10 +594,7 @@ def test_budget_exhaustion_preserves_existing_deferred_work_with_one_trusted_mar
             "id": "scan-cost-limit",
             "reason": "Validation was deferred because the scan reached its cost limit.",
         }
-    assert (
-        "No findings were validated before the scan reached its cost limit"
-        in (scan_dir / "report.md").read_text()
-    )
+    assert "No findings are included in this partial report" in (scan_dir / "report.md").read_text()
 
 
 def test_budget_exhaustion_preserves_capped_discovery(tmp_path: Path) -> None:

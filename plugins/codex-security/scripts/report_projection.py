@@ -1029,8 +1029,8 @@ def build_report_markdown(
                         "No vulnerability conclusion can be drawn."
                         if no_source_review
                         else (
-                            "No findings were validated before the scan reached its cost limit. "
-                            "Review the deferred candidates in Open Questions And Follow Up."
+                            "No findings are included in this partial report. "
+                            "Review the unresolved work in Open Questions And Follow Up."
                             if budget_exhausted
                             else "No reportable findings survived the canonical discovery, validation, "
                             "and reportability gates."
