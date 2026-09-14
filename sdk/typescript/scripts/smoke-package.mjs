@@ -816,6 +816,60 @@ try {
     ],
     { cwd: consumer },
   );
+  run(
+    process.execPath,
+    [
+      "--input-type=module",
+      "-e",
+      `
+import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
+import { createInterface } from "node:readline";
+for (const mode of ["success", "cancel"]) {
+  const child = spawn(process.execPath, [process.argv[1], "dedupe", "--records"], {
+    stdio: ["pipe", "pipe", "pipe"]
+  });
+  const closed = new Promise((resolve, reject) => {
+    child.once("error", reject);
+    child.once("close", resolve);
+  });
+  const timeout = setTimeout(() => child.kill("SIGKILL"), 30_000);
+  let diagnostics = "", response;
+  child.stderr.setEncoding("utf8").on("data", value => diagnostics += value);
+  const send = message => child.stdin.write(JSON.stringify(message) + "\\n");
+  send({jsonrpc:"2.0", id:"init", method:"initialize", params:{protocolVersion:1}});
+  try {
+    for await (const line of createInterface({input:child.stdout})) {
+      const message = JSON.parse(line);
+      if (message.id === "init") {
+        assert.deepEqual(message.result, {protocolVersion:1});
+        send({jsonrpc:"2.0", id:"run", method:"run", params:{
+          observations:[], scopeKey:"synthetic-scope", sourceManifest:{}
+        }});
+      } else if (message.id === "run") {
+        response = message;
+      } else if (mode === "cancel") {
+        send({jsonrpc:"2.0", method:"cancel"});
+      } else {
+        assert.equal(message.method, "source.verify");
+        send({jsonrpc:"2.0", id:message.id, result:null});
+      }
+    }
+    // Keep host stdin open: the isolated attempt must stop its own input socket.
+    assert.equal(await closed, mode === "cancel" ? 130 : 0, diagnostics);
+    assert.ok(response);
+    if (mode === "cancel") assert.equal(response.error.code, -32800);
+    else assert.deepEqual(response.result.pairOutcomes, []);
+  } finally {
+    clearTimeout(timeout);
+    if (child.exitCode === null) child.kill("SIGKILL");
+  }
+}
+`,
+      launcher,
+    ],
+    { cwd: consumer },
+  );
   await smokeNestedDeepScanWorker(installedRoot, consumer);
 
   console.log(

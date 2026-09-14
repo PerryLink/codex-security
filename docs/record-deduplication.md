@@ -57,6 +57,9 @@ namespace, such as `mcp__review_validator`. It defaults to `review_validator`;
 `submit_decisions` and `submit_error` keep their fixed names. The SDK supplies the
 resolved namespace in each request and renders its instructions accordingly,
 without changing finding evidence. The host must register those exact tools.
+Source tools may share the result namespace, but cannot replace
+`submit_decisions` or `submit_error` in either the configured namespace or
+`review_validator`. Duplicate source namespace/name pairs are rejected.
 Changing the namespace invalidates checkpoint and prior-pair bindings. The CLI
 keeps its existing namespace and behavior.
 

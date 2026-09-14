@@ -1,7 +1,7 @@
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { createInterface } from "node:readline";
-import { PassThrough } from "node:stream";
+import { PassThrough, Writable } from "node:stream";
 import { expect, test } from "bun:test";
 import type { Finding, FindingsDocument } from "../src/models.js";
 import type { DeduplicationReviewRequest } from "../src/deduplication/records.js";
@@ -378,3 +378,91 @@ test("unsupported protocol version fails before callback dispatch", async () => 
     s.close();
   }
 });
+
+test("input stream errors fail the active run through readline", async () => {
+  const s = session();
+  try {
+    await s.initialize();
+    s.run();
+    expect((await s.next()).method).toBe("source.verify");
+    s.input.destroy(new Error("Synthetic input failure"));
+    expect(await s.done).toBe(2);
+    const response = await s.next();
+    expect(response.id).toBe("run");
+    expect(response.error).toBeDefined();
+    expect(response.result).toBeUndefined();
+  } finally {
+    s.close();
+  }
+});
+
+test.each(["success", "cancel"])(
+  "waits for the final %s write and handles asynchronous output failure",
+  async (mode) => {
+    const input = new PassThrough();
+    let releaseWrite: ((error?: Error | null) => void) | undefined;
+    let reached!: () => void;
+    const finalWrite = new Promise<void>((resolve) => {
+      reached = resolve;
+    });
+    const send = (message: unknown) =>
+      input.write(`${JSON.stringify(message)}\n`);
+    const output = new Writable({
+      write(chunk, _encoding, callback) {
+        if (chunk.length === 0) {
+          callback();
+          return;
+        }
+        const message = JSON.parse(chunk.toString()) as Message;
+        if (message.id === "run") {
+          if (mode === "success") expect(message.error).toBeUndefined();
+          else expect(message.error?.code).toBe(-32800);
+          releaseWrite = callback;
+          reached();
+          return;
+        }
+        callback();
+        if (message.id === "init") {
+          send({
+            jsonrpc: "2.0",
+            id: "run",
+            method: "run",
+            params: { ...params, observations: [] },
+          });
+        } else if (mode === "cancel") {
+          send({ jsonrpc: "2.0", method: "cancel" });
+        } else {
+          expect(message.method).toBe("source.verify");
+          send({ jsonrpc: "2.0", id: message.id, result: null });
+        }
+      },
+    });
+    let settled = false;
+    const done = runRecordDedupeProtocol(input, output, { write() {} }).then(
+      (code) => {
+        settled = true;
+        return code;
+      },
+    );
+    try {
+      send({
+        jsonrpc: "2.0",
+        id: "init",
+        method: "initialize",
+        params: { protocolVersion: 1 },
+      });
+      await finalWrite;
+      await Promise.resolve();
+      expect(settled).toBe(false);
+      const fail = releaseWrite!;
+      releaseWrite = undefined;
+      fail(new Error("Synthetic asynchronous EPIPE"));
+      expect(await done).toBe(2);
+      expect(output.listenerCount("error")).toBe(0);
+    } finally {
+      releaseWrite?.();
+      input.destroy();
+      output.destroy();
+    }
+  },
+);

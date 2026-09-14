@@ -695,23 +695,27 @@ test("invalid or colliding result namespaces fail before source access", async (
       "single identifier",
     );
   }
-  const input = options();
-  input.resultToolNamespace = "mcp__review_validator";
-  input.sourceTools = [
-    {
-      namespace: input.resultToolNamespace,
-      name: "read_source",
-      description: "Synthetic source operation",
-      inputSchema: { type: "object" },
-      version: "1",
-    },
-  ];
-  input.verifySource = async () => {
-    throw new Error("Source must not be accessed");
-  };
-  await expect(deduplicateRecords(input)).rejects.toThrow(
-    "reserved result namespaces",
-  );
+  for (const namespace of ["review_validator", "mcp__review_validator"]) {
+    for (const name of ["submit_decisions", "submit_error"]) {
+      const input = options();
+      input.resultToolNamespace = "mcp__review_validator";
+      input.sourceTools = [
+        {
+          namespace,
+          name,
+          description: "Synthetic source operation",
+          inputSchema: { type: "object" },
+          version: "1",
+        },
+      ];
+      input.verifySource = async () => {
+        throw new Error("Source must not be accessed");
+      };
+      await expect(deduplicateRecords(input)).rejects.toThrow(
+        "reserved result tools",
+      );
+    }
+  }
 });
 
 test.each([true, false])(
@@ -765,3 +769,34 @@ test.each([true, false])(
     ).toBe(true);
   },
 );
+
+test("source tools can share the result namespace with distinct names", async () => {
+  const input = options();
+  input.resultToolNamespace = "mcp__review_validator";
+  input.sourceTools = [
+    {
+      namespace: input.resultToolNamespace,
+      name: "read_source",
+      description: "Synthetic source operation",
+      inputSchema: { type: "object" },
+      version: "1",
+    },
+  ];
+  const namespaces: string[] = [];
+  input.reviewRunner = {
+    async run(request) {
+      expect(request.sourceTools).toEqual(input.sourceTools!);
+      namespaces.push(request.resultToolNamespace);
+      return submission(request);
+    },
+  };
+  const result = await deduplicateRecords(input);
+  expect(result.pairOutcomes[0]!.decision).toBe("SAME");
+  expect(namespaces.length).toBeGreaterThan(0);
+  expect(new Set(namespaces)).toEqual(new Set([input.resultToolNamespace]));
+  input.sourceTools = [...input.sourceTools, ...input.sourceTools];
+  input.verifySource = async () => {
+    throw new Error("Source must not be accessed");
+  };
+  await expect(deduplicateRecords(input)).rejects.toThrow("distinct names");
+});

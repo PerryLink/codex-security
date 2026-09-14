@@ -158,12 +158,13 @@ export async function deduplicateRecords(
   for (const tool of sourceTools) {
     const key = JSON.stringify([tool.namespace, tool.name]);
     if (
-      tool.namespace === DEFAULT_RESULT_TOOL_NAMESPACE ||
-      tool.namespace === resultToolNamespace ||
+      ((tool.namespace === DEFAULT_RESULT_TOOL_NAMESPACE ||
+        tool.namespace === resultToolNamespace) &&
+        (tool.name === "submit_decisions" || tool.name === "submit_error")) ||
       toolNames.has(key)
     )
       throw new CodexSecurityError(
-        "Source tools must have distinct names outside the reserved result namespaces.",
+        "Source tools must have distinct names and cannot replace reserved result tools.",
       );
     toolNames.add(key);
   }

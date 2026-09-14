@@ -65,7 +65,7 @@ const cancel = z.strictObject({
 
 type Id = z.infer<typeof rpcId>;
 type Output = {
-  write(text: string): unknown;
+  write(text: string, callback?: (error?: Error | null) => void): unknown;
   on?(event: "error", listener: () => void): unknown;
   removeListener?(event: "error", listener: () => void): unknown;
 };
@@ -87,6 +87,7 @@ export async function runRecordDedupeProtocol(
   let runId: Id | undefined;
   let initializeId: Id | undefined;
   let finished = false;
+  let outputFailed = false;
   let resolveExit!: (code: number) => void;
   const exit = new Promise<number>((resolve) => {
     resolveExit = resolve;
@@ -114,6 +115,7 @@ export async function runRecordDedupeProtocol(
           });
       }
     } catch {
+      outputFailed = true;
       // A closed output pipe cannot receive a final protocol error.
     } finally {
       if (error) {
@@ -126,14 +128,30 @@ export async function runRecordDedupeProtocol(
       lines.close();
       signal?.removeEventListener("abort", aborted);
       input.removeListener("error", inputError);
-      output.removeListener?.("error", outputError);
-      resolveExit(code);
+      const drained = () => {
+        output.removeListener?.("error", outputError);
+        resolveExit(outputFailed ? 2 : code);
+      };
+      if (output.on) {
+        try {
+          // Keep the error listener through queued writes and their error events.
+          output.write("", (error) => {
+            if (error) outputFailed = true;
+            // Writable error events can follow callbacks in the same turn.
+            setImmediate(drained);
+          });
+        } catch {
+          outputFailed = true;
+          setImmediate(drained);
+        }
+      } else drained();
     }
   }
   function aborted(): void {
     finish(130, new Error("Record deduplication canceled."), -32800);
   }
   function outputError(): void {
+    outputFailed = true;
     finish(2, new Error("Record protocol output failed."));
   }
   function inputError(): void {
@@ -271,6 +289,7 @@ export async function runRecordDedupeProtocol(
     if (!finished)
       finish(2, new Error("Record protocol input closed before completion."));
   });
+  lines.on("error", inputError);
   input.on("error", inputError);
   output.on?.("error", outputError);
   signal?.addEventListener("abort", aborted, { once: true });
@@ -304,5 +323,8 @@ export async function runRecordDedupeCli(
   } finally {
     process.removeListener("SIGINT", abort);
     process.removeListener("SIGTERM", abort);
+    // This one-attempt CLI owns stdin; a canceled readline callback can leave
+    // Node's input socket active even after the interface has closed.
+    process.stdin.destroy();
   }
 }

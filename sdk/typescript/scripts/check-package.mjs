@@ -226,6 +226,7 @@ const distFiles = new Set(
     "deduplication/checkpointed-review",
     "deduplication/review-checkpoint",
     "deduplication/records",
+    "deduplication/records-cli",
     "deduplication/retry",
     "deduplication/deduplication",
     "finding-retrieval",
