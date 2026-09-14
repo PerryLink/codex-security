@@ -546,6 +546,30 @@ def _ensure_finding_identity(finding: Any, *, candidate_only: bool = False) -> N
     finding["identity"] = {"anchor": anchor}
 
 
+def _ensure_finding_identities(findings: list[dict[str, Any]]) -> None:
+    def key(finding: dict[str, Any]) -> bytes:
+        identity = finding["identity"]
+        return _encoded(
+            [finding.get("ruleId"), identity.get("anchor"), identity.get("instance", "")]
+        )
+
+    # Reserve authored identities even when they follow a generated sibling.
+    reserved = {
+        key(finding)
+        for finding in findings
+        if isinstance(finding, dict) and isinstance(finding.get("identity"), dict)
+    }
+    for finding in findings:
+        if not isinstance(finding, dict) or "identity" in finding:
+            continue
+        _ensure_finding_identity(finding)
+        suffix = 2
+        while key(finding) in reserved:
+            finding["identity"]["instance"] = f"saved-{suffix}"
+            suffix += 1
+        reserved.add(key(finding))
+
+
 def _retained_findings(finding: dict[str, Any]) -> Iterator[dict[str, Any]]:
     """Yield canonical and historical findings without trusting candidate IDs."""
     pending = [finding]
@@ -1314,8 +1338,7 @@ def budget_exhausted_draft(
         findings = {
             "findings": copy.deepcopy(accepted_result["findings"]) if accepted_result else []
         }
-        for finding in findings["findings"]:
-            _ensure_finding_identity(finding)
+        _ensure_finding_identities(findings["findings"])
         if accepted_result is not None:
             coverage = accepted_result["sourceCoverage"]
             if "threatModel" in accepted_result:
