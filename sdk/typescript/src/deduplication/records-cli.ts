@@ -97,6 +97,7 @@ export async function runRecordDedupeProtocol(
   let checkpoints = false;
   let runId: Id | undefined;
   let initializeId: Id | undefined;
+  let requestId: Id | null = null;
   let finished = false;
   let outputFailed = false;
   let resolveExit!: (code: number) => void;
@@ -118,12 +119,11 @@ export async function runRecordDedupeProtocol(
     pending.clear();
     try {
       if (error) {
-        if (runId !== undefined)
-          send({
-            jsonrpc: "2.0",
-            id: runId,
-            error: { code: rpcCode, message: error.message },
-          });
+        send({
+          jsonrpc: "2.0",
+          id: runId ?? requestId,
+          error: { code: rpcCode, message: error.message },
+        });
       }
     } catch {
       outputFailed = true;
@@ -180,7 +180,17 @@ export async function runRecordDedupeProtocol(
   }
   function handle(line: string): void {
     if (finished) return;
+    requestId = null;
     const value: unknown = JSON.parse(line);
+    if (
+      typeof value === "object" &&
+      value !== null &&
+      "method" in value &&
+      "id" in value
+    ) {
+      const parsedId = rpcId.safeParse(value.id);
+      if (parsedId.success) requestId = parsedId.data;
+    }
     if (cancel.safeParse(value).success) {
       if (runId === undefined)
         throw new Error("Cancel requires an active run.");
@@ -214,6 +224,7 @@ export async function runRecordDedupeProtocol(
       initializeId = message.id;
       checkpoints = params.checkpoints;
       send({ jsonrpc: "2.0", id: message.id, result: { protocolVersion: 1 } });
+      requestId = null;
       return;
     }
     if (

@@ -189,6 +189,10 @@ On failure, return an error instead of a substitute verdict:
 
 The host registers and executes the request's source and result tools, enforces
 access to the approved repositories, and owns model execution and durable state.
+Before a run is accepted, a rejected request receives an error with its own ID;
+unidentifiable input uses `null`. Once accepted, the run ID identifies its terminal
+response. An acknowledged initialization ID is not reused for later input errors.
+
 Protocol execution does not write diagnostics to stderr. Use the structured
 stdout error and process exit status; an unread stderr pipe cannot block the
 attempt. Static command-usage errors may still use stderr.

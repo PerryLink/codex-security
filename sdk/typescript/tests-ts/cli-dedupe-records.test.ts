@@ -35,7 +35,7 @@ const params = {
 };
 type Message = {
   jsonrpc: "2.0";
-  id: string | number;
+  id: string | number | null;
   method?: string;
   params: Record<string, unknown>;
   result?: unknown;
@@ -359,6 +359,10 @@ test("unsupported protocol version fails before callback dispatch", async () => 
       params: { protocolVersion: 2 },
     });
     expect(await s.done).toBe(2);
+    const error = await s.next();
+    expect(error.id).toBe("init");
+    expect(error.error?.code).toBe(-32600);
+    expect(error.result).toBeUndefined();
   } finally {
     s.close();
   }
@@ -482,3 +486,21 @@ test("invalid command diagnostics handle asynchronous output failure", async () 
     diagnostics.destroy();
   }
 });
+
+test.each([false, true])(
+  "unidentifiable input errors use null without repeating initialize (initialized=%s)",
+  async (initialized) => {
+    const s = session();
+    try {
+      if (initialized) await s.initialize();
+      s.input.write("{malformed-json\n");
+      expect(await s.done).toBe(2);
+      const error = await s.next();
+      expect(error.id).toBeNull();
+      expect(error.error?.code).toBe(-32600);
+      expect(error.result).toBeUndefined();
+    } finally {
+      s.close();
+    }
+  },
+);

@@ -825,7 +825,7 @@ try {
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { createInterface } from "node:readline";
-for (const mode of ["success", "cancel", "blocked-diagnostics"]) {
+for (const mode of ["success", "cancel", "blocked-diagnostics", "invalid-initialize"]) {
   const child = spawn(process.execPath, [process.argv[1], "dedupe", "--records"], {
     stdio: ["pipe", "pipe", "pipe"]
   });
@@ -839,11 +839,12 @@ for (const mode of ["success", "cancel", "blocked-diagnostics"]) {
     child.stderr.setEncoding("utf8").on("data", value => diagnostics += value);
   }
   const send = message => child.stdin.write(JSON.stringify(message) + "\\n");
-  send({jsonrpc:"2.0", id:"init", method:"initialize", params:{protocolVersion:1}});
+  send({jsonrpc:"2.0", id:"init", method:"initialize", params:{protocolVersion:mode === "invalid-initialize" ? 2 : 1}});
   try {
     for await (const line of createInterface({input:child.stdout})) {
       const message = JSON.parse(line);
       if (message.id === "init") {
+        if (mode === "invalid-initialize") { response = message; continue; }
         assert.deepEqual(message.result, {protocolVersion:1});
         send({jsonrpc:"2.0", id:"run", method:"run", params:{
           observations:[], scopeKey:"synthetic-scope", sourceManifest:{}
@@ -861,10 +862,13 @@ for (const mode of ["success", "cancel", "blocked-diagnostics"]) {
       }
     }
     // Keep host stdin open: the isolated attempt must stop its own input socket.
-    const expectedExit = mode === "cancel" ? 130 : mode === "blocked-diagnostics" ? 2 : 0;
+    const expectedExit = mode === "success" ? 0 : mode === "cancel" ? 130 : 2;
     assert.equal(await closed, expectedExit, diagnostics);
     assert.ok(response);
-    if (mode === "cancel") assert.equal(response.error.code, -32800);
+    if (mode === "invalid-initialize") {
+      assert.equal(response.id, "init");
+      assert.equal(response.error.code, -32600);
+    } else if (mode === "cancel") assert.equal(response.error.code, -32800);
     else if (mode === "blocked-diagnostics") assert.equal(response.error.code, -32000);
     else assert.deepEqual(response.result.pairOutcomes, []);
   } finally {
