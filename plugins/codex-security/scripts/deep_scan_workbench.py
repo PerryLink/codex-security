@@ -1225,7 +1225,9 @@ def claim_deep_scan_coordinator_locked(
         if not selected_parent:
             run, _ = require_running_deep_scan(connection, scan_id)
         elif (
-            run["cancel_requested"] or scan["status"] != "running" or scan["canceled_at"] is not None
+            run["cancel_requested"]
+            or scan["status"] != "running"
+            or scan["canceled_at"] is not None
         ):
             raise SystemExit("Only a running scan can complete its selected Deep Scan result.")
         timestamp = now()
