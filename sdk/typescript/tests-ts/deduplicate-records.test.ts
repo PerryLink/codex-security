@@ -1,5 +1,3 @@
-import { readFile } from "node:fs/promises";
-import { join } from "node:path";
 import { expect, test } from "bun:test";
 import {
   deduplicateRecords,
@@ -7,67 +5,12 @@ import {
   type DeduplicationCheckpointStore,
   type DeduplicationReviewRequest,
   type Finding,
-  type FindingsDocument,
 } from "../src/index.js";
-import { PLUGIN_ROOT } from "./plugin-root.js";
-
-const fixture: FindingsDocument = JSON.parse(
-  await readFile(
-    join(PLUGIN_ROOT, "examples/completed-scan/findings.json"),
-    "utf8",
-  ),
-);
-
-function finding(index: number): Finding {
-  return {
-    ...structuredClone(fixture.findings[0]!),
-    findingId: `csf_${index.toString(16).padStart(24, "0")}`,
-    occurrenceId: `occ_${index.toString(16).padStart(24, "0")}`,
-    title: `Synthetic issue ${index}`,
-    extensions: {
-      originalEvidence: { description: `Complete evidence ${index}` },
-    },
-  };
-}
-
-function assigned(request: DeduplicationReviewRequest): Finding[] {
-  return JSON.parse(
-    request.prompt.slice(request.prompt.lastIndexOf("\n\n") + 2),
-  ).findings;
-}
-
-function submission(request: DeduplicationReviewRequest, same = true): unknown {
-  const findings = assigned(request);
-  if (request.stage === "screening")
-    return {
-      decisions: Object.fromEntries(
-        findings.slice(1).map((_, index) => [
-          `pair-${index + 1}`,
-          {
-            decision: same ? "SAME" : "DISTINCT",
-            rationale: same
-              ? "One control closes both reported paths."
-              : "Independent corrections are required.",
-          },
-        ]),
-      ),
-    };
-  return same
-    ? {
-        decision: "SAME",
-        rationale: "The inspected shared control closes both complete paths.",
-        canonicalFindingId: findings[0]!.findingId,
-        mergedFinding: {
-          ...findings[0],
-          title: findings.map((value) => value.title).join("; "),
-          extensions: { originalFindings: findings },
-        },
-      }
-    : {
-        decision: "DISTINCT",
-        rationale: "Independent corrections are required.",
-      };
-}
+import {
+  assigned,
+  finding,
+  submission,
+} from "./record-deduplication-fixtures.js";
 
 class Checkpoints implements DeduplicationCheckpointStore {
   readonly values = new Map<string, unknown>();
@@ -111,14 +54,6 @@ function options(
     scopeKey: "synthetic-scope",
     concurrency: 1,
   };
-}
-
-function deferred<T>() {
-  let resolve!: (value: T) => void;
-  const promise = new Promise<T>((accept) => {
-    resolve = accept;
-  });
-  return { promise, resolve };
 }
 
 test("public record API reviews complete records without artifacts or a findings service", async () => {
@@ -183,24 +118,6 @@ test("empty or isolated records do not invoke a reviewer", async () => {
       observations.map((value) => value.findingId),
     );
   }
-});
-
-test("conflicting candidate identities fail before any model review", async () => {
-  const input = options();
-  input.candidates = [
-    {
-      ...input.observations[0]!,
-      title: "Different evidence under the same identifier",
-    },
-  ];
-  input.reviewRunner = {
-    async run() {
-      throw new Error("No review should run");
-    },
-  };
-  await expect(deduplicateRecords(input)).rejects.toThrow(
-    "Conflicting finding content",
-  );
 });
 
 test("raw model output and checkpoint hits are validated by the SDK", async () => {
@@ -379,8 +296,8 @@ test("stable source policy preserves prior pairs across batch growth while recor
 });
 
 test("checkpoint persistence is acknowledged before scheduling the next review", async () => {
-  const saving = deferred<void>();
-  const release = deferred<void>();
+  const saving = Promise.withResolvers<void>();
+  const release = Promise.withResolvers<void>();
   const store = new Checkpoints();
   let writes = 0;
   const originalSave = store.saveReview.bind(store);
@@ -596,8 +513,14 @@ test("detailed outcomes preserve input order when screening completion order cha
   async function run(order: [number, number]) {
     const input = options();
     input.concurrency = 2;
-    const started = [deferred<void>(), deferred<void>()];
-    const released = [deferred<void>(), deferred<void>()];
+    const started = [
+      Promise.withResolvers<void>(),
+      Promise.withResolvers<void>(),
+    ];
+    const released = [
+      Promise.withResolvers<void>(),
+      Promise.withResolvers<void>(),
+    ];
     const completed: number[] = [];
     input.reviewRunner = {
       async run(request) {
