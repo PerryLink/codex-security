@@ -119,6 +119,7 @@ const outcomes = [
   "failed",
   "completed",
   "completed-owner-suffix",
+  "completed-owner-explicit",
   "restart",
   "canceled-before-publication",
   "canceled-during-publication",
@@ -241,7 +242,9 @@ for (const {
     let budgetTriggered = false;
     let cancellationReadLost = false;
     let lostCancellationDeepState: unknown;
-    const ownerSuffix = outcome === "completed-owner-suffix";
+    const ownerSuffix =
+      outcome === "completed-owner-suffix" ||
+      outcome === "completed-owner-explicit";
     let nativeOwnerStatus: unknown;
     let originalFinalizationInput: unknown;
     let selectedPath = "";
@@ -618,7 +621,11 @@ for (const {
                         runWorkbench(workbenchOptions, args),
                       signal: cancellation.signal,
                     });
-                    await rejoinSelectedScanThroughMcp(environment, scanId);
+                    await rejoinSelectedScanThroughMcp(
+                      environment,
+                      scanId,
+                      outcome === "completed-owner-explicit",
+                    );
                     const saved = await runWorkbench(workbenchOptions, [
                       "get-scan",
                       "--scan-id",
@@ -1028,6 +1035,7 @@ for (const {
 async function rejoinSelectedScanThroughMcp(
   environment: NodeJS.ProcessEnv,
   scanId: string,
+  explicitCompletion = false,
 ): Promise<void> {
   const child = spawn(
     process.execPath,
@@ -1075,7 +1083,9 @@ async function rejoinSelectedScanThroughMcp(
                 id: 2,
                 method: "tools/call",
                 params: {
-                  name: "start_codex_security_deep_scan",
+                  name: explicitCompletion
+                    ? "complete_codex_security_scan"
+                    : "start_codex_security_deep_scan",
                   arguments: { scanId },
                   _meta: {
                     "openai/threadId": threadId,
@@ -1106,9 +1116,10 @@ async function rejoinSelectedScanThroughMcp(
           if (response.id === 2) {
             expect(response.error).toBeUndefined();
             expect(response.result?.isError).toBeUndefined();
-            expect(
-              response.result?.structuredContent?.manifestPath,
-            ).toBeDefined();
+            if (!explicitCompletion)
+              expect(
+                response.result?.structuredContent?.manifestPath,
+              ).toBeDefined();
             resolve();
           }
         } catch (error) {
