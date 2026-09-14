@@ -2459,7 +2459,3 @@ paths. See the security policy below for the full threat model.
   feature requests
 - [Security policy](https://github.com/openai/codex-security/blob/main/SECURITY.md)
   for private vulnerability reporting and safe operation
-
-For host-owned candidate lookup, source access, model execution and checkpoints,
-`codex-security dedupe --records` exposes the record SDK through a bidirectional
-JSON-RPC stream. See [the record integration protocol](../../docs/record-deduplication.md#headless-cli-protocol).
