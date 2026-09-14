@@ -908,9 +908,7 @@ describe("deep scan workbench ownership", () => {
         ]),
       );
       const report = await readFile(join(scanDir, "report.md"), "utf8");
-      expect(report).toContain(
-        "No findings were validated before the scan reached its cost limit.",
-      );
+      expect(report).toContain("partial report");
       if (existingDeferred) {
         expect(report).toContain(
           "Existing candidate validation dependency was unavailable.",
@@ -965,7 +963,7 @@ describe("deep scan workbench ownership", () => {
       false,
     ],
   ] as const)(
-    "only describes an exhausted scan cost limit for %s",
+    "uses the partial-report summary for an exhausted scan cost limit: %s",
     (_description, reason, exhausted) => {
       const python = Bun.which("python3") ?? Bun.which("python");
       expect(python).not.toBeNull();
@@ -987,11 +985,7 @@ describe("deep scan workbench ownership", () => {
       );
       expect(result.exitCode, new TextDecoder().decode(result.stderr)).toBe(0);
       const report = new TextDecoder().decode(result.stdout);
-      expect(
-        report.includes(
-          "No findings were validated before the scan reached its cost limit.",
-        ),
-      ).toBe(exhausted);
+      expect(report.includes("partial report")).toBe(exhausted);
       expect(
         report.includes(
           "No reportable findings survived the canonical discovery, validation, and reportability gates.",
