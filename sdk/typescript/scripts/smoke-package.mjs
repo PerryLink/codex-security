@@ -847,7 +847,8 @@ for (const mode of ["success", "cancel", "blocked-diagnostics", "invalid-initial
         if (mode === "invalid-initialize") { response = message; continue; }
         assert.deepEqual(message.result, {protocolVersion:1});
         send({jsonrpc:"2.0", id:"run", method:"run", params:{
-          observations:[], scopeKey:"synthetic-scope", sourceManifest:{}
+          observations:[], candidates:[], candidateRelationships:[],
+          scopeKey:"synthetic-scope", sourceManifest:{}
         }});
       } else if (message.id === "run") {
         response = message;
