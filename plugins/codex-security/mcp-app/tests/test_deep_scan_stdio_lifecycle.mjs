@@ -259,6 +259,9 @@ async function testDeepScanDetachedCompletion(mode) {
       assert.equal(rejoined.result.structuredContent.manifestPath, path.join(finished.scanDir, "scan-manifest.json"));
       if (mode === "lost-response") {
         assert.deepEqual(await readFile(path.join(finished.scanDir, "scan-manifest.json")), manifestBeforeReplay);
+        const afterReplay = await runWorkbench(environment, ["get-scan", "--scan-id", scanId]);
+        assert.equal(afterReplay.scan.progress.status, "complete");
+        assert.equal(afterReplay.scan.executionAttribution.completedAt, beforeReplay.scan.executionAttribution.completedAt);
       }
       assert.deepEqual((await getDeepScan({ environment, scanId, threadId })).finalizationInput, finished.finalizationInput);
     }
@@ -275,7 +278,7 @@ async function testDeepScanDetachedCompletion(mode) {
     assert.deepEqual(publicScan.scan.executionAttribution.owner, originalPublicScan.scan.executionAttribution.owner);
     assert.equal(publicScan.scan.executionAttribution.owner.threadId, threadId);
     assert.equal((await readJsonLines(startLogPath)).length, 3, "completion and replay launch no extra model workers");
-    assert.equal((await readJsonLines(finalizerLogPath)).length, mode === "failure" || mode === "active-failure" || mode === "remote-replay" || mode === "lost-response" ? 2 : 1);
+    assert.equal((await readJsonLines(finalizerLogPath)).length, mode === "failure" || mode === "active-failure" || mode === "remote-replay" ? 2 : 1);
     assertProcessAlive(mode === "remote-replay" ? remote.pid : server.pid);
     console.log("native selected completion passed", mode, scanId);
   } catch (error) {
