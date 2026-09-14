@@ -727,14 +727,6 @@ export function createCodexSecurityServer(): McpServer {
     } catch (error: unknown) {
       return toolErrorResult(deepScanInvocationFailureMessage(error));
     }
-    const completeSelectedParent = async (run: DeepScanRunState) => {
-      if (run.finalizationInput && run.status === "succeeded") {
-        await runWorkbench([
-          "complete-scan", "--scan-id", run.scanId, "--thread-id", threadId,
-          ...optionalArg("--claim-token", handoffClaimToken),
-        ]);
-      }
-    };
     const preparation = await deepScanStartLock.run(async () => {
       // A joining observer does not need a usable current home. A new run,
       // however, must save its original settings before creation can commit.
@@ -758,11 +750,14 @@ export function createCodexSecurityServer(): McpServer {
           threadId
         });
       }
-      const immediate = deepScanTerminalResult(begun.run);
+      // Recipes identify SDK executions, including runs predating usageOwner.
+      const sdkOwned = begun.run.usageOwner?.dedicated
+        ?? ((await runWorkbench(["get-scan", "--scan-id", begun.run.scanId])).recipe != null);
+      const immediate = deepScanTerminalResult(begun.run, sdkOwned);
       const completingLocally = begun.run.status === "succeeded"
         && begun.run.finalizationInput
         && deepScanCoordinators.get(begun.run.scanId);
-      if (immediate && !completingLocally) return { begun, immediate };
+      if (immediate && !completingLocally) return { begun, immediate, sdkOwned };
       const started = await startOrJoinDeepScanCoordinator({
         begin: begun,
         registry: deepScanCoordinators,
@@ -817,8 +812,15 @@ export function createCodexSecurityServer(): McpServer {
               ...(handoffClaimToken === undefined ? {} : { handoffClaimToken })
             }, runWorkbench, signal, publication);
           },
-          onFinalized: async (run) => {
-            try { await completeSelectedParent(run); }
+          onFinalized: async (run, signal) => {
+            // The SDK stops its usage tracker and enforces the budget after this turn.
+            if (sdkOwned) return;
+            try {
+              await runWorkbench([
+                "complete-scan", "--scan-id", run.scanId, "--thread-id", threadId,
+                ...optionalArg("--claim-token", handoffClaimToken),
+              ], undefined, false, false, signal);
+            }
             catch (error) {
               throw new Error(deepScanInvocationFailureMessage(error), { cause: error });
             }
@@ -833,22 +835,20 @@ export function createCodexSecurityServer(): McpServer {
           }
         }
       });
-      return { begun, ...started };
+      return { begun, sdkOwned, ...started };
     }).catch((error: unknown) => ({
       invocationFailure: toolErrorResult(deepScanInvocationFailureMessage(error))
     }));
     if ("invocationFailure" in preparation) return preparation.invocationFailure;
-    if (preparation.immediate) {
-      try { await completeSelectedParent(preparation.begun.run); }
-      catch (error) { return toolErrorResult(deepScanInvocationFailureMessage(error)); }
-      return preparation.immediate;
-    }
+    // A remote terminal result is aggregate readiness, not ownership of parent completion.
+    // Explicit completion can replay the selected result after an owner is lost.
+    if (preparation.immediate) return preparation.immediate;
     const { begun, coordinator, joined } = preparation;
     if (joined) {
       logDeepScanEvent({ event: "coordinator_joined", scanId: begun.run.scanId });
     }
     const terminal = await coordinator.wait(abortSignalFromExtra(extra));
-    const result = deepScanTerminalResult(terminal);
+    const result = deepScanTerminalResult(terminal, preparation.sdkOwned);
     if (!result) {
       return toolErrorResult(deepScanInvocationFailureMessage(
         new Error(`Deep Scan ${terminal.scanId} ended without a terminal result.`)
@@ -1639,13 +1639,15 @@ function boundedErrorData(error: unknown): { message: string; name: string } {
   };
 }
 
-function deepScanTerminalResult(run: DeepScanRunState) {
+function deepScanTerminalResult(run: DeepScanRunState, sdkOwned = false) {
   if (run.status === "succeeded") {
     if (!run.manifestPath) return undefined;
     return {
       content: [{
         type: "text" as const,
-        text: `Deep Scan discovery completed. Independent Standard scans have already performed validation and attack-path analysis and have been consolidated into the canonical scan-manifest.json, findings.json, and coverage.json under ${run.scanDir}. The returned manifestPath is the canonical scan-manifest.json, not a legacy discovery manifest. Any instructions requiring parent candidate listing, centralized validation, attack-path analysis, or another draft apply only to the old discovery-only workflow and must be skipped. The authoritative scan ID is ${run.scanId}. Immediately call complete_codex_security_scan once using that scan ID to seal and publish the scan. Return output only after completion succeeds and generated report.md exists. If completion fails, surface that exact error and return no final, no-findings, structured, or benchmark response.`
+        text: `Deep Scan discovery completed. Independent Standard scans have already performed validation and attack-path analysis and have been consolidated into the canonical scan-manifest.json, findings.json, and coverage.json under ${run.scanDir}. The returned manifestPath is the canonical scan-manifest.json, not a legacy discovery manifest. Any instructions requiring parent candidate listing, centralized validation, attack-path analysis, or another draft apply only to the old discovery-only workflow and must be skipped. The authoritative scan ID is ${run.scanId}. ${sdkOwned
+          ? "Leave the canonical artifacts unchanged and end this scan turn without calling a completion tool. The SDK will account for the completed turn, enforce its budget, and seal and publish the scan."
+          : "Immediately call complete_codex_security_scan once using that scan ID to seal and publish the scan. Return output only after completion succeeds and generated report.md exists. If completion fails, surface that exact error and return no final, no-findings, structured, or benchmark response."}`
       }],
       structuredContent: { manifestPath: run.manifestPath }
     };
@@ -1685,11 +1687,12 @@ async function runWorkbench(
   input?: string | Buffer,
   selectFinalization = false,
   withExecutionSettings = false,
+  signal?: AbortSignal,
 ): Promise<JsonObject> {
   let pythonCommand: string | undefined;
   try {
     pythonCommand = await resolvePythonCommand();
-    return await executeWorkbenchWithStateSelection(pythonCommand, args, input, selectFinalization, withExecutionSettings);
+    return await executeWorkbenchWithStateSelection(pythonCommand, args, input, selectFinalization, withExecutionSettings, signal);
   } catch (error) {
     const launchError = pythonCommand
       ? missingPythonHelperMessage(error, pythonCommand)
@@ -1710,35 +1713,36 @@ async function executeWorkbenchWithStateSelection(
   input?: string | Buffer,
   selectFinalization = false,
   withExecutionSettings = false,
+  signal?: AbortSignal,
 ): Promise<JsonObject> {
   if (WORKBENCH_COMMANDS_WITHOUT_DATABASE.has(args[0] ?? "")) {
-    return await executeWorkbench(pythonCommand, args, undefined, input, selectFinalization, withExecutionSettings);
+    return await executeWorkbench(pythonCommand, args, undefined, input, selectFinalization, withExecutionSettings, signal);
   }
   if (CONFIGURED_WORKBENCH_STATE_DIR) {
-    return await executeWorkbench(pythonCommand, args, undefined, input, selectFinalization, withExecutionSettings);
+    return await executeWorkbench(pythonCommand, args, undefined, input, selectFinalization, withExecutionSettings, signal);
   }
   if (fallbackWorkbenchStateDir) {
-    return await executeWorkbench(pythonCommand, args, await fallbackWorkbenchStateDir, input, selectFinalization, withExecutionSettings);
+    return await executeWorkbench(pythonCommand, args, await fallbackWorkbenchStateDir, input, selectFinalization, withExecutionSettings, signal);
   }
   if (persistentWorkbenchStateSucceeded) {
-    return await executeWorkbench(pythonCommand, args, undefined, input, selectFinalization, withExecutionSettings);
+    return await executeWorkbench(pythonCommand, args, undefined, input, selectFinalization, withExecutionSettings, signal);
   }
   return await withWorkbenchStateSelectionLock(async () => {
     if (fallbackWorkbenchStateDir) {
-      return await executeWorkbench(pythonCommand, args, await fallbackWorkbenchStateDir, input, selectFinalization, withExecutionSettings);
+      return await executeWorkbench(pythonCommand, args, await fallbackWorkbenchStateDir, input, selectFinalization, withExecutionSettings, signal);
     }
     if (persistentWorkbenchStateSucceeded) {
-      return await executeWorkbench(pythonCommand, args, undefined, input, selectFinalization, withExecutionSettings);
+      return await executeWorkbench(pythonCommand, args, undefined, input, selectFinalization, withExecutionSettings, signal);
     }
     try {
-      const result = await executeWorkbench(pythonCommand, args, undefined, input, selectFinalization, withExecutionSettings);
+      const result = await executeWorkbench(pythonCommand, args, undefined, input, selectFinalization, withExecutionSettings, signal);
       persistentWorkbenchStateSucceeded = true;
       return result;
     } catch (error) {
       if (!isUnwritableSqliteOpenError(error)) throw error;
       const fallbackStateDir = await pinFallbackWorkbenchStateDir();
       logWorkbenchStateFallback();
-      return await executeWorkbench(pythonCommand, args, fallbackStateDir, input, selectFinalization, withExecutionSettings);
+      return await executeWorkbench(pythonCommand, args, fallbackStateDir, input, selectFinalization, withExecutionSettings, signal);
     }
   });
 }
@@ -1764,6 +1768,7 @@ async function executeWorkbench(
   input?: string | Buffer,
   selectFinalization = false,
   withExecutionSettings = false,
+  signal?: AbortSignal,
 ): Promise<JsonObject> {
   const userContextIndex = args.indexOf("--user-context");
   const userContext = userContextIndex === -1 ? undefined : args[userContextIndex + 1];
@@ -1778,6 +1783,7 @@ async function executeWorkbench(
     ? ["-c", `import runpy, sys; script = sys.argv.pop(1); runpy.run_path(script)['main'](${internalInvocation})`, workbenchScriptPath(), ...workbenchArgs]
     : [workbenchScriptPath(), ...workbenchArgs];
   const execution = execFileAsync(pythonCommand, pythonArgs, {
+    signal,
     cwd: PLUGIN_ROOT,
     env: stateDir
       ? { ...process.env, CODEX_SECURITY_STATE_DIR: stateDir }

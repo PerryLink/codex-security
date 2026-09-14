@@ -70,7 +70,7 @@ export interface CoordinatorOptions {
   observeReplacement?: (run: DeepScanRunState) => Promise<DeepScanRunState>;
   onComplete?: (draft: ScanDraftInput, signal: AbortSignal, publication: DeepScanPublication) => Promise<void>;
   /** Complete the enclosing scan after selected publication, before local waiters settle. */
-  onFinalized?: (run: DeepScanRunState) => Promise<void>;
+  onFinalized?: (run: DeepScanRunState, signal: AbortSignal) => Promise<void>;
   onStopped?: (run: DeepScanRunState) => Promise<void>;
 }
 
@@ -439,7 +439,7 @@ export class DeepScanCoordinator {
       finish: (input) => this.options.store.finish(input),
     });
     if (this.canceled || this.externallyFailed) return;
-    await this.options.onFinalized?.(cloneState(this.state));
+    await this.options.onFinalized?.(cloneState(this.state), this.publicationAbortController.signal);
     if (this.canceled || this.externallyFailed) return;
     this.finishLocally(this.state);
   }

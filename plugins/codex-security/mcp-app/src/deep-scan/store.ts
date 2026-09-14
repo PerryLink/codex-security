@@ -672,7 +672,8 @@ function parseUsageOwner(value: unknown): DeepScanRunState["usageOwner"] {
   return {
     threadId: optionalString(owner.threadId) ?? null,
     turnId: optionalString(owner.turnId) ?? null,
-    startedAt: requiredString(owner.startedAt, "deepScan.usageOwner.startedAt")
+    startedAt: requiredString(owner.startedAt, "deepScan.usageOwner.startedAt"),
+    ...(typeof owner.dedicated === "boolean" ? { dedicated: owner.dedicated } : {})
   };
 }
 

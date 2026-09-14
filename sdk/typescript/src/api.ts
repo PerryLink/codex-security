@@ -4178,7 +4178,7 @@ function scanPrompt(
     "Run this Codex Security scan non-interactively.",
     ...(mode === "deep"
       ? [
-          `The SDK has already registered this scan. Call start_codex_security_deep_scan with ${JSON.stringify({ scanId })}; never pass targetPath or create another scan.`,
+          `The SDK has already registered this scan. Call start_codex_security_deep_scan with ${JSON.stringify({ scanId })}; never pass targetPath or create another scan. Leave finalization to the SDK after this turn; do not call a completion tool.`,
         ]
       : skillName === "security-scan" || customValidation
         ? [
@@ -4238,7 +4238,7 @@ function scanPrompt(
         ]
       : skillName === "deep-security-scan"
         ? [
-            "The Deep Scan coordinator already wrote the canonical scan artifacts. Call complete_codex_security_scan exactly once without submitting another semantic draft; the workbench owns authoritative metadata, finalization, report generation, and sealing.",
+            "The Deep Scan coordinator already wrote the canonical scan artifacts. Leave them unchanged and end the scan turn without calling a completion tool; the SDK accounts for the completed turn, enforces its budget, and owns finalization, report generation, and sealing.",
           ]
         : [
             "Use record_codex_security_scan_draft and complete_codex_security_scan as directed by the selected skill; the workbench owns authoritative metadata, finalization, report generation, and sealing.",

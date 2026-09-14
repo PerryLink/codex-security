@@ -34,7 +34,12 @@ export interface ScanExecutionAttribution {
   formatVersion: 1;
   legacy?: true;
   executionThreadIds: string[];
-  owner: { threadId: string | null; turnId: string | null; startedAt: string };
+  owner: {
+    threadId: string | null;
+    turnId: string | null;
+    startedAt: string;
+    dedicated?: boolean;
+  };
   startedAt: string;
   completedAt: string | null;
 }
