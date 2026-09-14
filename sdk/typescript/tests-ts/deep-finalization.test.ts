@@ -1,7 +1,7 @@
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { appendFile, mkdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { afterEach, expect, test } from "bun:test";
 import type { ThreadEvent } from "@openai/codex-sdk";
 import {
@@ -13,6 +13,7 @@ import {
   runWorkbench,
   type WorkbenchCommandOptions,
 } from "../src/runtime.js";
+import { resumeSelectedDeepScan } from "../src/deep-scan-finalization.js";
 import { TestClient } from "./support/api-client.js";
 import {
   completedEvents,
@@ -117,6 +118,7 @@ for (const boundary of ["registration", "stream-start"] as const) {
 const outcomes = [
   "failed",
   "completed",
+  "completed-owner-suffix",
   "restart",
   "canceled-before-publication",
   "canceled-during-publication",
@@ -239,6 +241,8 @@ for (const {
     let budgetTriggered = false;
     let cancellationReadLost = false;
     let lostCancellationDeepState: unknown;
+    const ownerSuffix = outcome === "completed-owner-suffix";
+    let nativeOwnerStatus: unknown;
     let originalFinalizationInput: unknown;
     let selectedPath = "";
     let selectedBytes: Buffer<ArrayBuffer>;
@@ -256,11 +260,15 @@ for (const {
       "01",
       `rollout-${threadId}.jsonl`,
     );
-    const recordBudgetUsage = () =>
+    const recordBudgetUsage = (
+      inputTokens = 1_250,
+      outputTokens = 30,
+      timestamp = new Date().toISOString(),
+    ) =>
       appendFile(
         usagePath,
         JSON.stringify({
-          timestamp: new Date().toISOString(),
+          timestamp,
           type: "turn_context",
           payload: {
             turn_id: "synthetic-scan-turn",
@@ -269,15 +277,15 @@ for (const {
         }) +
           "\n" +
           JSON.stringify({
-            timestamp: new Date().toISOString(),
+            timestamp,
             type: "event_msg",
             payload: {
               type: "token_count",
               info: {
                 total_token_usage: {
-                  input_tokens: 1_250,
+                  input_tokens: inputTokens,
                   cached_input_tokens: 200,
-                  output_tokens: 30,
+                  output_tokens: outputTokens,
                 },
               },
             },
@@ -286,7 +294,7 @@ for (const {
           (unpricedUsage
             ? [
                 JSON.stringify({
-                  timestamp: new Date().toISOString(),
+                  timestamp,
                   type: "turn_context",
                   payload: {
                     turn_id: "synthetic-scan-turn",
@@ -294,7 +302,7 @@ for (const {
                   },
                 }),
                 JSON.stringify({
-                  timestamp: new Date().toISOString(),
+                  timestamp,
                   type: "event_msg",
                   payload: {
                     type: "token_count",
@@ -302,7 +310,7 @@ for (const {
                       total_token_usage: {
                         input_tokens: 1_350,
                         cached_input_tokens: 200,
-                        output_tokens: 30,
+                        output_tokens: outputTokens,
                       },
                     },
                   },
@@ -600,17 +608,50 @@ for (const {
                       payload: { id: threadId, cwd: scanDir },
                     }) + "\n",
                   );
+                  if (ownerSuffix) {
+                    await recordBudgetUsage();
+                    await resumeSelectedDeepScan({
+                      scanId,
+                      threadId,
+                      pluginRoot: PLUGIN_ROOT,
+                      runWorkbench: (args) =>
+                        runWorkbench(workbenchOptions, args),
+                      signal: cancellation.signal,
+                    });
+                    await rejoinSelectedScanThroughMcp(environment, scanId);
+                    const saved = await runWorkbench(workbenchOptions, [
+                      "get-scan",
+                      "--scan-id",
+                      scanId,
+                    ]);
+                    const scan = saved["scan"] as {
+                      progress: { status: string };
+                      executionAttribution: { completedAt: string | null };
+                    };
+                    nativeOwnerStatus = scan.progress.status;
+                    const completedAt = scan.executionAttribution.completedAt;
+                    await recordBudgetUsage(
+                      2_500,
+                      60,
+                      new Date(
+                        Math.max(
+                          Date.now(),
+                          completedAt ? Date.parse(completedAt) + 1 : 0,
+                        ),
+                      ).toISOString(),
+                    );
+                  }
                   if (outcome === "canceled-before-publication")
                     cancellation.abort("Synthetic user cancellation");
-                  if (outcome === "completed") {
+                  if (outcome === "completed" || ownerSuffix) {
                     yield {
                       type: "turn.completed",
                       usage: {
-                        input_tokens: 0,
-                        cached_input_tokens: 0,
+                        input_tokens: ownerSuffix ? 2_500 : 0,
+                        cached_input_tokens: ownerSuffix ? 200 : 0,
                         cache_write_input_tokens: 0,
                         reasoning_output_tokens: 0,
-                        output_tokens: 0,
+                        output_tokens: ownerSuffix ? 60 : 0,
                       },
                     };
                   } else {
@@ -948,8 +989,14 @@ for (const {
           commands.filter((command) => command === "complete-scan"),
         ).toHaveLength(2);
       }
-      // The synthetic accepted workers have no native usage receipts.
-      expect(result.cost).toBeNull();
+      if (ownerSuffix) {
+        expect(nativeOwnerStatus).toBe("running");
+        expect(result.cost?.inputTokens).toBe(2_500);
+        expect(result.cost?.outputTokens).toBe(60);
+      } else {
+        // The synthetic accepted workers have no native usage receipts.
+        expect(result.cost).toBeNull();
+      }
       expect(result.coverage.completeness).toBe("partial");
       expect(result.findings.findings[0]?.remediation).toBe(
         "Validate the resolved destination before writing.",
@@ -976,4 +1023,117 @@ for (const {
     }
   };
   test(name, runCase, 30_000);
+}
+
+async function rejoinSelectedScanThroughMcp(
+  environment: NodeJS.ProcessEnv,
+  scanId: string,
+): Promise<void> {
+  const child = spawn(
+    process.execPath,
+    [join(PLUGIN_ROOT, "mcp/server.mjs"), "--stdio"],
+    {
+      env: environment,
+      stdio: ["pipe", "pipe", "pipe"],
+    },
+  );
+  let stderr = "";
+  child.stderr.setEncoding("utf8");
+  child.stderr.on("data", (chunk: string) => {
+    stderr += chunk;
+  });
+  const exited = new Promise<void>((resolve) =>
+    child.once("exit", () => resolve()),
+  );
+  const result = new Promise<void>((resolve, reject) => {
+    let buffer = "";
+    child.once("error", reject);
+    child.once("exit", () =>
+      reject(new Error(`MCP closed before selected rejoin: ${stderr}`)),
+    );
+    child.stdout.setEncoding("utf8");
+    child.stdout.on("data", (chunk: string) => {
+      buffer += chunk;
+      for (;;) {
+        const newline = buffer.indexOf("\n");
+        if (newline < 0) break;
+        const line = buffer.slice(0, newline);
+        buffer = buffer.slice(newline + 1);
+        try {
+          const response = JSON.parse(line) as {
+            id?: number;
+            error?: unknown;
+            result?: {
+              isError?: boolean;
+              structuredContent?: { manifestPath?: string };
+            };
+          };
+          if (response.id === 1) {
+            child.stdin.write(
+              JSON.stringify({
+                jsonrpc: "2.0",
+                id: 2,
+                method: "tools/call",
+                params: {
+                  name: "start_codex_security_deep_scan",
+                  arguments: { scanId },
+                  _meta: {
+                    "openai/threadId": threadId,
+                    "codex/sandbox-state-meta": {
+                      permissionProfile: {
+                        type: "managed",
+                        file_system: {
+                          type: "restricted",
+                          entries: [
+                            {
+                              path: {
+                                type: "special",
+                                value: { kind: "root" },
+                              },
+                              access: "read",
+                            },
+                          ],
+                        },
+                        network: "restricted",
+                      },
+                      sandboxCwd: pathToFileURL(PLUGIN_ROOT).href,
+                    },
+                  },
+                },
+              }) + "\n",
+            );
+          }
+          if (response.id === 2) {
+            expect(response.error).toBeUndefined();
+            expect(response.result?.isError).toBeUndefined();
+            expect(
+              response.result?.structuredContent?.manifestPath,
+            ).toBeDefined();
+            resolve();
+          }
+        } catch (error) {
+          reject(error);
+        }
+      }
+    });
+  });
+  child.stdin.write(
+    JSON.stringify({
+      jsonrpc: "2.0",
+      id: 1,
+      method: "initialize",
+      params: {
+        protocolVersion: "2025-11-25",
+        capabilities: {},
+        clientInfo: { name: "sdk-owner-completion", version: "0.1.0" },
+      },
+    }) + "\n",
+  );
+  try {
+    await result;
+  } finally {
+    child.stdin.end();
+    child.kill();
+    await exited;
+  }
 }
