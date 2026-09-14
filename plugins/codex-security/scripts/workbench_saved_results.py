@@ -1311,7 +1311,11 @@ def budget_exhausted_draft(
     if before_selection:
         # Unmerged discoveries remain in their accepted artifacts. Only the
         # committed reducer may contribute findings to this partial result.
-        findings = {"findings": accepted_result["findings"] if accepted_result else []}
+        findings = {
+            "findings": copy.deepcopy(accepted_result["findings"]) if accepted_result else []
+        }
+        for finding in findings["findings"]:
+            _ensure_finding_identity(finding)
         if accepted_result is not None:
             coverage = accepted_result["sourceCoverage"]
             if "threatModel" in accepted_result:
