@@ -881,6 +881,30 @@ for (const mode of ["success", "cancel", "blocked-diagnostics", "invalid-initial
     ],
     { cwd: consumer },
   );
+  for (const recordFlag of ["--records=true", "--records=false"]) {
+    const rejected = spawnSync(
+      process.execPath,
+      [
+        launcher,
+        "dedupe",
+        recordFlag,
+        "--scan",
+        "synthetic-scan",
+        "--findings-url",
+        "http://127.0.0.1:3000",
+      ],
+      {
+        cwd: consumer,
+        encoding: "utf8",
+        timeout: PACKAGE_SMOKE_TIMEOUT_MS,
+        windowsHide: true,
+      },
+    );
+    assert.ifError(rejected.error);
+    assert.equal(rejected.status, 2, rejected.stderr);
+    assert.equal(rejected.stdout, "");
+    assert.match(rejected.stderr, /run request/u);
+  }
   await smokeNestedDeepScanWorker(installedRoot, consumer);
 
   console.log(

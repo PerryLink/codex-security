@@ -241,3 +241,23 @@ test("dedupe forwards cancellation and removes signal handlers", async () => {
     expect(signals.listeners.get("SIGTERM")?.size).toBe(0);
   }
 });
+
+test.each(["--records=true", "--records=false", "--records="])(
+  "dedupe rejects alternate record syntax %s before saved-scan execution",
+  async (recordFlag) => {
+    const deps = dependencies();
+    let scanCalls = 0;
+    deps.deduplicateScan = async () => {
+      scanCalls += 1;
+      throw new Error("Saved-scan deduplication must not run");
+    };
+    const stdout = capture();
+    const stderr = capture();
+    expect(
+      await main([...args, recordFlag], stdout.stream, stderr.stream, deps),
+    ).toBe(2);
+    expect(scanCalls).toBe(0);
+    expect(stdout.text()).toBe("");
+    expect(stderr.text()).toContain("run request");
+  },
+);

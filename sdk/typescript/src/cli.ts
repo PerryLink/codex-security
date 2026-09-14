@@ -1741,7 +1741,7 @@ export async function main(
   dependencies: CliDependencies = DEFAULT_DEPENDENCIES,
 ): Promise<number> {
   if (
-    argv.includes("--records") &&
+    argv.some((arg) => arg === "--records" || arg.startsWith("--records=")) &&
     !argv.includes("--help") &&
     !argv.includes("-h")
   ) {

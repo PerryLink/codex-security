@@ -104,6 +104,7 @@ subsequent publication, stable canonical identities or workflow transitions.
 
 Use `codex-security dedupe --records` to call the same SDK algorithm from another
 language or process. Without `--records`, `dedupe` keeps its saved-scan behavior.
+Use the exact `--records` flag; value forms such as `--records=true` are rejected.
 Record mode accepts no other execution flags: inputs and settings arrive in the
 `run` message. `codex-security dedupe --help` describes both modes. Record mode
 does not prompt, load local scan state, start a model runtime or publish results.
