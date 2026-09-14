@@ -69,6 +69,8 @@ export interface CoordinatorOptions {
   heartbeatIntervalMs?: number;
   observeReplacement?: (run: DeepScanRunState) => Promise<DeepScanRunState>;
   onComplete?: (draft: ScanDraftInput, signal: AbortSignal, publication: DeepScanPublication) => Promise<void>;
+  /** Complete the enclosing scan after selected publication, before local waiters settle. */
+  onFinalized?: (run: DeepScanRunState) => Promise<void>;
   onStopped?: (run: DeepScanRunState) => Promise<void>;
 }
 
@@ -436,6 +438,9 @@ export class DeepScanCoordinator {
       publish: async (...args) => { await this.options.onComplete?.(...args); },
       finish: (input) => this.options.store.finish(input),
     });
+    if (this.canceled || this.externallyFailed) return;
+    await this.options.onFinalized?.(cloneState(this.state));
+    if (this.canceled || this.externallyFailed) return;
     this.finishLocally(this.state);
   }
 
@@ -562,7 +567,12 @@ export class DeepScanCoordinator {
       && this.state.coordinatorGeneration !== undefined
       && current.coordinatorGeneration > this.state.coordinatorGeneration
     );
-    if (current.status === "running" && !replacementConfirmed) {
+    // finish-deep-scan commits before the enclosing scan's finalizer. Its own
+    // succeeded generation is still ours until that finalizer settles.
+    const completingSelectedParent = current.status === "succeeded"
+      && this.state.finalizationInput !== undefined
+      && current.coordinatorGeneration === this.state.coordinatorGeneration;
+    if (!replacementConfirmed && (current.status === "running" || completingSelectedParent)) {
       // A selection response can be lost after its transaction commits.
       if (current.finalizationInput) this.state = { ...this.state,
         finalizationInput: current.finalizationInput, terminalReason: current.terminalReason };

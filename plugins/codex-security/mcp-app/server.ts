@@ -727,6 +727,14 @@ export function createCodexSecurityServer(): McpServer {
     } catch (error: unknown) {
       return toolErrorResult(deepScanInvocationFailureMessage(error));
     }
+    const completeSelectedParent = async (run: DeepScanRunState) => {
+      if (run.finalizationInput && run.status === "succeeded") {
+        await runWorkbench([
+          "complete-scan", "--scan-id", run.scanId, "--thread-id", threadId,
+          ...optionalArg("--claim-token", handoffClaimToken),
+        ]);
+      }
+    };
     const preparation = await deepScanStartLock.run(async () => {
       // A joining observer does not need a usable current home. A new run,
       // however, must save its original settings before creation can commit.
@@ -751,7 +759,10 @@ export function createCodexSecurityServer(): McpServer {
         });
       }
       const immediate = deepScanTerminalResult(begun.run);
-      if (immediate) return { begun, immediate };
+      const completingLocally = begun.run.status === "succeeded"
+        && begun.run.finalizationInput
+        && deepScanCoordinators.get(begun.run.scanId);
+      if (immediate && !completingLocally) return { begun, immediate };
       const started = await startOrJoinDeepScanCoordinator({
         begin: begun,
         registry: deepScanCoordinators,
@@ -806,6 +817,7 @@ export function createCodexSecurityServer(): McpServer {
               ...(handoffClaimToken === undefined ? {} : { handoffClaimToken })
             }, runWorkbench, signal, publication);
           },
+          onFinalized: completeSelectedParent,
           onStopped: async (run) => {
             await runWorkbench([
               "preserve-scan-results", "--scan-id", run.scanId,
@@ -821,14 +833,6 @@ export function createCodexSecurityServer(): McpServer {
       invocationFailure: toolErrorResult(deepScanInvocationFailureMessage(error))
     }));
     if ("invocationFailure" in preparation) return preparation.invocationFailure;
-    const completeSelectedParent = async (run: DeepScanRunState) => {
-      if (run.finalizationInput && run.status === "succeeded") {
-        await runWorkbench([
-          "complete-scan", "--scan-id", run.scanId, "--thread-id", threadId,
-          ...optionalArg("--claim-token", handoffClaimToken),
-        ]);
-      }
-    };
     if (preparation.immediate) {
       try { await completeSelectedParent(preparation.begun.run); }
       catch (error) { return toolErrorResult(deepScanInvocationFailureMessage(error)); }
@@ -839,8 +843,6 @@ export function createCodexSecurityServer(): McpServer {
       logDeepScanEvent({ event: "coordinator_joined", scanId: begun.run.scanId });
     }
     const terminal = await coordinator.wait(abortSignalFromExtra(extra));
-    try { await completeSelectedParent(terminal); }
-    catch (error) { return toolErrorResult(deepScanInvocationFailureMessage(error)); }
     const result = deepScanTerminalResult(terminal);
     if (!result) {
       return toolErrorResult(deepScanInvocationFailureMessage(
