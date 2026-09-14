@@ -696,7 +696,7 @@ export function createCodexSecurityServer(): McpServer {
 
   server.registerTool("start_codex_security_deep_scan", {
     title: "Start or Join Codex Security Deep Scan",
-    description: "Run or rejoin independent Standard security scans and semantically merge their validated findings. Pass scanId and its handoffClaimToken to resume, or targetPath to start headlessly. The call blocks until the aggregate draft is ready, fails, or is canceled. On success, manifestPath identifies the canonical parent scan-manifest.json; call complete_codex_security_scan once.",
+    description: "Run or rejoin independent Standard security scans and semantically merge their validated findings. Pass scanId and its handoffClaimToken to resume, or targetPath to start headlessly. The call blocks until the aggregate draft is ready, fails, or is canceled. On success, manifestPath identifies the canonical parent scan-manifest.json; native scans can call complete_codex_security_scan once. SDK-managed scans leave completion to the SDK after the scan turn ends.",
     inputSchema: startDeepScanSchema,
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     _meta: modelActionMeta
@@ -1169,7 +1169,7 @@ export function createCodexSecurityServer(): McpServer {
 
   server.registerTool("complete_codex_security_scan", {
     title: "Complete Codex Security Scan",
-    description: "Finalization only: validate and seal already-authored scan-manifest.json, findings.json, and coverage.json, generate report.md, index findings, and mark the scan complete. For an app-backed running scan, scan-manifest.json is an unsealed draft and must omit scan.sealedAt and scan.artifacts; this tool supplies the exact workbench timestamps, seal, artifact digests, and derived finding identities. Call only after those canonical files exist; this tool does not create missing artifacts or run skipped phases. If it fails, surface the exact error and stop the current response without retrying completion or returning a final, no-findings, structured, or benchmark response.",
+    description: "Finalization only: validate and seal already-authored scan-manifest.json, findings.json, and coverage.json, generate report.md, index findings, and mark the scan complete. For an app-backed running scan, scan-manifest.json is an unsealed draft and must omit scan.sealedAt and scan.artifacts; this tool supplies the exact workbench timestamps, seal, artifact digests, and derived finding identities. Call only after those canonical files exist; this tool does not create missing artifacts or run skipped phases. SDK-managed Deep scans leave sealing to the SDK after the scan turn ends. If it fails, surface the exact error and stop the current response without retrying completion or returning a final, no-findings, structured, or benchmark response.",
     inputSchema: completeScanSchema,
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     _meta: modelActionMeta
@@ -1180,7 +1180,7 @@ export function createCodexSecurityServer(): McpServer {
       const progress = isJsonObject(scan?.progress) ? scan.progress : undefined;
       if (scan?.mode === "deep" && context.recipe != null && progress?.status === "running") {
         // A tool call is still inside the owner turn; its final usage has not arrived.
-        return scanActionResult(context,
+        return scanActionResult(redactHandoffClaimToken(context),
           "The SDK completes this Deep Scan after the scan turn finishes. Continue any remaining scan work, then end the turn without calling completion again. The SDK will account for the turn, enforce its budget, and seal and publish the scan."
         );
       }
