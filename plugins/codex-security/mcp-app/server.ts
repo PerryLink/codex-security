@@ -1175,6 +1175,15 @@ export function createCodexSecurityServer(): McpServer {
     _meta: modelActionMeta
   }, async ({ scanId, handoffClaimToken }) => {
     try {
+      const context = await runWorkbench(["get-scan", "--scan-id", scanId]);
+      const scan = isJsonObject(context.scan) ? context.scan : undefined;
+      const progress = isJsonObject(scan?.progress) ? scan.progress : undefined;
+      if (scan?.mode === "deep" && context.recipe != null && progress?.status === "running") {
+        // A tool call is still inside the owner turn; its final usage has not arrived.
+        return scanActionResult(context,
+          "The SDK completes this Deep Scan after the scan turn finishes. Continue any remaining scan work, then end the turn without calling completion again. The SDK will account for the turn, enforce its budget, and seal and publish the scan."
+        );
+      }
       const result = await runWorkbench([
         "complete-scan",
         "--scan-id",

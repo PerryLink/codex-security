@@ -108,6 +108,7 @@ export class WorkbenchDeepScanStore implements DeepScanStore {
   private readonly coordinatorLeases = new Map<string, {
     input: DeepScanCoordinatorLeaseInput;
     run: DeepScanRunState;
+    heartbeatWrite?: Promise<void>;
   }>();
 
   constructor(private readonly runWorkbench: WorkbenchRunner) {}
@@ -211,7 +212,7 @@ export class WorkbenchDeepScanStore implements DeepScanStore {
       throw new Error("Deep Scan coordinator lease belongs to another continuation.");
     }
     const updatedAt = new Date().toISOString();
-    await this.writeCoordinatorHeartbeat(lease.run, updatedAt);
+    await this.writeCoordinatorHeartbeat(lease, updatedAt);
     return { ...lease.run, updatedAt };
   }
 
@@ -219,18 +220,23 @@ export class WorkbenchDeepScanStore implements DeepScanStore {
     const lease = this.coordinatorLeases.get(scanId);
     if (!lease) return;
     this.coordinatorLeases.delete(scanId);
-    await this.writeCoordinatorHeartbeat(lease.run, new Date().toISOString(), true);
+    await this.writeCoordinatorHeartbeat(lease, new Date().toISOString(), true);
   }
 
-  private writeCoordinatorHeartbeat(run: DeepScanRunState, updatedAt: string, released = false): Promise<void> {
-    // Serialize with pending heartbeats so a late write cannot renew a released lease.
-    const operation = this.writeTail.then(() => writeJsonAtomic(join(
+  private writeCoordinatorHeartbeat(
+    lease: { run: DeepScanRunState; heartbeatWrite?: Promise<void> },
+    updatedAt: string,
+    released = false
+  ): Promise<void> {
+    // Heartbeats bypass SQLite writes; only writes to this lease file must settle in order.
+    const { run } = lease;
+    const operation = (lease.heartbeatWrite ?? Promise.resolve()).then(() => writeJsonAtomic(join(
       run.scanDir,
       "artifacts",
       "deep_discovery",
       `coordinator-heartbeat-${run.coordinatorGeneration}.json`
     ), { coordinatorGeneration: run.coordinatorGeneration, updatedAt, ...(released ? { released: true } : {}) }));
-    this.writeTail = operation.then(() => undefined, () => undefined);
+    lease.heartbeatWrite = operation.then(() => undefined, () => undefined);
     return operation;
   }
 
