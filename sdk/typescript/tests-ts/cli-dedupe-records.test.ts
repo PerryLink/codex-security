@@ -4,7 +4,10 @@ import { createInterface } from "node:readline";
 import { PassThrough, Writable } from "node:stream";
 import { expect, test } from "bun:test";
 import type { Finding, FindingsDocument } from "../src/models.js";
-import type { DeduplicationReviewRequest } from "../src/deduplication/records.js";
+import {
+  deduplicateRecords,
+  type DeduplicationReviewRequest,
+} from "../src/deduplication/records.js";
 import {
   runRecordDedupeCli,
   runRecordDedupeProtocol,
@@ -29,6 +32,10 @@ const first = finding(1),
   second = finding(2);
 const params = {
   observations: [first],
+  candidates: [second],
+  candidateRelationships: [
+    { observationId: first.findingId, candidateIds: [second.findingId] },
+  ],
   scopeKey: "synthetic-scope",
   sourceManifest: { revision: "synthetic-revision" },
   concurrency: 2,
@@ -110,6 +117,7 @@ async function drive(
     malformedReview?: boolean;
     onPut?: () => Promise<void>;
     priorDecisions?: unknown[];
+    loseCheckpointAck?: boolean;
   } = {},
 ) {
   const s = session(),
@@ -130,9 +138,6 @@ async function drive(
         case "source.verify":
           s.reply(message, null);
           break;
-        case "candidates.get":
-          s.reply(message, [second]);
-          break;
         case "checkpoint.get":
           s.reply(
             message,
@@ -146,7 +151,8 @@ async function drive(
             message.params["result"],
           );
           expect(message.params["binding"]).toBeObject();
-          s.reply(message, null);
+          if (options.loseCheckpointAck) s.input.end();
+          else s.reply(message, null);
           break;
         case "review.run":
           s.reply(
@@ -191,6 +197,103 @@ test("runs the SDK and reuses host-persisted validated checkpoints", async () =>
   expect(prior.message.result).toMatchObject({
     pairOutcomes: [{ origin: "prior", checkpointKeys: [] }],
   });
+});
+test("preloaded relationships produce the same results and checkpoints as the SDK provider", async () => {
+  const directCheckpoints = new Map<string, unknown>();
+  const direct = await deduplicateRecords({
+    ...params,
+    candidateProvider: { potentialDuplicates: async () => [second] },
+    reviewRunner: { run: async (request) => reviewResult(request) },
+    verifySource: async () => {},
+    checkpointStore: {
+      getReview: async (key) => directCheckpoints.get(key) ?? null,
+      saveReview: async (key, _binding, result) => {
+        directCheckpoints.set(key, result);
+      },
+    },
+  });
+  const cliCheckpoints = new Map<string, unknown>();
+  const preloaded = await drive(cliCheckpoints);
+  expect(preloaded.message.result).toEqual(direct);
+  expect(cliCheckpoints).toEqual(directCheckpoints);
+  const recovered = await drive(directCheckpoints);
+  expect(recovered.message.result).toEqual(direct);
+  expect(recovered.methods).not.toContain("review.run");
+});
+test("recovers a persisted review when the checkpoint acknowledgement is lost", async () => {
+  const checkpoints = new Map<string, unknown>();
+  const interrupted = await drive(checkpoints, { loseCheckpointAck: true });
+  expect(interrupted.exit).toBe(2);
+  expect(checkpoints.size).toBe(1);
+  const recovered = await drive(checkpoints);
+  const fresh = await drive(new Map());
+  expect(recovered.message.result).toEqual(fresh.message.result);
+  expect(
+    recovered.methods.filter((method) => method === "review.run"),
+  ).toHaveLength(1);
+  expect(
+    fresh.methods.filter((method) => method === "review.run"),
+  ).toHaveLength(2);
+});
+test.each([
+  { candidates: [] },
+  { candidateRelationships: [] },
+  {
+    candidateRelationships: [
+      params.candidateRelationships[0],
+      params.candidateRelationships[0],
+    ],
+  },
+  {
+    candidateRelationships: [
+      { observationId: second.findingId, candidateIds: [] },
+    ],
+  },
+  { candidates: [{ ...first, title: "Conflicting content" }] },
+  { candidates: [{}] },
+])(
+  "rejects incomplete or conflicting comparison batches before callbacks: %j",
+  async (change) => {
+    const s = session();
+    try {
+      await s.initialize();
+      s.run({ ...params, ...change });
+      const response = await s.next();
+      expect(response.id).toBe("run");
+      expect(response.method).toBeUndefined();
+      expect(response.error).toBeDefined();
+      expect(await s.done).toBe(2);
+    } finally {
+      s.close();
+    }
+  },
+);
+test("an explicit empty neighborhood does not compare unrelated preloaded candidates", async () => {
+  const s = session();
+  try {
+    await s.initialize();
+    s.run({
+      ...params,
+      candidateRelationships: [
+        { observationId: first.findingId, candidateIds: [] },
+      ],
+    });
+    for (;;) {
+      const response = await s.next();
+      if (response.id === "run") {
+        expect(response.result).toMatchObject({
+          uniqueFindingIds: [first.findingId],
+          pairOutcomes: [],
+        });
+        break;
+      }
+      expect(response.method).toBe("source.verify");
+      s.reply(response, null);
+    }
+    expect(await s.done).toBe(0);
+  } finally {
+    s.close();
+  }
 });
 test("malformed model output fails instead of producing DISTINCT", async () => {
   const result = await drive(new Map(), { malformedReview: true });
@@ -281,23 +384,38 @@ test("correlates concurrent callbacks independently of reply order", async () =>
   const s = session();
   try {
     await s.initialize();
-    s.run({ ...params, observations: [first, second] });
+    s.run({
+      ...params,
+      observations: [first, second],
+      candidates: [first, second],
+      candidateRelationships: [
+        { observationId: first.findingId, candidateIds: [second.findingId] },
+        { observationId: second.findingId, candidateIds: [first.findingId] },
+      ],
+    });
     s.reply(await s.next(), null);
     const a = await s.next(),
       b = await s.next();
-    expect(a.method).toBe("candidates.get");
-    expect(b.method).toBe("candidates.get");
+    expect(a.method).toBe("source.verify");
+    expect(b.method).toBe("source.verify");
     expect(a.id).not.toBe(b.id);
-    s.reply(b, []);
-    s.reply(a, []);
+    s.reply(b, null);
+    s.reply(a, null);
     for (;;) {
       const message = await s.next();
       if (message.id === "run") {
         expect(message.error).toBeUndefined();
         break;
       }
-      expect(message.method).toBe("source.verify");
-      s.reply(message, null);
+      if (message.method === "review.run")
+        s.reply(
+          message,
+          reviewResult(message.params["request"] as DeduplicationReviewRequest),
+        );
+      else {
+        expect(message.method).toBe("source.verify");
+        s.reply(message, null);
+      }
     }
     expect(await s.done).toBe(0);
   } finally {
@@ -416,7 +534,12 @@ test.each(["success", "cancel"])(
             jsonrpc: "2.0",
             id: "run",
             method: "run",
-            params: { ...params, observations: [] },
+            params: {
+              ...params,
+              observations: [],
+              candidates: [],
+              candidateRelationships: [],
+            },
           });
         } else if (mode === "cancel") {
           send({ jsonrpc: "2.0", method: "cancel" });

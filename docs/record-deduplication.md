@@ -132,16 +132,18 @@ The CLI replies with `{"jsonrpc":"2.0","id":"init","result":{"protocolVersion":1
 `checkpoints` defaults to `false`; enabling it installs the host checkpoint store.
 Then send `run` with a different request ID and these parameters:
 
-| Field                 | Contract                                                                |
-| --------------------- | ----------------------------------------------------------------------- |
-| `observations`        | Required array of complete SDK Findings; the SDK validates each record. |
-| `scopeKey`            | Required nonempty corpus scope.                                         |
-| `sourceManifest`      | Required JSON object describing host-approved source.                   |
-| `sourceTools`         | Optional SDK source tool descriptors; defaults to an empty array.       |
-| `settingsDigest`      | Optional host execution-settings binding.                               |
-| `resultToolNamespace` | Optional result tool namespace; defaults to `review_validator`.         |
-| `priorDecisions`      | Optional earlier bound pair decisions; defaults to an empty array.      |
-| `concurrency`         | Optional positive integer; defaults to the SDK default of 8.            |
+| Field                    | Contract                                                                                                      |
+| ------------------------ | ------------------------------------------------------------------------------------------------------------- |
+| `observations`           | Required array of complete SDK Findings; the SDK validates each record.                                       |
+| `candidates`             | Required array of complete candidate Findings, fetched and authorized by the host before invoking the CLI.    |
+| `candidateRelationships` | Required `{observationId, candidateIds}` entries, exactly one per observation, including empty neighborhoods. |
+| `scopeKey`               | Required nonempty corpus scope.                                                                               |
+| `sourceManifest`         | Required JSON object describing host-approved source.                                                         |
+| `sourceTools`            | Optional SDK source tool descriptors; defaults to an empty array.                                             |
+| `settingsDigest`         | Optional host execution-settings binding.                                                                     |
+| `resultToolNamespace`    | Optional result tool namespace; defaults to `review_validator`.                                               |
+| `priorDecisions`         | Optional earlier bound pair decisions; defaults to an empty array.                                            |
+| `concurrency`            | Optional positive integer; defaults to the SDK default of 8.                                                  |
 
 A minimal empty-corpus run is:
 
@@ -152,11 +154,17 @@ A minimal empty-corpus run is:
   "method": "run",
   "params": {
     "observations": [],
+    "candidates": [],
+    "candidateRelationships": [],
     "scopeKey": "synthetic-scope",
     "sourceManifest": { "revision": "synthetic-revision" }
   }
 }
 ```
+
+The host fetches, authorizes and freezes the entire comparison batch before launching the CLI: observations, candidate records, explicit neighborhoods, exact source revisions, execution settings and prior decisions. Candidate IDs resolve only against the supplied `candidates` array. Missing neighborhoods, dangling references and conflicting record content fail before callbacks. The CLI uses an in-memory candidate provider for the existing algorithm; it never requests candidates from the host or an HTTP endpoint. Supplying a candidate record does not nominate it for every observation.
+
+Saved-scan mode retains `--findings-url`, including base URLs with path prefixes (for example `https://example.test/security/findings`). Record mode needs no findings service. Model reviews, source verification and durable checkpoint acknowledgements remain host operations; canonical publication follows only after the host receives and verifies the results.
 
 The CLI sends callback requests with contiguous increasing IDs `sdk:1`, `sdk:2`,
 and so on, in emission order within each process. Requests can overlap;
@@ -166,7 +174,6 @@ methods are:
 
 | Method           | Parameters               | Success `result`                                                   |
 | ---------------- | ------------------------ | ------------------------------------------------------------------ |
-| `candidates.get` | `{finding}`              | Array of complete candidate Findings.                              |
 | `review.run`     | `{request}`              | Raw model submission, validated by the SDK.                        |
 | `source.verify`  | `{manifest}`             | `null`, after verifying the exact source binding.                  |
 | `checkpoint.get` | `{key}`                  | Previously saved raw review result, or `null` if absent.           |

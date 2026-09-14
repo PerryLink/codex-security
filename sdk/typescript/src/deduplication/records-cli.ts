@@ -3,11 +3,20 @@ import type { Readable } from "node:stream";
 import { z } from "zod";
 import type { JsonObject } from "../config.js";
 import type { Finding } from "../models.js";
+import { workflowDigest } from "../finding-workflow.js";
+import { requireFinding } from "./deduplication-reviewer.js";
 import { deduplicateRecords } from "./records.js";
 
 const object = z.record(z.string(), z.json());
 const runParams = z.strictObject({
   observations: z.array(z.unknown()),
+  candidates: z.array(z.unknown()),
+  candidateRelationships: z.array(
+    z.strictObject({
+      observationId: z.string(),
+      candidateIds: z.array(z.string()),
+    }),
+  ),
   scopeKey: z.string(),
   sourceManifest: object,
   settingsDigest: z.string().optional(),
@@ -39,6 +48,50 @@ const initializeParams = z.strictObject({
   protocolVersion: z.literal(1),
   checkpoints: z.boolean().default(false),
 });
+
+/** Resolve the complete host-selected graph before any source or model callback. */
+function preloadedCandidates(params: z.infer<typeof runParams>) {
+  const records = new Map<string, Finding>();
+  for (const input of [...params.observations, ...params.candidates]) {
+    requireFinding(input);
+    const previous = records.get(input.findingId);
+    if (previous && workflowDigest(previous) !== workflowDigest(input))
+      throw new Error("Conflicting finding content in the comparison batch.");
+    records.set(input.findingId, input);
+  }
+  const observations = new Set(
+    (params.observations as Finding[]).map((finding) => finding.findingId),
+  );
+  const candidates = new Set(
+    (params.candidates as Finding[]).map((finding) => finding.findingId),
+  );
+  const neighborhoods = new Map<string, readonly Finding[]>();
+  for (const relationship of params.candidateRelationships) {
+    if (
+      !observations.has(relationship.observationId) ||
+      neighborhoods.has(relationship.observationId)
+    )
+      throw new Error(
+        "Candidate relationships must name each observation once.",
+      );
+    neighborhoods.set(
+      relationship.observationId,
+      relationship.candidateIds.map((id) => {
+        if (!candidates.has(id))
+          throw new Error(
+            "Candidate relationship names a missing candidate record.",
+          );
+        return records.get(id)!;
+      }),
+    );
+  }
+  if (neighborhoods.size !== observations.size)
+    throw new Error("Candidate relationships must name each observation once.");
+  return {
+    potentialDuplicates: async (finding: Finding) =>
+      neighborhoods.get(finding.findingId)!,
+  };
+}
 const rpcId = z.union([z.string(), z.number().int()]);
 const request = z.strictObject({
   jsonrpc: z.literal("2.0"),
@@ -239,18 +292,12 @@ export async function runRecordDedupeProtocol(
     }
     runId = message.id;
     const params = runParams.parse(message.params);
+    const candidateProvider = preloadedCandidates(params);
     void deduplicateRecords({
       ...params,
       observations: params.observations as Finding[],
       sourceManifest: params.sourceManifest as JsonObject,
-      candidateProvider: {
-        potentialDuplicates: async (finding) => {
-          const result = await call("candidates.get", { finding });
-          if (!Array.isArray(result))
-            throw new Error("candidates.get must return an array of Findings.");
-          return result as Finding[];
-        },
-      },
+      candidateProvider,
       reviewRunner: {
         run: (review) => call("review.run", { request: review }),
       },

@@ -7,6 +7,32 @@ const neighborhood = {
   potentialDuplicates: [],
 };
 
+test.each(["/gateway/security", "/gateway/security/"])(
+  "preserves the findings base URL prefix %s for lookups and writes",
+  async (prefix) => {
+    const urls: string[] = [];
+    const client = new FindingsClient(
+      `https://synthetic.test${prefix}`,
+      undefined,
+      async (input) => {
+        const url = String(input);
+        urls.push(url);
+        return Response.json(
+          url.includes("potential-duplicates") ? neighborhood : [],
+        );
+      },
+    );
+    await client.potentialDuplicates("synthetic", scope);
+    await client.publish([], scope.repositoryId);
+    await client.storeDedupeGroups([["first", "second"]]);
+    expect(urls).toEqual([
+      "https://synthetic.test/gateway/security/v1/finding/synthetic/potential-duplicates?repositoryId=synthetic-repository",
+      "https://synthetic.test/gateway/security/v1/bulk/findings",
+      "https://synthetic.test/gateway/security/v1/dedupe-groups",
+    ]);
+  },
+);
+
 test("lookup retries rate limits and honors Retry-After before continuing", async () => {
   let requests = 0;
   const delays: number[] = [];
