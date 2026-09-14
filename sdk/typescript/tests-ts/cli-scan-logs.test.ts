@@ -13,11 +13,11 @@ import { readSavedScanLogs } from "../src/scan-logs.js";
 import { VERSION } from "../src/version.js";
 import { capture, dependencies } from "./cli-fixtures.js";
 
-async function fixture() {
+async function fixture(attributedOwner = false) {
   const state = await realpath(await mkdtemp(join(tmpdir(), "saved-logs-")));
   const home = join(state, "codex-home");
   await mkdir(join(home, "sessions"), { recursive: true });
-  const events = [
+  const events: Record<string, unknown>[] = [
     { type: "session_meta", payload: { id: "thread-1" } },
     {
       type: "event_msg",
@@ -27,6 +27,15 @@ async function fixture() {
       },
     },
   ];
+  const timestamp = "2026-08-11T12:01:00.000Z";
+  if (attributedOwner) {
+    events.splice(1, 0, {
+      type: "turn_context",
+      timestamp,
+      payload: { turn_id: "scan-turn" },
+    });
+    Object.assign(events.at(-1)!, { timestamp });
+  }
   await writeFile(
     join(home, "sessions", "rollout.jsonl"),
     events.map((event) => JSON.stringify(event)).join("\n"),
@@ -36,6 +45,42 @@ async function fixture() {
   const settingsDirectory = join(scanDir, "artifacts", "deep_discovery");
   await mkdir(settingsDirectory, { recursive: true });
   await mkdir(join(originalHome, "sessions"), { recursive: true });
+  let ownerEvents = events;
+  if (attributedOwner) {
+    const repeated = {
+      type: "event_msg",
+      timestamp,
+      payload: { message: "repeated scan occurrence" },
+    };
+    ownerEvents = [
+      ...events,
+      repeated,
+      repeated,
+      {
+        type: "event_msg",
+        timestamp,
+        payload: { message: "recorded non-usage suffix" },
+      },
+    ];
+    await writeFile(
+      join(home, "sessions", "rollout.jsonl"),
+      [
+        ...events,
+        { type: "turn_context", timestamp, payload: { turn_id: "other-turn" } },
+        {
+          type: "event_msg",
+          timestamp,
+          payload: { message: "unrelated first-copy suffix" },
+        },
+      ]
+        .map((event) => JSON.stringify(event))
+        .join("\n"),
+    );
+    await writeFile(
+      join(originalHome, "sessions", "owner.jsonl"),
+      ownerEvents.map((event) => JSON.stringify(event)).join("\n"),
+    );
+  }
   await writeFile(
     join(settingsDirectory, "execution-settings.json"),
     JSON.stringify({
@@ -65,6 +110,21 @@ async function fixture() {
     mode: "deep",
     scanDir,
     executionThreadIds: ["worker"],
+    ...(attributedOwner
+      ? {
+          executionAttribution: {
+            formatVersion: 1 as const,
+            executionThreadIds: ["worker"],
+            owner: {
+              threadId: "thread-1",
+              turnId: "scan-turn",
+              startedAt: timestamp,
+            },
+            startedAt: timestamp,
+            completedAt: timestamp,
+          },
+        }
+      : {}),
   };
   const logs = await readSavedScanLogs(scan, [home, originalHome]);
   const deps = dependencies({
@@ -74,7 +134,7 @@ async function fixture() {
   deps.createSecurity = () => {
     throw new Error("Reading logs must not start Codex");
   };
-  return { state, logs, deps };
+  return { state, logs, deps, ownerEvents };
 }
 
 async function referenceOutput(args: string[], logs: unknown) {
@@ -101,6 +161,34 @@ function withoutDuration(text: string) {
 }
 
 describe("saved logs JSON output", () => {
+  test("selects the recorded owner suffix after scan attribution through the saved logs command", async () => {
+    const f = await fixture(true);
+    try {
+      const stdout = capture();
+      expect(
+        await main(
+          ["scans", "logs", "scan-1", "--json"],
+          stdout.stream,
+          capture().stream,
+          f.deps,
+        ),
+      ).toBe(0);
+      const result = JSON.parse(stdout.text());
+      expect(
+        result.sessions.map(({ threadId }: { threadId: string }) => threadId),
+      ).toEqual(["worker", "thread-1"]);
+      expect(
+        result.events
+          .filter(
+            ({ threadId }: { threadId: string }) => threadId === "thread-1",
+          )
+          .map(({ event }: { event: unknown }) => event),
+      ).toEqual(f.ownerEvents);
+    } finally {
+      await rm(f.state, { recursive: true, force: true });
+    }
+  });
+
   test("loads the same-thread recorded worker suffix through the saved logs command", async () => {
     const f = await fixture();
     try {

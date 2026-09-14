@@ -180,59 +180,22 @@ export async function readScanLogs(options: ScanLogOptions) {
     const session = logs.get(threadId);
     if (session !== undefined) {
       // Compare only scan-owned logs. Keep traversal order unless a later copy
-      // contains every recorded event followed by additional events.
+      // contains every attributed event followed by additional events.
       for (const path of sessionPaths.get(threadId)!.slice(1)) {
-        if (await extendsSessionLog(path, session.path)) session.path = path;
+        if (await extendsSessionLog(path, session, attribution))
+          session.path = path;
       }
       sessions.push(session);
     }
   }
   const events: Record<string, unknown>[] = [];
   for (const session of sessions) {
-    let replaying = false;
-    let turnId: string | null = null;
-    for await (const event of sessionEvents(session.path)) {
-      const payload = event["payload"];
-      if (
-        isRecord(payload) &&
-        (event["type"] === "turn_context" ||
-          payload["type"] === "task_started") &&
-        typeof payload["turn_id"] === "string"
-      ) {
-        turnId = payload["turn_id"];
-      }
-      if (event["type"] === "session_meta" && isRecord(payload)) {
-        replaying = payload["id"] !== session.threadId;
-      }
-      if (replaying) {
-        if (
-          event["type"] !== "event_msg" ||
-          !isRecord(payload) ||
-          payload["type"] !== "task_started" ||
-          typeof payload["started_at"] !== "number" ||
-          session.startedAt === null ||
-          payload["started_at"] < Math.floor(session.startedAt / 1_000)
-        ) {
-          continue;
-        }
-        replaying = false;
-      }
-      if (
-        !attribution ||
-        event["type"] === "session_meta" ||
-        isAttributedScanEvent(
-          attribution,
-          session.threadId,
-          event["type"] === "token_usage_record" &&
-            isRecord(payload) &&
-            typeof payload["turn_id"] === "string"
-            ? payload["turn_id"]
-            : turnId,
-          event["timestamp"],
-        )
-      ) {
-        events.push({ threadId: session.threadId, event });
-      }
+    for await (const event of attributedSessionEvents(
+      session.path,
+      session,
+      attribution,
+    )) {
+      events.push({ threadId: session.threadId, event });
     }
   }
 
@@ -248,13 +211,70 @@ export async function readScanLogs(options: ScanLogOptions) {
   };
 }
 
+async function* attributedSessionEvents(
+  path: string,
+  session: SessionLog,
+  attribution: ScanExecutionAttribution | null | undefined,
+): AsyncGenerator<Record<string, unknown>> {
+  let replaying = false;
+  let turnId: string | null = null;
+  for await (const event of sessionEvents(path)) {
+    const payload = event["payload"];
+    if (
+      isRecord(payload) &&
+      (event["type"] === "turn_context" ||
+        payload["type"] === "task_started") &&
+      typeof payload["turn_id"] === "string"
+    ) {
+      turnId = payload["turn_id"];
+    }
+    if (event["type"] === "session_meta" && isRecord(payload)) {
+      replaying = payload["id"] !== session.threadId;
+    }
+    if (replaying) {
+      if (
+        event["type"] !== "event_msg" ||
+        !isRecord(payload) ||
+        payload["type"] !== "task_started" ||
+        typeof payload["started_at"] !== "number" ||
+        session.startedAt === null ||
+        payload["started_at"] < Math.floor(session.startedAt / 1_000)
+      ) {
+        continue;
+      }
+      replaying = false;
+    }
+    if (
+      !attribution ||
+      event["type"] === "session_meta" ||
+      isAttributedScanEvent(
+        attribution,
+        session.threadId,
+        event["type"] === "token_usage_record" &&
+          isRecord(payload) &&
+          typeof payload["turn_id"] === "string"
+          ? payload["turn_id"]
+          : turnId,
+        event["timestamp"],
+      )
+    ) {
+      yield event;
+    }
+  }
+}
+
 async function extendsSessionLog(
   path: string,
-  previousPath: string,
+  session: SessionLog,
+  attribution: ScanExecutionAttribution | null | undefined,
 ): Promise<boolean> {
-  const previous = sessionEvents(previousPath);
+  const previous = attributedSessionEvents(session.path, session, attribution);
   try {
-    for await (const event of sessionEvents(path)) {
+    for await (const event of attributedSessionEvents(
+      path,
+      session,
+      attribution,
+    )) {
       const recorded = await previous.next();
       if (recorded.done) return true;
       if (JSON.stringify(event) !== JSON.stringify(recorded.value))

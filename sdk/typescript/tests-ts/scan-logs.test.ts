@@ -82,9 +82,13 @@ function commandEvent(command: string, id: string, timestamp?: string) {
 }
 
 describe("saved scan logs", () => {
-  test.each(["sessions", "archived_sessions"])(
-    "reads the complete same-thread recorded copy from %s with scan turn attribution",
-    async (directory) => {
+  test.each(
+    ["sessions", "archived_sessions"].flatMap((directory) =>
+      ["prefix only", "unrelated owner turn"].map((tail) => [directory, tail]),
+    ),
+  )(
+    "reads the complete same-thread recorded copy from %s after %s",
+    async (directory, tail) => {
       const current = await temporaryHome();
       const original = await temporaryHome();
       const scanDir = await temporaryHome();
@@ -100,7 +104,23 @@ describe("saved scan logs", () => {
         commandEvent("prefix", "prefix-call", timestamp),
       ];
       const suffix = commandEvent("saved suffix", "suffix-call", timestamp);
-      await writeSession(current, "owner", prefix);
+      await writeSession(current, "owner", [
+        ...prefix,
+        ...(tail === "unrelated owner turn"
+          ? [
+              {
+                type: "turn_context",
+                timestamp,
+                payload: { turn_id: "other-turn" },
+              },
+              commandEvent(
+                "unrelated first copy",
+                "other-first-call",
+                timestamp,
+              ),
+            ]
+          : []),
+      ]);
       const currentPath = join(
         current,
         "sessions",
@@ -150,6 +170,66 @@ describe("saved scan logs", () => {
         { type: "session_meta", payload: { id: "owner" } },
         ...prefix,
         suffix,
+        suffix,
+      ]);
+      expect(result.sessions[0]?.path).toStartWith(join(original, directory!));
+    },
+  );
+
+  test.each(["equal", "shorter", "divergent"])(
+    "keeps the first rollout when attributed occurrences are %s",
+    async (copy) => {
+      const first = await temporaryHome();
+      const second = await temporaryHome();
+      const timestamp = "2026-08-11T12:01:00.000Z";
+      const turn = {
+        type: "turn_context",
+        timestamp,
+        payload: { turn_id: "scan-turn" },
+      };
+      const prefix = commandEvent("first", "first-call", timestamp);
+      const suffix = commandEvent("complete", "complete-call", timestamp);
+      const unrelated = {
+        type: "turn_context",
+        timestamp,
+        payload: { turn_id: "other-turn" },
+      };
+      await writeSession(first, "owner", [turn, prefix, suffix, unrelated]);
+      await writeSession(second, "owner", [
+        turn,
+        ...(copy === "equal"
+          ? [prefix, suffix]
+          : copy === "shorter"
+            ? [prefix]
+            : [
+                prefix,
+                commandEvent("different", "different-call", timestamp),
+                suffix,
+              ]),
+        unrelated,
+        commandEvent("more unrelated work", "other-call", timestamp),
+      ]);
+      const result = await readScanLogs({
+        scanId: "scan-1",
+        threadId: "owner",
+        codexHome: [first, second],
+        executionAttribution: {
+          formatVersion: 1,
+          executionThreadIds: [],
+          owner: {
+            threadId: "owner",
+            turnId: "scan-turn",
+            startedAt: timestamp,
+          },
+          startedAt: timestamp,
+          completedAt: timestamp,
+        },
+      });
+      expect(result.sessions[0]?.path).toStartWith(first);
+      expect(result.events.map(({ event }) => event)).toEqual([
+        { type: "session_meta", payload: { id: "owner" } },
+        turn,
+        prefix,
         suffix,
       ]);
     },
@@ -548,7 +628,14 @@ describe("saved scan logs", () => {
     await mkdir(join(current, "sessions"), { recursive: true });
     await writeFile(
       currentPath,
-      (await readFile(path, "utf8")).split("\n").slice(0, 4).join("\n"),
+      (await readFile(path, "utf8"))
+        .split("\n")
+        .slice(0, 4)
+        .join("\n")
+        .replace(
+          "PRIVATE PRE-SCAN CONVERSATION",
+          "OTHER PRE-SCAN CONVERSATION",
+        ),
     );
     const result = await readScanLogs({
       scanId: "scan-1",
