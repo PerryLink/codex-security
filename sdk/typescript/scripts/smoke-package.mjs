@@ -825,7 +825,7 @@ try {
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { createInterface } from "node:readline";
-for (const mode of ["success", "cancel"]) {
+for (const mode of ["success", "cancel", "blocked-diagnostics"]) {
   const child = spawn(process.execPath, [process.argv[1], "dedupe", "--records"], {
     stdio: ["pipe", "pipe", "pipe"]
   });
@@ -835,7 +835,9 @@ for (const mode of ["success", "cancel"]) {
   });
   const timeout = setTimeout(() => child.kill("SIGKILL"), 30_000);
   let diagnostics = "", response;
-  child.stderr.setEncoding("utf8").on("data", value => diagnostics += value);
+  if (mode !== "blocked-diagnostics") {
+    child.stderr.setEncoding("utf8").on("data", value => diagnostics += value);
+  }
   const send = message => child.stdin.write(JSON.stringify(message) + "\\n");
   send({jsonrpc:"2.0", id:"init", method:"initialize", params:{protocolVersion:1}});
   try {
@@ -850,15 +852,20 @@ for (const mode of ["success", "cancel"]) {
         response = message;
       } else if (mode === "cancel") {
         send({jsonrpc:"2.0", method:"cancel"});
+      } else if (mode === "blocked-diagnostics") {
+        // Exceed the unread stderr pipe buffer with a synthetic host failure.
+        send({jsonrpc:"2.0", id:message.id, error:{code:-32001, message:"x".repeat(1024 * 1024)}});
       } else {
         assert.equal(message.method, "source.verify");
         send({jsonrpc:"2.0", id:message.id, result:null});
       }
     }
     // Keep host stdin open: the isolated attempt must stop its own input socket.
-    assert.equal(await closed, mode === "cancel" ? 130 : 0, diagnostics);
+    const expectedExit = mode === "cancel" ? 130 : mode === "blocked-diagnostics" ? 2 : 0;
+    assert.equal(await closed, expectedExit, diagnostics);
     assert.ok(response);
     if (mode === "cancel") assert.equal(response.error.code, -32800);
+    else if (mode === "blocked-diagnostics") assert.equal(response.error.code, -32000);
     else assert.deepEqual(response.result.pairOutcomes, []);
   } finally {
     clearTimeout(timeout);

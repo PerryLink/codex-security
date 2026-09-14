@@ -47,18 +47,13 @@ function session() {
   const lines = createInterface({ input: output });
   const messages: Message[] = [],
     waiting: ((message: Message) => void)[] = [];
-  let diagnostics = "";
   lines.on("line", (line) => {
     const message: Message = JSON.parse(line),
       next = waiting.shift();
     if (next) next(message);
     else messages.push(message);
   });
-  const done = runRecordDedupeProtocol(input, output, {
-    write: (text) => {
-      diagnostics += text;
-    },
-  });
+  const done = runRecordDedupeProtocol(input, output);
   const send = (message: unknown) =>
     input.write(`${JSON.stringify(message)}\n`);
   const next = async (): Promise<Message> =>
@@ -90,7 +85,6 @@ function session() {
     initialize,
     run,
     close,
-    diagnostics: () => diagnostics,
   };
 }
 function reviewResult(request: DeduplicationReviewRequest): unknown {
@@ -250,7 +244,7 @@ test.each(["orphan", "malformed", "duplicate"])(
           error: { code: 1, message: "both" },
         });
       expect(await s.done).toBe(2);
-      expect(s.diagnostics()).not.toBe("");
+      expect((await s.next()).error).toBeDefined();
     } finally {
       s.close();
     }
@@ -341,21 +335,13 @@ test("rejects execution flags before reading stdin", async () => {
   expect(error).toContain("run request");
 });
 
-test("closed output terminates pending callbacks even when diagnostics also fail", async () => {
+test("closed output terminates pending callbacks", async () => {
   const input = new PassThrough();
-  const done = runRecordDedupeProtocol(
-    input,
-    {
-      write() {
-        throw new Error("Closed output");
-      },
+  const done = runRecordDedupeProtocol(input, {
+    write() {
+      throw new Error("Closed output");
     },
-    {
-      write() {
-        throw new Error("Closed diagnostics");
-      },
-    },
-  );
+  });
   input.write(
     '{"jsonrpc":"2.0","id":"init","method":"initialize","params":{"protocolVersion":1}}\n',
   );
@@ -373,7 +359,6 @@ test("unsupported protocol version fails before callback dispatch", async () => 
       params: { protocolVersion: 2 },
     });
     expect(await s.done).toBe(2);
-    expect(s.diagnostics()).toContain("Malformed");
   } finally {
     s.close();
   }
@@ -438,12 +423,10 @@ test.each(["success", "cancel"])(
       },
     });
     let settled = false;
-    const done = runRecordDedupeProtocol(input, output, { write() {} }).then(
-      (code) => {
-        settled = true;
-        return code;
-      },
-    );
+    const done = runRecordDedupeProtocol(input, output).then((code) => {
+      settled = true;
+      return code;
+    });
     try {
       send({
         jsonrpc: "2.0",
@@ -466,3 +449,36 @@ test.each(["success", "cancel"])(
     }
   },
 );
+
+test("invalid command diagnostics handle asynchronous output failure", async () => {
+  let failed!: () => void;
+  const failure = new Promise<void>((resolve) => {
+    failed = resolve;
+  });
+  const diagnostics = new Writable({
+    write(_chunk, _encoding, callback) {
+      setImmediate(() => {
+        callback(new Error("Synthetic startup diagnostic EPIPE"));
+        failed();
+      });
+    },
+  });
+  try {
+    expect(
+      await runRecordDedupeCli(
+        ["dedupe", "--records", "--concurrency", "2"],
+        {
+          write() {
+            throw new Error("No protocol output expected");
+          },
+        },
+        diagnostics,
+      ),
+    ).toBe(2);
+    await failure;
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(diagnostics.listenerCount("error")).toBe(0);
+  } finally {
+    diagnostics.destroy();
+  }
+});

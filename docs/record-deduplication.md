@@ -109,7 +109,8 @@ Record mode accepts no other execution flags: inputs and settings arrive in the
 does not prompt, load local scan state, start a model runtime or publish results.
 
 The transport is bidirectional JSON-RPC 2.0, one UTF-8 JSON object per line on
-stdin/stdout. Stdout contains only protocol messages; stderr contains diagnostics.
+stdin/stdout. Stdout contains only protocol messages; protocol execution does not
+write diagnostics to stderr.
 There are no batch messages. A process serves one initialized attempt and exits
 when its run succeeds, fails or is canceled. Keep stdin open and service callbacks
 until the final run response; piping only a run request and closing stdin cancels
@@ -188,6 +189,10 @@ On failure, return an error instead of a substitute verdict:
 
 The host registers and executes the request's source and result tools, enforces
 access to the approved repositories, and owns model execution and durable state.
+Protocol execution does not write diagnostics to stderr. Use the structured
+stdout error and process exit status; an unread stderr pipe cannot block the
+attempt. Static command-usage errors may still use stderr.
+
 The CLI does not execute source tool descriptors itself. Credentials belong in
 the host's execution environment, not protocol arguments or source descriptors.
 Unknown parameters, malformed or duplicate replies, and replies to unknown IDs

@@ -71,11 +71,22 @@ type Output = {
 };
 type Pending = { resolve(value: unknown): void; reject(error: Error): void };
 
+function writeDiagnostic(stream: Output, message: string): void {
+  const ignoreError = () => {};
+  const release = () => stream.removeListener?.("error", ignoreError);
+  stream.on?.("error", ignoreError);
+  try {
+    // Diagnostics never delay the result; retain their observer for late errors.
+    stream.write(message, () => setImmediate(release));
+  } catch {
+    setImmediate(release);
+  }
+}
+
 /** One isolated attempt: all source, model and durable state operations belong to the host. */
 export async function runRecordDedupeProtocol(
   input: Readable,
   output: Output,
-  diagnostics: Output,
   signal?: AbortSignal,
 ): Promise<number> {
   const lines = createInterface({ input, crlfDelay: Infinity });
@@ -118,13 +129,6 @@ export async function runRecordDedupeProtocol(
       outputFailed = true;
       // A closed output pipe cannot receive a final protocol error.
     } finally {
-      if (error) {
-        try {
-          diagnostics.write(`codex-security: ${error.message}\n`);
-        } catch {
-          /* Diagnostics must not prevent pending work from terminating. */
-        }
-      }
       lines.close();
       signal?.removeEventListener("abort", aborted);
       input.removeListener("error", inputError);
@@ -304,7 +308,8 @@ export async function runRecordDedupeCli(
   diagnostics: Output,
 ): Promise<number> {
   if (argv.length !== 2 || argv[0] !== "dedupe" || argv[1] !== "--records") {
-    diagnostics.write(
+    writeDiagnostic(
+      diagnostics,
       "codex-security: dedupe --records takes no scan, model, output or other flags; pass options in the run request.\n",
     );
     return 2;
@@ -317,7 +322,6 @@ export async function runRecordDedupeCli(
     return await runRecordDedupeProtocol(
       process.stdin,
       output,
-      diagnostics,
       controller.signal,
     );
   } finally {
