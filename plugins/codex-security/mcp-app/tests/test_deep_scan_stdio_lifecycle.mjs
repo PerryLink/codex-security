@@ -33,7 +33,7 @@ const parentSandboxState = {
 if (process.platform === "win32") {
   console.log("deep scan stdio lifecycle test skipped on Windows (POSIX fake Codex executable)");
 } else {
-  for (const mode of ["cancel-after-seal", "cancel-finalizer", "cancel-finalizer-failure", "late-rejoin", "late-rejoin-failure", "detached", "joined", "remote", "failure", "active-failure", "remote-replay", "lost-response"]) {
+  for (const mode of ["cancel-after-seal", "cancel-finalizer", "cancel-finalizer-failure", "late-rejoin", "late-rejoin-failure", "detached", "joined", "remote", "failure", "active-failure", "remote-replay", "lost-response", "lost-response-corrupt", "lost-response-remove"]) {
     await testDeepScanDetachedCompletion(mode);
   }
   await testDeepScanStdioLifecycle();
@@ -66,7 +66,7 @@ async function testDeepScanDetachedCompletion(mode) {
   await writeFile(controlPath, "wait-for-completion");
   await writePythonWrapper(pythonWrapperPath);
   if (mode === "cancel-after-seal") await writeFile(committedControlPath, "wait");
-  if (mode !== "detached") await writeFile(finalizerControlPath, mode === "joined" || mode === "remote" || mode.startsWith("cancel-finalizer") || mode.startsWith("late-rejoin") ? "wait" : mode === "active-failure" || mode === "remote-replay" ? "failure" : mode);
+  if (mode !== "detached") await writeFile(finalizerControlPath, mode === "joined" || mode === "remote" || mode.startsWith("cancel-finalizer") || mode.startsWith("late-rejoin") ? "wait" : mode === "active-failure" || mode === "remote-replay" ? "failure" : mode.startsWith("lost-response") ? "lost-response" : mode);
   await writeFakeCodex(fakeCodexPath);
   if (!installedPluginRoot) await bundleServer(serverBundlePath);
   const environment = {
@@ -225,7 +225,7 @@ async function testDeepScanDetachedCompletion(mode) {
       assert.equal((await readJsonLines(finalizerLogPath)).length, 1);
       await rm(finalizerControlPath);
     }
-    if (mode === "failure" || mode === "active-failure" || mode === "remote-replay" || mode === "lost-response") {
+    if (mode === "failure" || mode === "active-failure" || mode === "remote-replay" || mode.startsWith("lost-response")) {
       await waitFor(() => server.stderrEvents().some((event) => event.event === "coordinator_publication_pending"),
         "public finalization failure to remain pending");
       if (mode === "active-failure") {
@@ -242,7 +242,7 @@ async function testDeepScanDetachedCompletion(mode) {
       assert.deepEqual(pending.finalizationInput, finished.finalizationInput);
       assert.equal((await readJsonLines(finalizerLogPath)).length, 1, "the owner does not add a retry layer");
       const beforeReplay = await runWorkbench(environment, ["get-scan", "--scan-id", scanId]);
-      assert.equal(beforeReplay.scan.progress.status, mode !== "lost-response" ? "running" : "complete");
+      assert.equal(beforeReplay.scan.progress.status, !mode.startsWith("lost-response") ? "running" : "complete");
       const manifestBeforeReplay = await readFile(path.join(finished.scanDir, "scan-manifest.json"));
       let replayServer = server;
       if (mode === "remote-replay") {
@@ -254,10 +254,29 @@ async function testDeepScanDetachedCompletion(mode) {
           clientInfo: { name: "reconstructed-finalizer", version: "0.1.0" },
         }));
       }
+      const damagedArtifact = path.join(finished.scanDir, "findings.json");
+      if (mode === "lost-response-corrupt") {
+        await writeFile(damagedArtifact, Buffer.concat([await readFile(damagedArtifact), Buffer.from(" ")]));
+      } else if (mode === "lost-response-remove") {
+        await rm(damagedArtifact);
+      }
       const rejoined = await replayServer.request(5, "tools/call", toolCall("start_codex_security_deep_scan", { scanId }, threadId));
+      if (mode === "lost-response-corrupt" || mode === "lost-response-remove") {
+        assert.equal(rejoined.result?.isError, true, "completion replay must reject altered sealed artifacts");
+        assert.match(rejoined.result.content.map((item) => item.text).join(" "),
+          /sealed artifact changed or is missing|findings\.json: expected a file/);
+        assert.deepEqual(await readFile(path.join(finished.scanDir, "scan-manifest.json")), manifestBeforeReplay);
+        assert.deepEqual(await readFile(path.join(finished.scanDir, finished.finalizationInput.resultPath)), selectedBytes);
+        assert.equal((await readJsonLines(startLogPath)).length, 3, "rejected replay launches no workers");
+        const afterReplay = await runWorkbench(environment, ["get-scan", "--scan-id", scanId]);
+        assert.equal(afterReplay.scan.progress.status, "complete");
+        assert.equal(afterReplay.scan.executionAttribution.completedAt, beforeReplay.scan.executionAttribution.completedAt);
+        console.log("native selected completion integrity passed", mode, scanId);
+        return;
+      }
       assertNoError(rejoined);
       assert.equal(rejoined.result.structuredContent.manifestPath, path.join(finished.scanDir, "scan-manifest.json"));
-      if (mode === "lost-response") {
+      if (mode.startsWith("lost-response")) {
         assert.deepEqual(await readFile(path.join(finished.scanDir, "scan-manifest.json")), manifestBeforeReplay);
         const afterReplay = await runWorkbench(environment, ["get-scan", "--scan-id", scanId]);
         assert.equal(afterReplay.scan.progress.status, "complete");
