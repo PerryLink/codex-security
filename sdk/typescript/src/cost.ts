@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { open, readdir, readFile, realpath } from "node:fs/promises";
+import { open, readdir, realpath } from "node:fs/promises";
 import { join } from "node:path";
 import {
   estimateScanCost,
@@ -16,6 +16,7 @@ import {
   attributedScanThreads,
   isAttributedScanEvent,
   isScanArtifactDirectory,
+  recordedScanCodexHome,
   sessionParentThreadId,
   sessionStartedAt,
   type ScanExecutionAttribution,
@@ -267,29 +268,8 @@ export class ScanCostTracker {
     const unreadable: Array<{ session: SessionUsage; error: unknown }> = [];
     const homes = new Set([this.#options.codexHome]);
     if (this.#options.scanDirectory !== undefined) {
-      try {
-        const saved: unknown = JSON.parse(
-          await readFile(
-            join(
-              this.#options.scanDirectory,
-              "artifacts",
-              "deep_discovery",
-              "execution-settings.json",
-            ),
-            "utf8",
-          ),
-        );
-        if (
-          isRecord(saved) &&
-          saved["version"] === 1 &&
-          isRecord(saved["settings"])
-        ) {
-          const home = saved["settings"]["codexHome"];
-          if (typeof home === "string" && home !== "") homes.add(home);
-        }
-      } catch (error) {
-        if (!isMissingFile(error)) throw error;
-      }
+      const home = await recordedScanCodexHome(this.#options.scanDirectory);
+      if (home !== undefined) homes.add(home);
     }
     // Recovery restores workers to their recorded home; the SDK parent can
     // continue in the current home. Apply the same scan membership to both.

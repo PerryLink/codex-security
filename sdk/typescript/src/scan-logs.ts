@@ -1,5 +1,4 @@
 import { createReadStream } from "node:fs";
-import { readFile } from "node:fs/promises";
 import { basename, dirname, join, relative } from "node:path";
 import { createInterface } from "node:readline";
 import { sessionFiles } from "./cost.js";
@@ -9,6 +8,7 @@ import {
   attributedScanThreads,
   isAttributedScanEvent,
   isScanArtifactDirectory,
+  recordedScanCodexHome,
   sessionParentThreadId,
   sessionStartedAt,
   type ScanExecutionAttribution,
@@ -119,29 +119,8 @@ export async function readScanLogs(options: ScanLogOptions) {
       : options.codexHome,
   );
   if (options.scanDirectory !== undefined) {
-    try {
-      const saved: unknown = JSON.parse(
-        await readFile(
-          join(
-            options.scanDirectory,
-            "artifacts",
-            "deep_discovery",
-            "execution-settings.json",
-          ),
-          "utf8",
-        ),
-      );
-      if (
-        isRecord(saved) &&
-        saved["version"] === 1 &&
-        isRecord(saved["settings"])
-      ) {
-        const home = saved["settings"]["codexHome"];
-        if (typeof home === "string" && home !== "") homes.add(home);
-      }
-    } catch (error) {
-      if (!isRecord(error) || error["code"] !== "ENOENT") throw error;
-    }
+    const home = await recordedScanCodexHome(options.scanDirectory);
+    if (home !== undefined) homes.add(home);
   }
   // Recovered workers retain their original home; the parent can use the current home.
   for (const directory of ["sessions", "archived_sessions"]) {
