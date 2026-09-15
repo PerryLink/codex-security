@@ -16,6 +16,7 @@ import {
 } from "../../../../sdk/typescript/src/config.js";
 import { ScanSettingsSchema } from "../../../../sdk/typescript/src/scan-settings.js";
 import { accountStatus } from "../../../../sdk/typescript/src/auth.js";
+import { CodexSecurityError } from "../../../../sdk/typescript/src/errors.js";
 import { resolveDeepScanConfig } from "../../../../sdk/typescript/src/deep-config.js";
 import type { ScanResult } from "../../../../sdk/typescript/src/result.js";
 import {
@@ -168,20 +169,24 @@ export async function prepareNativeScan(
       ((modelProvider !== undefined && modelProvider !== "openai") ||
         provider !== undefined));
   if (!configuredProvider && (options.auth ?? "auto") === "auto") {
-    if (
-      config.forced_login_method === "chatgpt" ||
-      (!environment.CODEX_API_KEY?.trim() &&
-        environment.OPENAI_API_KEY?.trim() &&
-        (
-          await accountStatus(
-            { command: environment.CODEX_CLI_PATH },
-            selectedScanEnvironment(environment, "chatgpt"),
-            signal,
-            config,
-          )
-        ).authenticated)
-    )
+    if (config.forced_login_method === "chatgpt") {
       options.auth = "chatgpt";
+    } else if (
+      !environment.CODEX_API_KEY?.trim() &&
+      environment.OPENAI_API_KEY?.trim()
+    ) {
+      const status = await accountStatus(
+        { command: environment.CODEX_CLI_PATH },
+        selectedScanEnvironment(environment, "chatgpt"),
+        signal,
+        config,
+      );
+      if (status.authenticated) options.auth = "chatgpt";
+      else if (!/not logged in|unauthenticated/i.test(status.details))
+        throw new CodexSecurityError(
+          status.details || "Could not determine Codex account status.",
+        );
+    }
   }
   const selectedEnvironment = configuredProvider
     ? environment

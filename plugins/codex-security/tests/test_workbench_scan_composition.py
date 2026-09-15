@@ -132,6 +132,21 @@ def test_native_parent_binds_once_and_keeps_native_claim(tmp_path: Path) -> None
     assert first["claimToken"] == token
     assert run_workbench(state, *bind, input_text=json.dumps(registration))["threadId"] is None
     assert run_workbench(state, *arguments)["scan"]["scanId"] == scan["scanId"]
+    context_args = (
+        "update-scan-context",
+        "--scan-id",
+        scan["scanId"],
+        "--thread-id",
+        "native-owner",
+        "--claim-token",
+        token,
+    )
+    assert (
+        run_workbench(state, *context_args, "--user-context", "Before merger.")["scan"][
+            "userContext"
+        ]
+        == "Before merger."
+    )
     rejected = run_workbench(
         state,
         "set-scan-thread",
@@ -151,6 +166,35 @@ def test_native_parent_binds_once_and_keeps_native_claim(tmp_path: Path) -> None
         "sdk-execution",
         "--claim-token",
         token,
+    )
+    assert (
+        run_workbench(state, *context_args, "--user-context", "After merger.")["scan"][
+            "userContext"
+        ]
+        == "After merger."
+    )
+    for owner, claim in (
+        ("other-owner", token),
+        ("sdk-execution", token),
+        ("native-owner", "00000000-0000-4000-8000-000000000000"),
+    ):
+        rejected = run_workbench(
+            state,
+            "update-scan-context",
+            "--scan-id",
+            scan["scanId"],
+            "--thread-id",
+            owner,
+            "--claim-token",
+            claim,
+            "--user-context",
+            "Unauthorized replacement.",
+            check=False,
+        )
+        assert rejected["returncode"] != 0
+    assert (
+        run_workbench(state, "get-scan", "--scan-id", scan["scanId"])["scan"]["userContext"]
+        == "After merger."
     )
     rebound = run_workbench(state, *bind, input_text=json.dumps(registration))
     assert rebound["threadId"] == "sdk-execution"

@@ -96,7 +96,11 @@ def update_context(
                 raise SystemExit("This scan does not belong to the selected workspace.")
         else:
             thread_id = optional_text(args.thread_id, maximum=512)
-            owning_thread_id = scan["continuation_thread_id"] or workspace["thread_id"]
+            owning_thread_id = (
+                scan["deep_scan_owner_thread_id"]
+                or scan["continuation_thread_id"]
+                or workspace["thread_id"]
+            )
             if thread_id is None or thread_id != owning_thread_id:
                 raise SystemExit("This scan does not belong to the current Codex thread.")
             require_current_continuation(

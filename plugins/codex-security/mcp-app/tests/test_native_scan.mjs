@@ -165,6 +165,10 @@ if (process.argv.includes("login")) {
     openai: process.env.OPENAI_API_KEY,
     argv: process.argv.slice(2),
   }));
+  if (fs.existsSync(${JSON.stringify(join(root, "account-error"))})) {
+    console.error("Could not access the selected keyring");
+    process.exit(2);
+  }
   const authenticated = fs.existsSync(${JSON.stringify(join(root, "account-present"))});
   console.error(authenticated ? "Logged in using ChatGPT" : "Not logged in");
   process.exit(authenticated ? 0 : 1);
@@ -318,6 +322,67 @@ console.log(JSON.stringify({ type: "turn.completed", usage: { input_tokens: 0, c
           assert.equal(process.env.OPENAI_API_KEY, "synthetic-competing-key");
         }
       }
+      await writeFile(join(root, "account-error"), "synthetic");
+      for (const [provider, providerToml] of [
+        [undefined, ""],
+        [{ requires_openai_auth: true }, "requires_openai_auth = true\n"],
+        [
+          { requires_openai_auth: true, env_key: "OPENAI_API_KEY" },
+          'requires_openai_auth = true\nenv_key = "OPENAI_API_KEY"\n',
+        ],
+        [
+          { auth: { type: "command", command: "synthetic-auth-provider" } },
+          '[model_providers.custom.auth]\ntype = "command"\ncommand = "synthetic-auth-provider"\n',
+        ],
+      ]) {
+        const config = {
+          ...accountConfig,
+          ...(provider && {
+            model_provider: "custom",
+            model_providers: { custom: provider },
+          }),
+        };
+        await writeFile(
+          join(root, "config.toml"),
+          'cli_auth_credentials_store = "file"\nforced_chatgpt_workspace_id = "synthetic-workspace"\n' +
+            (provider
+              ? 'model_provider = "custom"\n[model_providers.custom]\n' +
+                providerToml
+              : ""),
+        );
+        for (const recipe of [undefined, { auth: "auto", config }]) {
+          await rm(join(root, "login.json"), { force: true });
+          if (provider?.env_key || provider?.auth) {
+            const prepared = await prepareNativeScan({ ...input(), recipe });
+            assert.equal(prepared.options.preserveProviderEnvironment, true);
+            assert.equal(
+              prepared.client.dependencies.environment.OPENAI_API_KEY,
+              "synthetic-competing-key",
+            );
+            await assert.rejects(readFile(join(root, "login.json")), {
+              code: "ENOENT",
+            });
+          } else {
+            await assert.rejects(prepareNativeScan({ ...input(), recipe }), {
+              name: "CodexSecurityError",
+              message: "Could not access the selected keyring",
+            });
+            const login = JSON.parse(
+              await readFile(join(root, "login.json"), "utf8"),
+            );
+            assert.ok(login.argv.includes('cli_auth_credentials_store="file"'));
+            assert.ok(
+              login.argv.includes(
+                'forced_chatgpt_workspace_id="synthetic-workspace"',
+              ),
+            );
+            assert.equal(login.openai, undefined);
+            assert.equal(login.codex, undefined);
+          }
+          assert.equal(process.env.OPENAI_API_KEY, "synthetic-competing-key");
+        }
+      }
+      await rm(join(root, "account-error"));
       await writeFile(join(root, "account-present"), "synthetic");
       await writeFile(
         join(root, "config.toml"),
@@ -333,7 +398,7 @@ console.log(JSON.stringify({ type: "turn.completed", usage: { input_tokens: 0, c
           },
         },
       ]) {
-        await rm(join(root, "login.json"));
+        await rm(join(root, "login.json"), { force: true });
         const prepared = await prepareNativeScan({ ...input(), recipe });
         assert.equal(prepared.options.preserveProviderEnvironment, undefined);
         assert.equal(prepared.options.auth, "chatgpt");
