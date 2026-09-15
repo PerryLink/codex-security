@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { build } from "esbuild";
 
@@ -18,12 +18,15 @@ export async function testDeepScanPublication({
   fixtureRun, FakeStore, FakeExecutor, DeepScanCoordinator, deferred,
   immediateClock, eventually, standardScanDraft,
 }) {
-  async function testDeadlineRetainsUnfinishedPassForFollowUp(resume) {
+  async function testDeadlineRetainsUnfinishedPassForFollowUp(resume, archive = false) {
     const fixture = await fixtureRun({ workers: 1, subagents: 0, stopAfterNoNew: 99, maxDiscoveryRuns: 8 });
     fixture.run.createdAt = new Date(immediateClock.now()).toISOString();
     const store = new FakeStore(fixture.run);
+    const retryGate = deferred();
     const executor = new FakeExecutor({
-      blockDiscoveryAfterCalls: 1, discoveryCandidateId: "candidate-1", dedupNewFindings: [1],
+      blockDiscoveryAfterCalls: archive ? 2 : 1,
+      discoveryGates: archive ? { "discovery-0002": retryGate.promise } : undefined,
+      discoveryCandidateId: "candidate-1", dedupNewFindings: [1],
     });
     const completed = [];
     const options = {
@@ -42,10 +45,18 @@ export async function testDeepScanPublication({
     const unfinished = [...store.workers.values()].find((worker) => (
       worker.kind === "discovery" && worker.status === "running"
     ));
-    const checkpoint = path.join(unfinished.artifactDir, "checkpoints", `${"a".repeat(64)}.json`);
+    const workerRoot = path.dirname(unfinished.artifactDir);
+    let checkpoint = path.join(unfinished.artifactDir, "checkpoints", `${"a".repeat(64)}.json`);
     const raw = { ...standardScanDraft(fixture.run.scanId, "unfinished-candidate", "discovery-0002"), complete: false };
     await mkdir(path.dirname(checkpoint), { recursive: true });
     await writeFile(checkpoint, JSON.stringify(raw));
+    if (archive) {
+      executor.options.malformedDiscoveryAttempts = 1;
+      retryGate.resolve();
+      await eventually(() => executor.discoveryCalls === 3 && executor.runningDiscovery === 1);
+      checkpoint = path.join(workerRoot, "attempts", "attempt-01", "checkpoints", path.basename(checkpoint));
+      assert.deepEqual(await readdir(unfinished.artifactDir), [], "validation retry archives the checkpoint before its next attempt");
+    }
     let terminal = await coordinator.wait(undefined, 5_000);
     if (resume) {
       assert.equal(terminal?.status, "canceled");
@@ -67,7 +78,7 @@ export async function testDeepScanPublication({
     assert.equal(terminal.terminalReason, "capped");
     assert.equal(terminal.dispatchedCount, 2);
     assert.equal(store.failCalls, 0);
-    assert.equal(executor.discoveryCalls, 2);
+    assert.equal(executor.discoveryCalls, archive ? 3 : 2);
     assert.equal(executor.runningDiscovery, 0);
     assert.equal(executor.dedupCalls, 1);
     assert.equal(store.dedupCommits.length, 1);
@@ -80,9 +91,9 @@ export async function testDeepScanPublication({
     assert.deepEqual(completed[0].findings.map((finding) => finding.provenance.candidateId), ["candidate-1"]);
     assert.equal(completed[0].coverage.completeness, "partial");
     assert.equal(completed[0].coverage.deferred.length, 1);
-    assert.ok(completed[0].coverage.deferred[0].reason.includes(
-      path.relative(fixture.run.scanDir, unfinished.artifactDir).split(path.sep).join("/"),
-    ));
+    assert.ok(completed[0].coverage.deferred[0].reason.endsWith(
+      `${path.relative(fixture.run.scanDir, workerRoot).split(path.sep).join("/")}.`,
+    ), "the evidence location covers current output and archived attempts");
   }
 
   async function testDiscoveryDeadlineDrainsActiveReducerAndPreservesFindings() {
@@ -303,6 +314,7 @@ export async function testDeepScanPublication({
 
   await testDeadlineRetainsUnfinishedPassForFollowUp(false);
   await testDeadlineRetainsUnfinishedPassForFollowUp(true);
+  await testDeadlineRetainsUnfinishedPassForFollowUp(true, true);
   await testDiscoveryDeadlineDrainsActiveReducerAndPreservesFindings();
   await testPublicationWaitsForAllAcceptedBatchResults();
   await testIndependentPassCoveragePreservesConflictingOutcomesAndEvidence();

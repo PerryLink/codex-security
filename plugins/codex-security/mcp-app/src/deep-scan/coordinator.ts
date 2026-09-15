@@ -99,7 +99,7 @@ export class DeepScanCoordinator {
     this.deadlineInterruptedPasses = new Set((this.state.persistedWorkers ?? [])
       .filter((worker) => worker.kind === "discovery" && worker.status === "canceled"
         && worker.error === "deep_scan_discovery_deadline_reached")
-      .map((worker) => worker.artifactDir));
+      .map((worker) => dirname(worker.artifactDir)));
     this.clock = options.clock ?? systemClock;
     this.log = options.log ?? (() => undefined);
     this.artifacts = createDeepScanArtifacts(this.state.scanDir);
@@ -687,7 +687,7 @@ export class DeepScanCoordinator {
               );
             }
           } else if (this.discoveryDeadlineReached) {
-            this.deadlineInterruptedPasses.add(join(this.artifacts.workersRoot, label, "output"));
+            this.deadlineInterruptedPasses.add(join(this.artifacts.workersRoot, label));
           } else if (!this.discoveryAbortController.signal.aborted) {
             throw new Error(`Discovery worker ${workerId} was canceled unexpectedly.`);
           }

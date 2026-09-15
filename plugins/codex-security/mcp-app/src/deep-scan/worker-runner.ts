@@ -7,11 +7,7 @@ import {
   validateReducerArtifacts
 } from "./artifact-validation.js";
 import type { DeepReductionInput, ReducerArtifactValidation } from "./artifact-validation.js";
-import {
-  archiveDirectory,
-  discoveryArtifacts,
-  writePrivateFile
-} from "./artifacts.js";
+import { archiveDirectory, writePrivateFile } from "./artifacts.js";
 import type { DeepScanArtifacts } from "./artifacts.js";
 import {
   boundedDeepScanErrorMessage,
@@ -99,7 +95,7 @@ export class DeepScanWorkerRunner {
     const artifactDir = join(workerRoot, "output");
     const promptPath = join(workerRoot, "prompt.md");
     const promptRoot = join(workerRoot, "prompts");
-    const files = discoveryArtifacts(artifactDir);
+    const resultPath = join(artifactDir, "result.json");
     await fs.mkdir(artifactDir, { recursive: true });
     const feedbackPath = join(
       artifacts.scanDir,
@@ -140,7 +136,7 @@ export class DeepScanWorkerRunner {
       artifactContext: { root: artifactDir, layout: "worker" },
       subagents: run.config.subagents,
       validate: async () => {
-        const result = await validateDiscoveryArtifacts(artifacts, files.resultPath, run.scanId);
+        const result = await validateDiscoveryArtifacts(artifacts, resultPath, run.scanId);
         discoveryCoverage = result.coverage;
       },
       beforeRetry: async (attempt) => {
@@ -160,7 +156,7 @@ export class DeepScanWorkerRunner {
       outcome = { ...outcome, status: "canceled" };
     }
     if (!discoveryCoverage) {
-      await fs.rm(files.resultPath, { force: true });
+      await fs.rm(resultPath, { force: true });
     }
     if (outcome.status === "failed") {
       return {
@@ -187,7 +183,7 @@ export class DeepScanWorkerRunner {
       artifactDir,
       attempt: outcome.attempt,
       threadId: outcome.threadId,
-      resultManifestPath: files.resultPath
+      resultManifestPath: resultPath
     };
     let persisted: PersistedDeepScanWorker;
     try {
@@ -211,7 +207,7 @@ export class DeepScanWorkerRunner {
       status: "succeeded",
       worker: {
         id: workerId,
-        resultPath: files.resultPath,
+        resultPath,
         completionSequence: persisted.completionSequence,
         coverage: discoveryCoverage
       }
@@ -234,10 +230,7 @@ export class DeepScanWorkerRunner {
     await fs.mkdir(artifactDir, { recursive: true });
     const basePrompt = renderDedupPrompt({
       reducerLabel,
-      discoveries: consumed.map((worker) => ({
-        workerId: worker.id,
-        resultPath: worker.resultPath
-      }))
+      claimedWorkerIds: consumed.map((worker) => worker.id)
     });
     await writePrivateFile(promptPath, basePrompt);
     await this.options.store.claimDedup({

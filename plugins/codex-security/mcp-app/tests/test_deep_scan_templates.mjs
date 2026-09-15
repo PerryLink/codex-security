@@ -63,10 +63,7 @@ assert.equal(withFeedback.includes(JSON.stringify(feedbackPath)), true);
 
 const dedup = renderDedupPrompt({
   reducerLabel: "dedup-0001",
-  discoveries: [{
-    workerId: "worker-001",
-    resultPath: "/fixture/worker/result.json"
-  }]
+  claimedWorkerIds: ["worker-001"]
 });
 const dedupContext = firstJsonBlock(dedup);
 assert.doesNotMatch(dedup, /\bcoverage\b/i);
@@ -91,7 +88,7 @@ for (const field of [
 
 const previousReduction = firstJsonBlock(renderDedupPrompt({
   reducerLabel: "dedup-0002",
-  discoveries: []
+  claimedWorkerIds: []
 }));
 assert.deepEqual(previousReduction, {
   reducerLabel: "dedup-0002",

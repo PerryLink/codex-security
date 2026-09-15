@@ -8,10 +8,6 @@ export interface DeepScanArtifacts {
   dedupRoot: string;
 }
 
-export interface DiscoveryArtifacts {
-  resultPath: string;
-}
-
 export function createDeepScanArtifacts(scanDir: string): DeepScanArtifacts {
   const deepRoot = join(scanDir, "artifacts", "deep_discovery");
   return {
@@ -19,12 +15,6 @@ export function createDeepScanArtifacts(scanDir: string): DeepScanArtifacts {
     deepRoot,
     workersRoot: join(deepRoot, "workers"),
     dedupRoot: join(deepRoot, "dedup")
-  };
-}
-
-export function discoveryArtifacts(artifactDir: string): DiscoveryArtifacts {
-  return {
-    resultPath: join(artifactDir, "result.json")
   };
 }
 
