@@ -17,9 +17,13 @@ const bundle = await build({
   platform: "node",
   write: false
 });
-const { captureDeepScanExecutionSettings: captureSettings, restoredDeepScanWorkerSettings: restoreSettings, loadDeepScanExecutionSettings: loadSettings } = await import(
+const { captureDeepScanExecutionSettings: captureSettings, restoredDeepScanWorkerSettings: restoreSettings, loadDeepScanExecutionSettings: loadRecordedSettings } = await import(
   `data:text/javascript;base64,${Buffer.from(bundle.outputFiles[0].contents).toString("base64")}`
 );
+const snapshots = new Map();
+const loadSettings = (directory, original, ...rest) => loadRecordedSettings(directory, {
+  ...original, executionSettings: snapshots.get(directory)
+}, ...rest);
 const root = await mkdtemp(join(tmpdir(), "deep-settings-"));
 try {
   const settings = {
@@ -51,7 +55,9 @@ try {
   const writeSnapshot = async (directory, value) => {
     const path = join(directory, "artifacts", "deep_discovery", "execution-settings.json");
     await mkdir(join(directory, "artifacts", "deep_discovery"), { recursive: true });
-    await writeFile(path, JSON.stringify({ version: 1, settings: value }, null, 2) + "\n");
+    const snapshot = { version: 1, settings: structuredClone(value) };
+    snapshots.set(directory, snapshot);
+    await writeFile(path, JSON.stringify(snapshot, null, 2) + "\n");
   };
   await assert.rejects(loadSettings(join(root, "missing")), /no recorded original execution settings/);
   await writeSnapshot(join(root, "one"), settings);
@@ -362,8 +368,18 @@ access_key_id = "synthetic-secret"
   assert.equal(unknown.nativeServiceTierAbsent, undefined);
   const unsupported = JSON.stringify({ version: 99, settings });
   await writeFile(savedPath, unsupported);
+  assert.deepEqual(await loadSettings(join(root, "one")), settings,
+    "artifact versions and settings cannot replace trusted run state");
+  snapshots.set(join(root, "one"), { version: 99, settings });
   await assert.rejects(loadSettings(join(root, "one")), /unsupported/);
   assert.equal(await readFile(savedPath, "utf8"), unsupported);
+  await assert.rejects(loadRecordedSettings(join(root, "one"), {
+    workflowVersion: "deep-security-scan/v2"
+  }), /no recorded original/, "an existing artifact cannot establish missing launch provenance");
+  snapshots.set(join(root, "one"), { version: 1, settings });
+  await rm(savedPath);
+  assert.deepEqual(await loadSettings(join(root, "one")), settings,
+    "removing the artifact does not remove the trusted launch selection");
 } finally {
   await rm(root, { recursive: true, force: true });
 }

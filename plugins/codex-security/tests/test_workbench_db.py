@@ -1239,7 +1239,7 @@ def test_workbench_persists_progress_and_indexes_completed_findings(tmp_path: Pa
             )
         }
         assert tables == EXPECTED_TABLES
-        assert connection.execute("SELECT COUNT(*) FROM schema_migrations").fetchone() == (45,)
+        assert connection.execute("SELECT COUNT(*) FROM schema_migrations").fetchone() == (46,)
         assert connection.execute("SELECT COUNT(*) FROM findings").fetchone() == (1,)
         assert connection.execute("SELECT COUNT(*) FROM finding_locations").fetchone() == (1,)
 
@@ -4257,10 +4257,7 @@ def test_completed_finding_projects_writeup_and_poc_artifact_paths(tmp_path: Pat
     (fixtures / "payload.txt").write_text("../outside\n")
     outside = tmp_path / "outside.txt"
     outside.write_text("must not be projected\n")
-    try:
-        (poc / "outside-link.txt").symlink_to(outside)
-    except OSError:
-        pass
+    (poc / "outside-link.txt").symlink_to(outside)
 
     completed = run_workbench(state_dir, "complete-scan", "--scan-id", scan_id)
     assert completed["scan"]["findings"][0]["artifactPaths"] == [
@@ -4373,7 +4370,6 @@ def test_workbench_preserves_dirty_git_scan_after_worktree_changes(tmp_path: Pat
     scan_id = str(started["results"]["scanId"])
     contract = started["results"]["contract"]["target"]
     assert contract["allowedKinds"] == ["git_worktree"]
-    snapshot_digest = str(contract["requiredSnapshotDigest"])
     write_completed_contract(
         Path(str(started["results"]["scanDir"])),
         scan_id,

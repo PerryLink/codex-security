@@ -30,6 +30,7 @@ export type WorkbenchRunner = (
   args: string[],
   input?: string,
   selectFinalization?: boolean,
+  withExecutionSettings?: boolean,
 ) => Promise<JsonObject>;
 
 const WORKFLOW_VERSION = "deep-security-scan/v1";
@@ -177,7 +178,7 @@ export class WorkbenchDeepScanStore implements DeepScanStore {
       input.threadId,
       ...this.coordinatorLeaseArgs(input.scanId),
       ...(input.handoffClaimToken ? ["--claim-token", input.handoffClaimToken] : [])
-    ]);
+    ], false, undefined, false, true);
     const run = parseDeepScan(result);
     const disposition = result.coordinatorDisposition;
     if (disposition !== "claimed" && disposition !== "adopted" && disposition !== "observing") {
@@ -438,12 +439,13 @@ export class WorkbenchDeepScanStore implements DeepScanStore {
     retryTransientFailure = false,
     input?: string,
     selectFinalization = false,
+    withExecutionSettings = false,
   ): Promise<JsonObject> {
     const operation = this.writeTail.then(async () => {
       try {
         return retryTransientFailure
           ? await this.runIdempotentPersistence(args, input, selectFinalization)
-          : await this.runWorkbench(args, input, selectFinalization);
+          : await this.runWorkbench(args, input, selectFinalization, withExecutionSettings);
       } catch (error) {
         const scanId = argumentValue(args, "--scan-id");
         if (scanId && isStaleCoordinatorGenerationError(error)) {
@@ -620,6 +622,8 @@ export function parseDeepScan(result: JsonObject): DeepScanRunState {
     workflowVersion: optionalString(value.workflowVersion),
     finalizationInput: parseFinalizationInput(value.finalizationInput),
     usageOwner: parseUsageOwner(value.usageOwner),
+    executionSettings: value.executionSettings == null ? undefined
+      : objectValue(value.executionSettings, "deepScan.executionSettings") as unknown as DeepScanRunState["executionSettings"],
     status,
     phase: deepScanPhase(value.phase),
     coordinatorGeneration: optionalPositiveInteger(value.coordinatorGeneration),

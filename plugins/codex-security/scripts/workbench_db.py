@@ -56,7 +56,6 @@ from finalize_scan_contract import (
     finalize_scan,
     finding_candidate_id,
     open_scan_local_file_descriptor,
-    write_scan_local_bytes,
 )
 from finding_preview import bounded_finding_details
 from workbench import handoff
@@ -1186,19 +1185,13 @@ def complete_budget_exhausted_scan(
                 "Budget-exhausted scan completion requires successfully completed Deep Scan "
                 "discovery."
             )
-        scan_dir = require_canonical_scan_directory(Path(scan["scan_dir"]))
-        candidates = (
-            []
-            if run["manifest_path"] == str(scan_dir / "scan-manifest.json")
-            else budget_exhausted_candidates(scan, scan_dir)
-        )
         warning = optional_text(args.message, maximum=2400)
         if warning is None:
             warning = (
                 f"Deep Scan reached its cost limit after an estimated "
                 f"${measured['estimatedUsd']:.6g}; completed discovery was preserved."
             )
-        budget_exhausted_draft(scan, scan_dir, candidates, warning)
+        saved_results.prepare_budget_draft(_WORKBENCH_DB_CONTEXT, connection, scan, warning)
         warnings = json.loads(scan["completion_warnings_json"])
         if warning not in warnings:
             connection.execute(
@@ -1286,7 +1279,7 @@ def budget_exhausted_draft(
     scan_dir: Path,
     candidates: list[dict[str, Any]],
     warning: str,
-) -> None:
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]] | None:
     documents: dict[str, dict[str, Any]] = {}
     for name in ("scan-manifest.json", "findings.json", "coverage.json"):
         path = artifact_path(scan_dir, name, required=False)
@@ -1310,7 +1303,7 @@ def budget_exhausted_draft(
             saved_results.validate_sealed_budget_draft(
                 _WORKBENCH_DB_CONTEXT, scan, scan_dir, manifest
             )
-            return
+            return None
     else:
         contract = scan_contract(scan)
         target_contract = contract["target"]
@@ -1418,19 +1411,7 @@ def budget_exhausted_draft(
             }
         )
     coverage["completeness"] = "partial"
-    for name, payload in (
-        ("findings.json", findings),
-        ("coverage.json", coverage),
-        ("scan-manifest.json", manifest),
-    ):
-        try:
-            write_scan_local_bytes(
-                scan_dir,
-                name,
-                (json.dumps(payload, allow_nan=False, indent=2, sort_keys=True) + "\n").encode(),
-            )
-        except (ContractError, OSError, TypeError, ValueError) as exc:
-            raise SystemExit(f"Budget-exhausted scan draft could not be saved: {exc}") from exc
+    return manifest, findings, coverage
 
 
 def complete_scan_locked(
@@ -1526,8 +1507,7 @@ def complete_scan_locked(
             scan_dir,
             expected_coverage_mode=expected_coverage_mode(scan),
             completion_binding=completion_binding,
-            # Save the finished Deep result as submitted. Worker drafts and
-            # recovery repairs belong to the stopped-scan path.
+            # Preserve the finished Deep output.
             completion_warnings=warnings if scan["mode"] != "deep" else None,
             draft_documents=saved_results.merge_saved_results(
                 scan_dir,
@@ -1543,6 +1523,9 @@ def complete_scan_locked(
             )
             if scan["mode"] != "deep" and current_manifest_path is not None and not already_sealed
             else None,
+        )
+        saved_results.require_selected_publication(
+            _WORKBENCH_DB_CONTEXT, connection, scan, prepared
         )
         add_warning()
         wrote = True
@@ -2489,7 +2472,7 @@ def require_reviewed_patch_applied(
             checkout = checkout_root
             copy_directory_excluding(target, checkout, excluded)
         else:
-            checkout = copy_git_worktree_files(target, checkout_root, excluded)
+            copy_git_worktree_files(target, checkout_root, excluded)
         arguments = ["apply", "--reverse", "--whitespace=nowarn"]
         if unversioned:
             arguments.append("--no-index")
@@ -3382,6 +3365,8 @@ _WORKBENCH_PUBLICATION_CONTEXT = publication.WorkbenchPublicationContext(
 _WORKBENCH_DB_CONTEXT = saved_results.WorkbenchDbContext(
     ARTIFACTS=ARTIFACTS,
     artifact_path=artifact_path,
+    budget_exhausted_candidates=budget_exhausted_candidates,
+    budget_exhausted_draft=budget_exhausted_draft,
     deep_scan=deep_scan,
     expected_coverage_mode=expected_coverage_mode,
     handoff=handoff,
@@ -3404,8 +3389,7 @@ _WORKBENCH_DB_CONTEXT = saved_results.WorkbenchDbContext(
 )
 
 
-def main(*, select_finalization: bool = False) -> None:
-    # Workbench callers send UTF-8 even when Windows uses a legacy code page.
+def main(*, select_finalization: bool = False, with_execution_settings: bool = False) -> None:
     sys.stdin.reconfigure(encoding="utf-8")
     args = parse_args(__doc__)
     deep_scan.configure(
@@ -3655,6 +3639,8 @@ def main(*, select_finalization: bool = False) -> None:
             result = list_stored_findings(connection, limit=args.limit, offset=args.offset)
         else:
             raise SystemExit(f"Unknown command: {args.command}")
+        if with_execution_settings:
+            deep_scan.include_execution_settings(connection, result)
     print(json.dumps(result, allow_nan=False, sort_keys=True))
 
 

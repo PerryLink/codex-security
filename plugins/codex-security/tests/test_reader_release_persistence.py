@@ -31,7 +31,12 @@ def introduced_metadata(state: Path, scan_dir: Path) -> dict:
         run = connection.execute("SELECT * FROM deep_scan_runs").fetchone()
         context = {
             name: run[name]
-            for name in ("discovery_user_context", "usage_owner_json", "finalization_input_json")
+            for name in (
+                "discovery_user_context",
+                "usage_owner_json",
+                "finalization_input_json",
+                "execution_settings_json",
+            )
             if name in run.keys()
         }
         inputs = list(connection.execute("SELECT * FROM deep_scan_dedup_inputs"))

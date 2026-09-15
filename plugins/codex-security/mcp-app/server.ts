@@ -1670,11 +1670,12 @@ async function runWorkbench(
   args: string[],
   input?: string | Buffer,
   selectFinalization = false,
+  withExecutionSettings = false,
 ): Promise<JsonObject> {
   let pythonCommand: string | undefined;
   try {
     pythonCommand = await resolvePythonCommand();
-    return await executeWorkbenchWithStateSelection(pythonCommand, args, input, selectFinalization);
+    return await executeWorkbenchWithStateSelection(pythonCommand, args, input, selectFinalization, withExecutionSettings);
   } catch (error) {
     const launchError = pythonCommand
       ? missingPythonHelperMessage(error, pythonCommand)
@@ -1694,35 +1695,36 @@ async function executeWorkbenchWithStateSelection(
   args: string[],
   input?: string | Buffer,
   selectFinalization = false,
+  withExecutionSettings = false,
 ): Promise<JsonObject> {
   if (WORKBENCH_COMMANDS_WITHOUT_DATABASE.has(args[0] ?? "")) {
-    return await executeWorkbench(pythonCommand, args, undefined, input, selectFinalization);
+    return await executeWorkbench(pythonCommand, args, undefined, input, selectFinalization, withExecutionSettings);
   }
   if (CONFIGURED_WORKBENCH_STATE_DIR) {
-    return await executeWorkbench(pythonCommand, args, undefined, input, selectFinalization);
+    return await executeWorkbench(pythonCommand, args, undefined, input, selectFinalization, withExecutionSettings);
   }
   if (fallbackWorkbenchStateDir) {
-    return await executeWorkbench(pythonCommand, args, await fallbackWorkbenchStateDir, input, selectFinalization);
+    return await executeWorkbench(pythonCommand, args, await fallbackWorkbenchStateDir, input, selectFinalization, withExecutionSettings);
   }
   if (persistentWorkbenchStateSucceeded) {
-    return await executeWorkbench(pythonCommand, args, undefined, input, selectFinalization);
+    return await executeWorkbench(pythonCommand, args, undefined, input, selectFinalization, withExecutionSettings);
   }
   return await withWorkbenchStateSelectionLock(async () => {
     if (fallbackWorkbenchStateDir) {
-      return await executeWorkbench(pythonCommand, args, await fallbackWorkbenchStateDir, input, selectFinalization);
+      return await executeWorkbench(pythonCommand, args, await fallbackWorkbenchStateDir, input, selectFinalization, withExecutionSettings);
     }
     if (persistentWorkbenchStateSucceeded) {
-      return await executeWorkbench(pythonCommand, args, undefined, input, selectFinalization);
+      return await executeWorkbench(pythonCommand, args, undefined, input, selectFinalization, withExecutionSettings);
     }
     try {
-      const result = await executeWorkbench(pythonCommand, args, undefined, input, selectFinalization);
+      const result = await executeWorkbench(pythonCommand, args, undefined, input, selectFinalization, withExecutionSettings);
       persistentWorkbenchStateSucceeded = true;
       return result;
     } catch (error) {
       if (!isUnwritableSqliteOpenError(error)) throw error;
       const fallbackStateDir = await pinFallbackWorkbenchStateDir();
       logWorkbenchStateFallback();
-      return await executeWorkbench(pythonCommand, args, fallbackStateDir, input, selectFinalization);
+      return await executeWorkbench(pythonCommand, args, fallbackStateDir, input, selectFinalization, withExecutionSettings);
     }
   });
 }
@@ -1747,6 +1749,7 @@ async function executeWorkbench(
   stateDir?: string,
   input?: string | Buffer,
   selectFinalization = false,
+  withExecutionSettings = false,
 ): Promise<JsonObject> {
   const userContextIndex = args.indexOf("--user-context");
   const userContext = userContextIndex === -1 ? undefined : args[userContextIndex + 1];
@@ -1755,8 +1758,10 @@ async function executeWorkbench(
     workbenchArgs.splice(userContextIndex, 2, "--user-context-stdin");
   }
   const workbenchInput = input ?? userContext;
-  const pythonArgs = selectFinalization
-    ? ["-c", "import runpy, sys; script = sys.argv.pop(1); runpy.run_path(script)['main'](select_finalization=True)", workbenchScriptPath(), ...workbenchArgs]
+  const internalInvocation = selectFinalization ? "select_finalization=True"
+    : withExecutionSettings ? "with_execution_settings=True" : undefined;
+  const pythonArgs = internalInvocation
+    ? ["-c", `import runpy, sys; script = sys.argv.pop(1); runpy.run_path(script)['main'](${internalInvocation})`, workbenchScriptPath(), ...workbenchArgs]
     : [workbenchScriptPath(), ...workbenchArgs];
   const execution = execFileAsync(pythonCommand, pythonArgs, {
     cwd: PLUGIN_ROOT,

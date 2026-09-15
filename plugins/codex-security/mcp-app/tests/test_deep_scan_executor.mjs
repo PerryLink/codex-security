@@ -744,6 +744,7 @@ async function testOpenAiCredentialsReachWorker() {
 }
 
 async function testIsolatedReconstructedWorkers() {
+  const launchFailures = [];
   const previousMarker = process.env.FAKE_CODEX_MARKER;
   const originalSpawn = childProcess.spawn;
   const scans = [];
@@ -842,17 +843,24 @@ async function testIsolatedReconstructedWorkers() {
       const recordedScanDir = run.scanDir;
       const snapshotPath = path.join(recordedScanDir, "artifacts", "deep_discovery", "execution-settings.json");
       await assert.rejects(readFile(snapshotPath), { code: "ENOENT" });
-      // This prior release reads the later writer's existing snapshot.
+      assert.equal(run.workflowVersion, "deep-security-scan/v1");
+      // Import the eventual writer's row and projection; this release must not create them.
+      const envelope = { version: 1, settings: saved };
+      const imported = spawnSync(process.env.PYTHON?.trim() || "python3", ["-c",
+        "import json, sqlite3, sys; c=sqlite3.connect(sys.argv[1]); c.execute(\"UPDATE deep_scan_runs SET execution_settings_json = ? WHERE scan_id = ?\", (sys.argv[3], sys.argv[2])); c.commit()",
+        path.join(fixture.root, "state", "workbench.sqlite3"), run.scanId, JSON.stringify(envelope)
+      ], { encoding: "utf8" });
+      assert.equal(imported.status, 0, imported.stderr);
       await mkdir(path.dirname(snapshotPath), { recursive: true });
-      await writeFile(snapshotPath, JSON.stringify({ version: 1, settings: saved }, null, 2) + "\n");
+      await writeFile(snapshotPath, JSON.stringify(envelope) + "\n");
       const snapshot = await readFile(snapshotPath, "utf8");
       const expectedProvider = name === "first" ? undefined
         : { "amazon-bedrock": { aws: { region: "us-west-2", profile: "fixture-profile" } } };
       assert.deepEqual(JSON.parse(snapshot).settings.providerConfig, expectedProvider,
         "recorded provider selections need no persisted catalog definitions");
-      assert.deepEqual(await loadDeepScanExecutionSettings(recordedScanDir), saved);
       const claim = await store.claimCoordinator({ scanId: run.scanId, threadId: beginInput.threadId });
       assert.equal(claim.acquired, true);
+      assert.deepEqual(await loadDeepScanExecutionSettings(recordedScanDir, claim.run), saved);
       const observer = await new WorkbenchDeepScanStore(runWorkbench).begin({
         ...beginInput, model: "observer-model", reasoningEffort: "low"
       });
@@ -863,25 +871,30 @@ async function testIsolatedReconstructedWorkers() {
       const runtimeEnvironment = { ...codexOptions.env };
       const restored = restoredDeepScanWorkerSettings(saved, currentParentSandbox, () => runtimeEnvironment);
       restored.codexOptions.baseUrl = codexOptions.baseUrl;
-      scans.push({ name, fixture, recordedScanDir, currentParentSandbox, config, configPath, promptPath, settings, runtimeEnvironment, snapshotPath, snapshot, providerKeys, expectedProvider,
+      scans.push({ name, fixture, run, readRun: async () => (await new WorkbenchDeepScanStore(runWorkbench).claimCoordinator({ scanId: run.scanId, threadId: beginInput.threadId })).run, recordedScanDir, currentParentSandbox, config, configPath, promptPath, settings, runtimeEnvironment, snapshotPath, snapshot, providerKeys, expectedProvider,
         executor: new CodexSdkWorkerExecutor(restored) });
     }
     childProcess.spawn = (command, args, options) => {
       const scan = scans.find((scan) => options?.env?.FAKE_CODEX_MARKER === scan.fixture.markerPath);
-      if (scan) {
-        const configured = scan.settings.codexOptions.codexPathOverride;
-        assert.ok(command === configured || command === path.toNamespacedPath(configured));
-      }
       return originalSpawn(command, scan ? [scan.fixture.executablePath, ...args] : args, options);
     };
     syncBuiltinESMExports();
 
-    for (const phase of ["fresh", "resume", "reconstructed", "incomplete"]) {
-      if (phase === "reconstructed" || phase === "incomplete") {
+    for (const phase of ["fresh", "resume", "reconstructed-fresh", "reconstructed", "incomplete"]) {
+      if (phase.startsWith("reconstructed") || phase === "incomplete") {
         for (const scan of scans) {
+          scan.run = await scan.readRun();
           // The caller restores recorded selections. Its old config file need
           // not exist; current credentials still come from the selected home/env.
-          if (phase === "reconstructed") await rm(scan.configPath);
+          if (phase === "reconstructed-fresh") await rm(scan.configPath);
+          if (phase.startsWith("reconstructed")) {
+            // The managed parent can edit its output files. Neither a substituted
+            // executable/home nor other settings in that file are launch authority.
+            const rewritten = JSON.parse(scan.snapshot);
+            rewritten.settings.codexPath = process.execPath;
+            rewritten.settings.codexHome = scans.find((other) => other !== scan).settings.codexOptions.env.CODEX_HOME;
+            await writeFile(scan.snapshotPath, JSON.stringify(rewritten));
+          }
           if (phase === "incomplete") {
             const saved = JSON.parse(scan.snapshot);
             for (const key of ["model", "reasoningEffort", "reasoningSummary"]) delete saved.settings[key];
@@ -890,10 +903,12 @@ async function testIsolatedReconstructedWorkers() {
             if (scan.name === "first") delete saved.settings.modelProvider;
             if (scan.name === "first") delete saved.settings.serviceTier;
             await writeFile(scan.snapshotPath, JSON.stringify(saved));
+            // Emulate an older trusted record with missing optional selections.
+            scan.run.executionSettings = saved;
           }
           const snapshotBeforeRead = await readFile(scan.snapshotPath, "utf8");
           const recorded = await loadDeepScanExecutionSettings(scan.recordedScanDir, {
-            ...scan.settings, createdAt: "2026-01-01T00:01:00Z"
+            ...scan.run, ...scan.settings, createdAt: "2026-01-01T00:01:00Z"
           });
           const restored = restoredDeepScanWorkerSettings(recorded, scan.currentParentSandbox, () => scan.runtimeEnvironment);
           restored.codexOptions.baseUrl = scan.settings.codexOptions.baseUrl;
@@ -910,8 +925,8 @@ async function testIsolatedReconstructedWorkers() {
         scan.runtimeEnvironment.CODEX_CLI_PATH = path.join(scan.fixture.root, "observer-codex");
       }
       for (const kind of ["discovery", "dedup"]) {
-        await Promise.all(scans.map(async (scan) => {
-          const resumeThreadId = phase === "fresh" ? undefined : `fixture-${scan.name}-resumed`;
+        const launches = await Promise.allSettled(scans.map(async (scan) => {
+          const resumeThreadId = ["fresh", "reconstructed-fresh"].includes(phase) ? undefined : `fixture-${scan.name}-resumed`;
           const result = await scan.executor.run({
             kind, promptPath: scan.promptPath, workingDirectory: scan.fixture.root,
             subagents: scan.name === "first" ? 0 : 2,
@@ -957,6 +972,11 @@ async function testIsolatedReconstructedWorkers() {
           assert.equal(child.argv.includes("resume"), resumeThreadId !== undefined);
           assert.equal(child.stdin.includes("continuation"), resumeThreadId !== undefined);
         }));
+        for (const [index, launch] of launches.entries()) {
+          if (launch.status === "rejected") {
+            launchFailures.push(`${scans[index].name}/${phase}/${kind}: ${launch.reason.message}`);
+          }
+        }
       }
       if (phase === "fresh") {
         for (const scan of scans) {
@@ -964,6 +984,7 @@ async function testIsolatedReconstructedWorkers() {
         }
       }
     }
+    assert.deepEqual(launchFailures, [], "every actual preflight and worker must retain the original launch selection");
   } finally {
     childProcess.spawn = originalSpawn;
     syncBuiltinESMExports();

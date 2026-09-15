@@ -1,7 +1,8 @@
 #!/usr/bin/env node
+import { existsSync, realpathSync } from "node:fs";
 import { copyFile, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
-import { pathToFileURL } from "node:url";
+import { fileURLToPath } from "node:url";
 import { brotliCompressSync, constants as zlibConstants } from "node:zlib";
 import { execFileSync } from "node:child_process";
 import { build } from "esbuild";
@@ -69,8 +70,8 @@ export async function buildMcpApp({ output }) {
 
 const invokedPath = process.argv[1];
 if (
-  invokedPath !== undefined
-  && pathToFileURL(resolve(invokedPath)).href === import.meta.url
+  invokedPath !== undefined && existsSync(invokedPath)
+  && realpathSync(invokedPath) === realpathSync(fileURLToPath(import.meta.url))
 ) {
   const args = process.argv.slice(2);
   if (args.length !== 2 || args[0] !== "--output") {

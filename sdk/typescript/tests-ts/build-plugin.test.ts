@@ -178,7 +178,7 @@ describe("bundled plugin build", () => {
     expect(result.stderr).toBe("");
   });
 
-  test("builds the MCP runtime with only MCP dependencies and no npm launcher", async () => {
+  test("builds the MCP runtime through a directory alias with only MCP dependencies and no npm launcher", async () => {
     const root = await temporaryDirectory();
     const plugin = join(root, "plugins", "codex-security");
     const mcp = join(plugin, "mcp-app");
@@ -239,10 +239,27 @@ describe("bundled plugin build", () => {
     );
     if (process.platform !== "win32") await chmod(join(bin, launcher), 0o755);
 
+    const alias = join(await temporaryDirectory(), "plugin link");
+    await symlink(
+      root,
+      alias,
+      process.platform === "win32" ? "junction" : "dir",
+    );
     const destination = join(root, "mcp");
     await execFileAsync(
       "node",
-      [join(mcp, "scripts", "build_mcp_app.mjs"), "--output", destination],
+      [
+        join(
+          alias,
+          "plugins",
+          "codex-security",
+          "mcp-app",
+          "scripts",
+          "build_mcp_app.mjs",
+        ),
+        "--output",
+        destination,
+      ],
       {
         env: {
           ...process.env,
@@ -291,12 +308,6 @@ describe("bundled plugin build", () => {
       repository,
       "SECURITY.md",
       `# Synthetic policy\n${policy}\n`,
-    );
-    const alias = join(await temporaryDirectory(), "plugin link");
-    await symlink(
-      root,
-      alias,
-      process.platform === "win32" ? "junction" : "dir",
     );
     await mkdir(join(root, "scripts"), { recursive: true });
     await copyFile(

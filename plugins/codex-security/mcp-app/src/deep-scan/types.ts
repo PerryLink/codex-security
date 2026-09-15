@@ -1,5 +1,6 @@
 import type { DeepReducerContext } from "../artifact-io.js";
 import type { ScanExecutionAttribution } from "../../../../../sdk/typescript/src/scan-sessions.js";
+import type { DeepScanExecutionSettingsSnapshot } from "./recovery-settings.js";
 
 export type DeepScanTerminalReason = "saturated" | "capped";
 
@@ -53,6 +54,7 @@ export interface DeepScanRunState {
   workflowVersion?: string;
   finalizationInput?: DeepScanFinalizationInput;
   usageOwner?: ScanExecutionAttribution["owner"] | null;
+  executionSettings?: DeepScanExecutionSettingsSnapshot | null;
   status: DeepScanRunStatus;
   phase?: "setup" | "discovery" | "reducing" | "terminal";
   coordinatorGeneration?: number;

@@ -32,18 +32,12 @@ for (const state of ["absent", "saved", "unsupported"]) {
         bytes = JSON.stringify({ version: state === "unsupported" ? 99 : 1, settings: { codexPath: join(root, "codex"), codexHome: root, parentSandbox: { filesystemDenies: [] } } });
         await writeFile(path, bytes);
       }
-      if (state === "unsupported") {
-        await assert.rejects(loadDeepScanExecutionSettings(root, original, readLegacyContext), /unsupported/);
-      } else {
-        const loaded = await loadDeepScanExecutionSettings(root, original, readLegacyContext);
-        assert.equal(loaded.model, "original-model");
-        assert.equal(loaded.reasoningEffort, "high");
-        if (state === "absent") {
-          assert.equal(loaded.codexPath, undefined);
-          assert.equal(loaded.codexHome, undefined);
-        }
-      }
-      assert.equal(contextReads, state === "absent" ? 1 : 0);
+      const loaded = await loadDeepScanExecutionSettings(root, original, readLegacyContext);
+      assert.equal(loaded.model, "original-model");
+      assert.equal(loaded.reasoningEffort, "high");
+      assert.equal(loaded.codexPath, undefined);
+      assert.equal(loaded.codexHome, undefined);
+      assert.equal(contextReads, 1, "legacy recovery ignores planted execution artifacts");
       if (state === "absent") await assert.rejects(stat(path), { code: "ENOENT" });
       else assert.equal(await readFile(path, "utf8"), bytes);
     } finally {

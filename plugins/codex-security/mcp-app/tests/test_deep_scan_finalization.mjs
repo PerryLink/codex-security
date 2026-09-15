@@ -107,3 +107,45 @@ test("cancellation prevents selected publication and preserves its input", async
   }), (error) => error === controller.signal.reason);
   assert.equal(selection.terminalReason, "capped");
 });
+
+for (const parentStatus of ["running", "complete", "invalid-seal"]) {
+  test(`recovery verifies the ${parentStatus} parent after a succeeded child`, async () => {
+    const root = await realpath(await mkdtemp(path.join(tmpdir(), "selected-parent-")));
+    const { resumeSelectedDeepScan } = await import(
+      `data:text/javascript;base64,${Buffer.from(bundle.outputFiles[0].contents).toString("base64")}`,
+    );
+    const resultPath = "selected.json";
+    await writeFile(path.join(root, resultPath), "{}\n");
+    const calls = [];
+    const runWorkbench = async (args) => {
+      const [command] = args;
+      calls.push(command);
+      if (command === "get-deep-scan") return { deepScan: {
+        scanId, scanDir: root, targetPath: root, scope: ".",
+        workflowVersion: "deep-security-scan/v2", status: "succeeded", phase: "terminal",
+        coordinatorGeneration: 2, dispatchedCount: 2, noNewStreak: 0,
+        config: { workers: 1, subagents: 0, stopAfterNoNew: 1, maxDiscoveryRuns: 2 },
+        finalizationInput: { version: 1, resultPath, resultSha256: "0".repeat(64),
+          terminalReason: "capped", omittedWorkerIds: [], selectedAt: "2026-01-01T00:00:00Z" },
+      } };
+      if (command === "get-scan") return { scan: {
+        scanId, scanDir: root, targetPath: root,
+        progress: { status: parentStatus === "running" ? "running" : "complete" },
+      } };
+      assert.deepEqual(args, ["prepare-scan-completion", "--scan-id", scanId, "--claim-token", "current-claim"]);
+      if (parentStatus === "running") throw new Error("Selected input changed after acceptance");
+      if (parentStatus === "invalid-seal") throw new Error("Recorded seal does not match");
+      return {};
+    };
+    try {
+      const recover = () => resumeSelectedDeepScan({ scanId, threadId: "original-parent",
+        pluginRoot: root, runWorkbench, handoffClaimToken: "current-claim", signal: new AbortController().signal });
+      if (parentStatus === "complete") await recover();
+      else await assert.rejects(recover(), parentStatus === "running" ? /changed after acceptance/ : /Recorded seal/);
+      assert.equal(calls.includes("prepare-scan-completion"), true);
+      assert.equal(await readFile(path.join(root, resultPath), "utf8"), "{}\n");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+}

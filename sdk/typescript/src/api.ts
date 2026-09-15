@@ -4352,8 +4352,10 @@ function addScanCosts(
   current: Readonly<ScanCost>,
 ): ScanCost {
   if (previous === null) return { ...current };
+  const { estimatedUsdRange: currentRange, ...currentCost } = current;
+  const previousRange = previous.estimatedUsdRange;
   return {
-    model: current.model,
+    ...currentCost,
     inputTokens: previous.inputTokens + current.inputTokens,
     cachedInputTokens: previous.cachedInputTokens + current.cachedInputTokens,
     cacheWriteInputTokens:
@@ -4377,6 +4379,18 @@ function addScanCosts(
     current.cacheWriteInputTokensReported === false
       ? { cacheWriteInputTokensReported: false }
       : {}),
+    ...(previousRange === undefined || currentRange === undefined
+      ? {}
+      : {
+          estimatedUsdRange: {
+            context: "unknown" as const,
+            min: previousRange.min + currentRange.min,
+            max:
+              previousRange.max === null || currentRange.max === null
+                ? null
+                : previousRange.max + currentRange.max,
+          },
+        }),
   };
 }
 

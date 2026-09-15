@@ -30,6 +30,11 @@ export interface DeepScanLegacySettingsContext {
   usageOwner?: DeepScanRunState["usageOwner"];
 }
 
+export interface DeepScanExecutionSettingsSnapshot {
+  version: number;
+  settings: DeepScanExecutionSettings;
+}
+
 export async function captureDeepScanExecutionSettings(
   original: Pick<DeepScanRunState, "model" | "reasoningEffort" | "usageOwner">,
   parentSandbox: DeepWorkerParentSandbox,
@@ -136,23 +141,23 @@ async function originalParentSettings(
 
 /** Read recorded execution settings or original legacy facts. */
 export async function loadDeepScanExecutionSettings(
-  scanDir: string,
-  original?: Pick<DeepScanRunState, "model" | "reasoningEffort" | "usageOwner" | "createdAt" | "workflowVersion">,
+  _scanDir: string,
+  original?: Pick<DeepScanRunState, "model" | "reasoningEffort" | "usageOwner" | "createdAt" | "workflowVersion" | "executionSettings">,
   readLegacyContext?: () => Promise<DeepScanLegacySettingsContext>,
   environment: NodeJS.ProcessEnv = process.env
 ): Promise<Partial<DeepScanExecutionSettings>> {
-  const path = join(scanDir, "artifacts", "deep_discovery", "execution-settings.json");
+  // Only the workbench creation transaction records the launch selection. Scan
+  // artifacts are model-writable and cannot select a preflight executable/home.
+  const saved = original?.executionSettings;
   let settings: DeepScanExecutionSettings;
-  try {
-    const saved = JSON.parse(await fs.readFile(path, "utf8"));
+  if (saved) {
     if (saved.version !== 1) {
       throw new Error("This Deep Scan uses an unsupported execution settings version.");
     }
     settings = executionSettings(saved.settings);
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  } else {
     if (original?.workflowVersion === "deep-security-scan/v1" || original?.workflowVersion === "deep-scan-mcp/v1") {
-      // Legacy runs predate this file. Their saved recipe and recorded owner
+      // Legacy runs predate the binding. Their saved recipe and recorded owner
       // can recover selections, but cannot establish an original executable or
       // home. Leave those unknown and retain the existing native launch behavior.
       const context = await readLegacyContext?.();

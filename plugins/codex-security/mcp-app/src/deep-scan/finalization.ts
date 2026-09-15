@@ -130,6 +130,14 @@ export async function resumeSelectedDeepScan(input: {
   const store = new WorkbenchDeepScanStore(input.runWorkbench);
   const run = await store.get(input.scanId, input.threadId);
   selectedInput(run);
+  const prepare = [
+    "prepare-scan-completion", "--scan-id", input.scanId,
+    ...(input.handoffClaimToken ? ["--claim-token", input.handoffClaimToken] : []),
+  ];
+  if (run.status === "succeeded") {
+    await input.runWorkbench(prepare);
+    return;
+  }
   try {
     await publishSelectedDeepScan({
       run,
@@ -161,11 +169,13 @@ export async function resumeSelectedDeepScan(input: {
         }),
     });
   } catch (error) {
-    // The original coordinator may publish while the SDK recovers its parent turn.
+    // A succeeded child does not prove that its parent publication is valid.
+    // Validate the publication and any existing seal; the caller owns completion.
     const committed = await store
       .get(input.scanId, input.threadId)
       .catch(() => null);
     if (committed?.status !== "succeeded") throw error;
+    await input.runWorkbench(prepare);
   }
 }
 

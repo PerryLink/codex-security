@@ -513,7 +513,11 @@ def _target_scope_lines(target: dict[str, Any]) -> list[str]:
 
 
 def _surface_notes(surface: dict[str, Any]) -> str:
-    notes = surface.get("notes", "No additional canonical notes were recorded.")
+    notes = surface.get(
+        "notes", surface.get("reason", "No additional canonical notes were recorded.")
+    )
+    if "notes" in surface and "reason" in surface and surface["reason"] != notes:
+        notes += f" {surface['reason']}"
     source = _coverage_source(surface)
     if source:
         notes = f"{source}. {notes}"

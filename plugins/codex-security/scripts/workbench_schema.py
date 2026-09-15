@@ -932,6 +932,13 @@ MIGRATIONS = (
         ALTER TABLE deep_scan_runs ADD COLUMN usage_owner_json TEXT;
         """,
     ),
+    (
+        51,
+        "bind original deep scan execution settings",
+        """
+        ALTER TABLE deep_scan_runs ADD COLUMN execution_settings_json TEXT;
+        """,
+    ),
 )
 
 

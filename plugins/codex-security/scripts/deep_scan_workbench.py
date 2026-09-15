@@ -679,6 +679,17 @@ def require_legacy_deep_scan_creation(connection: sqlite3.Connection) -> None:
         raise SystemExit("This Deep Scan database requires a newer version to start a scan.")
 
 
+def recorded_deep_scan_execution_settings(run: sqlite3.Row) -> dict[str, Any] | None:
+    saved = run["execution_settings_json"] if "execution_settings_json" in run.keys() else None
+    return json.loads(saved) if saved else None
+
+
+def include_execution_settings(connection: sqlite3.Connection, result: dict[str, Any]) -> None:
+    if "deepScan" in result:
+        run = require_deep_scan_run(connection, result["deepScan"]["scanId"])
+        result["deepScan"]["executionSettings"] = recorded_deep_scan_execution_settings(run)
+
+
 def read_deep_scan_execution_settings(scan_dir: Path) -> dict[str, Any]:
     relative_path = "artifacts/deep_discovery/execution-settings.json"
     if not (scan_dir / relative_path).exists():
@@ -687,6 +698,10 @@ def read_deep_scan_execution_settings(scan_dir: Path) -> dict[str, Any]:
             "its executable and Codex home cannot be recovered."
         )
     saved = _read_scan_local_json(scan_dir, relative_path, "Deep Scan execution settings")
+    return validate_deep_scan_execution_settings(saved)
+
+
+def validate_deep_scan_execution_settings(saved: dict[str, Any]) -> dict[str, Any]:
     if saved.get("version") != 1:
         raise SystemExit("This Deep Scan uses an unsupported execution settings version.")
     settings = saved.get("settings")
@@ -1187,12 +1202,15 @@ def claim_deep_scan_coordinator_locked(
             adopted = run["coordinator_generation"] > 1 or run["phase"] != "setup"
             disposition = "adopted" if adopted else "claimed"
 
-        scan_dir = Path(scan["scan_dir"])
-        if (
-            deep_scan_finalization_input(run) is None
-            and (scan_dir / "artifacts/deep_discovery/execution-settings.json").exists()
-        ):
-            read_deep_scan_execution_settings(scan_dir)
+        if deep_scan_finalization_input(run) is None:
+            saved = recorded_deep_scan_execution_settings(run)
+            if saved is not None:
+                validate_deep_scan_execution_settings(saved)
+            elif run["workflow_version"] == "deep-security-scan/v2":
+                raise SystemExit(
+                    "This Deep Scan has no recorded original execution settings; "
+                    "its executable and Codex home cannot be recovered."
+                )
         if disposition == "adopted":
             recover_expired_coordinator(connection, run, timestamp)
         connection.execute(
