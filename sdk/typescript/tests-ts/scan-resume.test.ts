@@ -55,6 +55,7 @@ async function interruptedScan(
   bulk = false,
   settings: Pick<
     ScanOptions,
+    | "maxCostUsd"
     | "safetyIdentifier"
     | "postScanPrompt"
     | "auth"
@@ -656,6 +657,82 @@ test.each([
     ).rejects.toThrow("running scan");
   },
 );
+
+test("completed legacy discovery seals partial results when its saved budget is exhausted", async () => {
+  const f = await interruptedScan(
+    "deep",
+    false,
+    { maxCostUsd: 0.001 },
+    true,
+    false,
+  );
+  const cost = estimateScanCost("gpt-5.6-sol", {
+    input_tokens: 10000,
+    output_tokens: 2000,
+  })!;
+  const coverage = {
+    completeness: "partial",
+    surfaces: [],
+    explicitExclusions: [],
+    deferred: [{ reason: "Retained legacy discovery coverage." }],
+  };
+  const checkpoint: DeepScanCheckpoint = {
+    version: 2,
+    startedAt: "2000-01-01T00:00:00Z",
+    passes: [],
+    mergedScanIds: [],
+    aggregate: { scanId: f.scanId, findings: [], coverage },
+    noNewStreak: 0,
+    consecutiveErrors: 0,
+    terminalReason: "capped",
+    legacy: { discoveryRuns: 1, coverage, originThreadId: f.threadId, cost },
+  };
+  await f.command(
+    [
+      "save-scan-artifact",
+      "--scan-id",
+      f.scanId,
+      "--artifact-path",
+      DEEP_SCAN_CHECKPOINT,
+    ],
+    JSON.stringify(checkpoint),
+  );
+  let turns = 0;
+  const client = resumeClient(f, () => ({
+    startThread: () => ({
+      id: null,
+      async runStreamed() {
+        turns++;
+        throw new Error("Completed legacy discovery needs no model turn.");
+      },
+    }),
+    resumeThread() {
+      throw new Error("The retired coordinator must not resume.");
+    },
+  }))({ codexOverrides: f.recipe.config });
+  try {
+    const result = await client.run(f.repository, {
+      mode: "deep",
+      outputDir: f.scanDir,
+      resumeScanId: f.scanId,
+      maxCostUsd: 0.001,
+      ...f.recipe.deepScan,
+    });
+    expect(result.manifest.scan.id).toBe(f.scanId);
+    expect(result.manifest.scan.sealedAt).toBeString();
+    expect(result.threadId).toBe(f.threadId);
+    expect(result.coverage.completeness).toBe("partial");
+    expect(result.cost!.estimatedUsd).toBe(cost.estimatedUsd);
+    expect(turns).toBe(0);
+    expect(
+      (await f.command(["get-scan", "--scan-id", f.scanId]))["scan"],
+    ).toMatchObject({
+      progress: { status: "complete" },
+    });
+  } finally {
+    await client.close();
+  }
+});
 
 test("bulk recovery merges a sealed child when the parent stopped before its first merge thread", async () => {
   const f = await interruptedScan("deep", true, {}, false, false);

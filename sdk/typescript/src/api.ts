@@ -2418,6 +2418,9 @@ export class CodexSecurity {
                   }
                 },
               });
+              if (budgetRecovery !== null)
+                budgetRecovery.threadId ??=
+                  checkpoint.legacy?.originThreadId ?? null;
               const usage = await finalize(undefined);
               const resultThreadId =
                 thread.id ?? checkpoint.legacy?.originThreadId;

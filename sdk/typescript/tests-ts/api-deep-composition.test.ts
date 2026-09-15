@@ -35,6 +35,8 @@ test.each([
 ] as { workers: number; budget: boolean; provider?: JsonObject }[])(
   "Deep composes sealed ordinary scans and preserves a budgeted parent: %j",
   async ({ workers, budget, provider }) => {
+    const python = Bun.which("python3") ?? Bun.which("python");
+    if (python === null) throw new Error("Python is required for this test.");
     const root = await mkdtemp(join(tmpdir(), "ordinary-composition-"));
     roots.push(root);
     const repo = join(root, "repo");
@@ -109,7 +111,7 @@ test.each([
             version,
           },
         }),
-        resolvePluginPython: async () => "/usr/bin/python3",
+        resolvePluginPython: async () => python,
         runWorkbench: async (options, args, input) => {
           const result = await runWorkbench(options, args, input);
           const id = args.includes("--scan-id")
