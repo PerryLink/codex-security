@@ -480,6 +480,7 @@ async function testDeepScanStdioLifecycle() {
       return partial.workers.some((worker) => worker.kind === "discovery" && worker.status === "succeeded")
         && partial.workers.some((worker) => worker.kind === "dedup" && worker.status === "running");
     }, "one accepted Standard scan and its interrupted singleton merge");
+    await waitForJsonLines(startLogPath, restartStartIndex + 2);
     const completedWorker = partial.workers.find((worker) => worker.kind === "discovery" && worker.status === "succeeded");
     const completedDraft = JSON.parse(await readFile(completedWorker.resultManifestPath, "utf8"));
     assert.equal(completedDraft.scanId, resumedScanId);
