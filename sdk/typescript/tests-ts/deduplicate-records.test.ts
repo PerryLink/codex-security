@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { expect, test } from "bun:test";
 import {
   deduplicateRecords,
@@ -302,4 +303,91 @@ test("cancellation drains an active host callback before rejecting without sched
   release.resolve();
   await expect(pending).rejects.toBe("cancelled");
   expect(calls).toBe(1);
+});
+
+test("a connected thousand-record batch resumes cached reviews under its concurrency limit and prior DISTINCT", async () => {
+  const records = Array.from({ length: 1000 }, (_, index) => ({
+    findingId: `chain-${index}`,
+    severity: { level: "high" as const },
+    evidence: { description: `Synthetic original ${index}` },
+  }));
+  const input = {
+    observations: records,
+    candidates: records,
+    candidateRelationships: records.map((record, index) => ({
+      observationId: record.findingId,
+      candidateIds:
+        index + 1 < records.length ? [records[index + 1]!.findingId] : [],
+    })),
+    concurrency: 3,
+    priorDecisions: [
+      {
+        findingIds: [records[0]!.findingId, records.at(-1)!.findingId] as [
+          string,
+          string,
+        ],
+        decision: "DISTINCT" as const,
+      },
+    ],
+  };
+  const key = (request: DeduplicationReviewRequest) =>
+    createHash("sha256").update(JSON.stringify(request)).digest("hex");
+  const expected = await deduplicateRecords({
+    ...input,
+    reviewRunner: { run: async (request) => submission(request) },
+  });
+  const saved = new Map<string, unknown>(),
+    executions = new Map<string, number>();
+  let active = 0,
+    maximum = 0,
+    interrupted = false,
+    hits = 0;
+  const reviewRunner = {
+    async run(request: DeduplicationReviewRequest) {
+      const id = key(request);
+      if (saved.has(id)) {
+        hits++;
+        return saved.get(id);
+      }
+      active++;
+      maximum = Math.max(maximum, active);
+      try {
+        await new Promise<void>((resolve) => setImmediate(resolve));
+        executions.set(id, (executions.get(id) ?? 0) + 1);
+        const response = submission(request);
+        saved.set(id, response);
+        if (!interrupted && saved.size === 500) {
+          interrupted = true;
+          throw new Error("Lost host reply after persistence");
+        }
+        return response;
+      } finally {
+        active--;
+      }
+    },
+  };
+  await expect(deduplicateRecords({ ...input, reviewRunner })).rejects.toThrow(
+    "Lost host reply after persistence",
+  );
+  expect(active).toBe(0);
+  const preserved = saved.size;
+  const recovered = await deduplicateRecords({ ...input, reviewRunner });
+  expect(recovered).toEqual(expected);
+  expect(hits).toBe(preserved);
+  expect(saved.size).toBe(2 * (records.length - 1));
+  expect([...executions.values()].every((count) => count === 1)).toBe(true);
+  expect(maximum).toBe(input.concurrency);
+  expect(active).toBe(0);
+  expect(
+    recovered.duplicateGroups.some(
+      (group) =>
+        group.includes(records[0]!.findingId) &&
+        group.includes(records.at(-1)!.findingId),
+    ),
+  ).toBe(false);
+  expect(
+    recovered.duplicateGroups.some(
+      (group) => group.length > records.length / 2,
+    ),
+  ).toBe(true);
 });
