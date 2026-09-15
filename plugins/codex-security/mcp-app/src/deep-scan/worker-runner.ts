@@ -1,7 +1,7 @@
-import { createHash } from "node:crypto";
 import { promises as fs } from "node:fs";
 import { dirname, join } from "node:path";
 import { getCodexSecurityDeepReducerInputs } from "../artifact-deep-reducer.js";
+import type { ScanDraftInput } from "../artifact-scan-draft.js";
 import {
   validateDiscoveryArtifacts,
   validateReducerArtifacts
@@ -35,67 +35,24 @@ import type {
 
 export interface AcceptedDiscovery {
   id: string;
-  label: string;
-  artifactDir: string;
   resultPath: string;
   completionSequence: number;
-  attempt: number;
-  threadId?: string;
-  basePromptSha256: string;
-  attemptPromptPaths: string[];
+  coverage: ScanDraftInput["coverage"];
 }
 
 export type DiscoveryOutcome =
-  | { type: "discovery"; status: "succeeded"; worker: AcceptedDiscovery }
-  | { type: "discovery"; status: "canceled"; workerId: string }
+  | { status: "succeeded"; worker: AcceptedDiscovery }
+  | { status: "canceled" }
   | {
-      type: "discovery";
       status: "failed";
-      workerId: string;
       error: Error;
       replaceableFailureKind?: DeepScanReplaceableFailureKind;
       consecutiveErrors?: number;
     };
 
-export interface SuccessfulDedupOutcome {
-  type: "dedup";
-  id: string;
-  consumed: AcceptedDiscovery[];
-  resultPath: string;
-  result: DeepReductionInput;
-  newFindings: number;
-  attempt: number;
-  threadId?: string;
-  basePromptSha256: string;
-  attemptPromptPaths: string[];
-  run: DeepScanRunState;
-}
-
-export interface FailedDedupOutcome {
-  type: "dedup";
-  status: "failed";
-  id: string;
-  consumed: AcceptedDiscovery[];
-  error: Error;
-}
-
-export type DedupOutcome = SuccessfulDedupOutcome | FailedDedupOutcome;
-
-/** Audit evidence for every logical SDK execution, including failures and cancellation. */
-export interface WorkerExecutionAudit {
-  id: string;
-  label: string;
-  kind: DeepScanWorkerKind;
-  status: "succeeded" | "failed" | "canceled";
-  attempt: number;
-  threadId?: string;
-  promptPath: string;
-  artifactDir: string;
-  basePromptSha256: string;
-  attemptPromptPaths: string[];
-  error?: string;
-  failureKind?: DeepScanReplaceableFailureKind;
-}
+export type DedupOutcome =
+  | { resultPath: string; result: DeepReductionInput; run: DeepScanRunState }
+  | { status: "failed"; id: string; error: Error };
 
 export interface ReducerRequest {
   id: string;
@@ -115,13 +72,11 @@ export interface DeepScanWorkerRunnerOptions {
   log: DeepScanLogger;
   retryDelaysMs: readonly number[];
   signal: AbortSignal;
-  recordExecution?: (execution: WorkerExecutionAudit) => void;
 }
 
 interface WorkerAttemptEvidence {
   attempt: number;
   threadId?: string;
-  attemptPromptPaths: string[];
 }
 
 type WorkerAttemptOutcome =
@@ -175,7 +130,7 @@ export class DeepScanWorkerRunner {
       artifactDir,
       attempt: 1
     });
-    let discoveryValidated = false;
+    let discoveryCoverage!: ScanDraftInput["coverage"];
     let outcome = await this.runWorkerWithRetries({
       workerId,
       kind: "discovery",
@@ -185,8 +140,8 @@ export class DeepScanWorkerRunner {
       artifactContext: { root: artifactDir, layout: "worker" },
       subagents: run.config.subagents,
       validate: async () => {
-        await validateDiscoveryArtifacts(artifacts, files.resultPath, run.scanId);
-        discoveryValidated = true;
+        const result = await validateDiscoveryArtifacts(artifacts, files.resultPath, run.scanId);
+        discoveryCoverage = result.coverage;
       },
       beforeRetry: async (attempt) => {
         await archiveDirectory(
@@ -204,23 +159,12 @@ export class DeepScanWorkerRunner {
       }, outcome.attempt, outcome.threadId);
       outcome = { ...outcome, status: "canceled" };
     }
-    if (!discoveryValidated) {
+    if (!discoveryCoverage) {
       await fs.rm(files.resultPath, { force: true });
     }
-    const basePromptSha256 = sha256(basePrompt);
-    this.recordExecution({
-      id: workerId,
-      label: workerLabel,
-      kind: "discovery",
-      promptPath,
-      artifactDir,
-      basePromptSha256
-    }, outcome);
     if (outcome.status === "failed") {
       return {
-        type: "discovery",
         status: "failed",
-        workerId,
         error: outcome.error,
         ...(outcome.replaceableFailureKind
           ? { replaceableFailureKind: outcome.replaceableFailureKind }
@@ -231,17 +175,7 @@ export class DeepScanWorkerRunner {
       };
     }
     if (outcome.status === "canceled" || this.options.signal.aborted) {
-      return { type: "discovery", status: "canceled", workerId };
-    }
-
-    if (this.options.signal.aborted) {
-      await this.persistWorkerCancellation({
-        workerId,
-        kind: "discovery",
-        promptPath,
-        artifactDir
-      }, outcome.attempt, outcome.threadId);
-      return { type: "discovery", status: "canceled", workerId };
+      return { status: "canceled" };
     }
 
     const acceptance = {
@@ -264,28 +198,22 @@ export class DeepScanWorkerRunner {
       );
     } catch (error) {
       if (!this.options.signal.aborted) throw error;
-      return { type: "discovery", status: "canceled", workerId };
+      return { status: "canceled" };
     }
     if (!persisted.completionSequence) {
       throw new Error(`Discovery worker ${workerId} did not receive a completion sequence.`);
     }
 
     // The SQLite acceptance commit is the ordering point. If cancellation arrives
-    // after it, keep the accepted manifest intact; the scheduler will omit it.
+    // after it, keep the accepted manifest intact for parent publication.
     this.options.log({ event: "discovery_accepted", scanId: run.scanId, workerId });
     return {
-      type: "discovery",
       status: "succeeded",
       worker: {
         id: workerId,
-        label: workerLabel,
-        artifactDir,
         resultPath: files.resultPath,
         completionSequence: persisted.completionSequence,
-        attempt: outcome.attempt,
-        threadId: outcome.threadId,
-        basePromptSha256,
-        attemptPromptPaths: outcome.attemptPromptPaths
+        coverage: discoveryCoverage
       }
     };
   }
@@ -377,22 +305,11 @@ export class DeepScanWorkerRunner {
       }, outcome.attempt, outcome.threadId);
       outcome = { ...outcome, status: "canceled" };
     }
-    const basePromptSha256 = sha256(basePrompt);
-    this.recordExecution({
-      id: reducerId,
-      label: reducerLabel,
-      kind: "dedup",
-      promptPath,
-      artifactDir,
-      basePromptSha256
-    }, outcome);
     if (outcome.status === "failed") {
       if (outcome.error instanceof DeepScanNonRetryableError) throw outcome.error;
       return {
-        type: "dedup",
         status: "failed",
         id: reducerId,
-        consumed,
         error: outcome.error
       };
     }
@@ -409,15 +326,6 @@ export class DeepScanWorkerRunner {
 
     if (!reducerValidation) {
       throw new Error(`${reducerId} completed without validated reducer artifacts.`);
-    }
-    if (this.options.signal.aborted) {
-      await this.persistWorkerCancellation({
-        workerId: reducerId,
-        kind: "dedup",
-        promptPath,
-        artifactDir
-      }, outcome.attempt, outcome.threadId);
-      throw abortError(this.options.signal.reason);
     }
 
     const commit = {
@@ -439,16 +347,8 @@ export class DeepScanWorkerRunner {
       newFindings: reducerValidation.newFindings
     });
     return {
-      type: "dedup",
-      id: reducerId,
-      consumed,
       resultPath,
       result: reducerValidation.result,
-      newFindings: reducerValidation.newFindings,
-      attempt: outcome.attempt,
-      threadId: outcome.threadId,
-      basePromptSha256,
-      attemptPromptPaths: outcome.attemptPromptPaths,
       run: committed
     };
   }
@@ -470,10 +370,9 @@ export class DeepScanWorkerRunner {
     let continuationPrompt: string | undefined;
     let lastThreadId: string | undefined;
     let executionPromptPath = input.promptPath;
-    const attemptPromptPaths = [input.promptPath];
     for (let attempt = 1; attempt <= maximumAttempts; attempt += 1) {
       if (signal.aborted) {
-        return await this.cancelAttempt(input, attempt, lastThreadId, attemptPromptPaths);
+        return await this.cancelAttempt(input, attempt, lastThreadId);
       }
       let validationStarted = false;
       let validationCompleted = false;
@@ -527,7 +426,7 @@ export class DeepScanWorkerRunner {
           }
         });
         if (signal.aborted) {
-          return await this.cancelAttempt(input, attempt, activeThreadId, attemptPromptPaths);
+          return await this.cancelAttempt(input, attempt, activeThreadId);
         }
         validationStarted = true;
         try {
@@ -537,7 +436,7 @@ export class DeepScanWorkerRunner {
         }
         validationCompleted = true;
         if (signal.aborted) {
-          return await this.cancelAttempt(input, attempt, activeThreadId, attemptPromptPaths);
+          return await this.cancelAttempt(input, attempt, activeThreadId);
         }
         this.options.log({
           event: "worker_succeeded",
@@ -549,12 +448,11 @@ export class DeepScanWorkerRunner {
         return {
           status: "succeeded",
           attempt,
-          threadId: result.threadId ?? activeThreadId,
-          attemptPromptPaths: [...attemptPromptPaths]
+          threadId: result.threadId ?? activeThreadId
         };
       } catch (error) {
         if (signal.aborted) {
-          return await this.cancelAttempt(input, attempt, activeThreadId, attemptPromptPaths);
+          return await this.cancelAttempt(input, attempt, activeThreadId);
         }
         const normalized = asError(error);
         const policyRefusal = input.kind === "discovery"
@@ -588,8 +486,7 @@ export class DeepScanWorkerRunner {
               ? {}
               : { consecutiveErrors: persistedFailure.consecutiveErrors }),
             attempt,
-            threadId: activeThreadId,
-            attemptPromptPaths: [...attemptPromptPaths]
+            threadId: activeThreadId
           };
         }
         await this.options.store.updateWorker({
@@ -627,7 +524,6 @@ export class DeepScanWorkerRunner {
               failedAttempt: attempt,
               error: normalized
             });
-            attemptPromptPaths.push(executionPromptPath);
           }
         }
         const delayMs = Math.ceil(
@@ -645,7 +541,7 @@ export class DeepScanWorkerRunner {
           await this.options.clock.sleep(delayMs, signal);
         } catch (sleepError) {
           if (signal.aborted) {
-            return await this.cancelAttempt(input, attempt, activeThreadId, attemptPromptPaths);
+            return await this.cancelAttempt(input, attempt, activeThreadId);
           }
           throw sleepError;
         }
@@ -714,35 +610,14 @@ export class DeepScanWorkerRunner {
       artifactDir: string;
     },
     attempt: number,
-    threadId: string | undefined,
-    attemptPromptPaths: string[]
+    threadId: string | undefined
   ): Promise<WorkerAttemptOutcome> {
     await this.persistWorkerCancellation(input, attempt, threadId);
     return {
       status: "canceled",
       attempt,
-      threadId,
-      attemptPromptPaths: [...attemptPromptPaths]
+      threadId
     };
-  }
-
-  private recordExecution(
-    input: Omit<WorkerExecutionAudit, "status" | "attempt" | "threadId" | "attemptPromptPaths" | "error">,
-    outcome: WorkerAttemptOutcome
-  ): void {
-    this.options.recordExecution?.({
-      ...input,
-      status: outcome.status,
-      attempt: outcome.attempt,
-      ...(outcome.threadId ? { threadId: outcome.threadId } : {}),
-      attemptPromptPaths: [...outcome.attemptPromptPaths],
-      ...(outcome.status === "failed" ? {
-        error: outcome.error.message,
-        ...(outcome.replaceableFailureKind
-          ? { failureKind: outcome.replaceableFailureKind }
-          : {})
-      } : {})
-    });
   }
 }
 
@@ -878,10 +753,6 @@ function validationErrorData(error: Error, message: string): Record<string, unkn
     ...(typeof value.expected === "string" ? { expected: value.expected } : {}),
     message
   };
-}
-
-export function sha256(value: string): string {
-  return `sha256:${createHash("sha256").update(value).digest("hex")}`;
 }
 
 function asError(error: unknown): Error {

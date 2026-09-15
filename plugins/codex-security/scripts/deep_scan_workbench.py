@@ -1495,37 +1495,8 @@ def claim_deep_scan_dedup(
                 "A Deep Scan dedup worker must claim an ordered prefix of buffered discovery "
                 "results in completion order."
             )
-        capped_singleton = (
-            len(input_ids) == 1
-            and (
-                run["discovery_runs_dispatched"] >= run["max_discovery_runs"]
-                or deep_scan_deadline_reached(run)
-            )
-            and connection.execute(
-                """
-                SELECT 1 FROM deep_scan_workers
-                WHERE scan_id = ? AND kind = 'discovery' AND status IN ('queued', 'running')
-                LIMIT 1
-                """,
-                (scan_id,),
-            ).fetchone()
-            is None
-        )
-        successful_reducer = connection.execute(
-            """
-            SELECT 1 FROM deep_scan_workers
-            WHERE scan_id = ? AND kind = 'dedup' AND status = 'succeeded'
-            LIMIT 1
-            """,
-            (scan_id,),
-        ).fetchone()
-        minimum_inputs = 1 if successful_reducer is not None or capped_singleton else 2
-        if len(input_ids) < minimum_inputs:
-            raise SystemExit(
-                "The first Deep Scan dedup requires two buffered discovery results."
-                if minimum_inputs == 2
-                else "A Deep Scan dedup requires at least one buffered discovery result."
-            )
+        if not input_ids:
+            raise SystemExit("A Deep Scan dedup requires at least one buffered discovery result.")
         timestamp = now()
         connection.execute(
             """

@@ -1,35 +1,40 @@
 import assert from "node:assert/strict";
-import { readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
+import { build } from "esbuild";
+
+const bundle = await build({
+  bundle: true,
+  entryPoints: [new URL("../src/artifact-scan-draft.ts", import.meta.url).pathname],
+  format: "esm",
+  platform: "node",
+  write: false,
+});
+const { parseScanDraft } = await import(
+  `data:text/javascript;base64,${Buffer.from(bundle.outputFiles[0].contents).toString("base64")}`
+);
 
 export async function testDeepScanPublication({
   fixtureRun, FakeStore, FakeExecutor, DeepScanCoordinator, deferred,
   immediateClock, eventually,
 }) {
-  async function testSaturationOmitsWorkerAcceptedDuringCancellation() {
+  async function testPublicationWaitsForAllAcceptedBatchResults() {
     const fixture = await fixtureRun({ workers: 3, subagents: 0, stopAfterNoNew: 2, maxDiscoveryRuns: 3 });
     const store = new FakeStore(fixture.run);
-    const releaseLateWorker = deferred();
-    const lateAcceptance = deferred();
+    const acceptance = deferred();
     const releaseAcceptance = deferred();
     const updateWorker = store.updateWorker.bind(store);
-    let acceptedLateWorker;
     store.updateWorker = async (update) => {
       const persisted = await updateWorker(update);
       if (update.kind === "discovery" && update.status === "succeeded"
         && path.basename(path.dirname(update.promptPath)) === "discovery-0003") {
-        acceptedLateWorker = persisted;
-        // This worker finishes too late to be included in the final result.
-        await rm(update.resultManifestPath);
-        lateAcceptance.resolve();
+        acceptance.resolve();
         await releaseAcceptance.promise;
       }
       return persisted;
     };
     const executor = new FakeExecutor({
-      blockDedup: true,
-      discoveryGates: { "discovery-0003": releaseLateWorker.promise },
-      discoveryCandidates: { "discovery-0003": "late-accepted-finding" },
+      discoveryCandidates: { "discovery-0003": "accepted-batch-finding" },
     });
     const completed = [];
     const coordinator = new DeepScanCoordinator({
@@ -38,42 +43,55 @@ export async function testDeepScanPublication({
       onComplete: async (draft) => completed.push(structuredClone(draft)),
     });
     coordinator.start();
-    await executor.dedupStarted;
-    releaseLateWorker.resolve();
-    await lateAcceptance.promise;
-    executor.releaseDedup();
-    await eventually(() => executor.dedupSignal?.aborted === true);
+    await acceptance.promise;
+    await eventually(() => [...store.workers.values()].filter((worker) => worker.status === "succeeded").length === 3);
+    assert.equal(executor.runningDiscovery, 0);
+    assert.equal(store.dedupClaims.length, 0, "merge must wait for each acceptance response");
+    assert.equal(completed.length, 0);
     releaseAcceptance.resolve();
     const terminal = await coordinator.wait(undefined, 5_000);
     assert.equal(terminal?.status, "succeeded", terminal?.error);
-    assert.equal(terminal.terminalReason, "saturated");
+    assert.equal(terminal.terminalReason, "capped");
     assert.equal(executor.discoveryCalls, 3);
-    assert.equal(executor.dedupCalls, 1, "late accepted results do not restart convergence");
-    assert.deepEqual(store.finishCalls[0].omittedWorkerIds, [acceptedLateWorker.id]);
+    assert.equal(executor.dedupCalls, 1);
+    assert.deepEqual(store.finishCalls[0].omittedWorkerIds, []);
     assert.equal(completed.length, 1);
-    assert.equal(completed[0].coverage.completeness, "complete");
-    assert.deepEqual(completed[0].findings, [], "late worker findings are not appended to the saturated aggregate");
+    assert.deepEqual(completed[0].findings.map((finding) => finding.provenance.candidateId), ["accepted-batch-finding"]);
   }
 
-  async function testSuccessfulDeepCoverageIgnoresWorkerAndReducerReviewStatus() {
-    const fixture = await fixtureRun({ workers: 2, subagents: 0, stopAfterNoNew: 2, maxDiscoveryRuns: 2 });
+  async function testIndependentPassCoveragePreservesConflictingOutcomesAndEvidence() {
+    const fixture = await fixtureRun({ workers: 3, subagents: 0, stopAfterNoNew: 2, maxDiscoveryRuns: 3 });
     const store = new FakeStore(fixture.run);
     const executor = new FakeExecutor();
     const run = executor.run.bind(executor);
-    const reviewed = { label: "Reviewed query", disposition: "no_issue_found" };
-    const workerReviewed = { ...reviewed, receiptRefs: ["artifacts/missing-worker-receipt.md"] };
-    const followUp = { label: "Worker follow-up", disposition: "needs_follow_up" };
+    const sourceCoverage = new Map();
     executor.run = async (request) => {
       const outcome = await run(request);
+      if (request.kind !== "discovery") return outcome;
       const resultPath = path.join(request.artifactContext.root, "result.json");
       const draft = JSON.parse(await readFile(resultPath, "utf8"));
+      const label = path.basename(path.dirname(request.promptPath));
+      const complete = label === "discovery-0001";
       draft.coverage = {
-        completeness: request.kind === "discovery" && request.promptPath.includes("discovery-0002")
-          ? "unknown" : "partial",
-        surfaces: [workerReviewed, followUp],
-        explicitExclusions: [],
-        deferred: [{ reason: "An independent review left this question unresolved." }],
+        completeness: complete ? "complete" : "partial",
+        surfaces: [{
+          id: "query-surface", label: "Reviewed query",
+          disposition: complete ? "no_issue_found" : "needs_follow_up",
+          notes: complete ? "Verified bound values." : `Unresolved proof from ${label}.`,
+          receiptRefs: ["artifacts/receipt.json"],
+        }],
+        explicitExclusions: [{ pattern: "vendor/**", reason: "Third-party source is outside the selected review." }],
+        deferred: complete ? [] : [{
+          id: "pending-query", candidateId: label === "discovery-0003" ? "c".repeat(512) : "candidate-1",
+          reason: "The candidate needs further source validation.",
+          surfaceIds: ["query-surface"],
+          candidate: { proof: `Independent evidence from ${label}.` },
+        }],
+        ...(complete ? {} : { openQuestions: [{ question: `Question from ${label}.` }] }),
       };
+      sourceCoverage.set(label, structuredClone(draft.coverage));
+      await mkdir(path.join(request.artifactContext.root, "artifacts"));
+      await writeFile(path.join(request.artifactContext.root, "artifacts", "receipt.json"), label);
       await writeFile(resultPath, JSON.stringify(draft));
       return outcome;
     };
@@ -81,37 +99,51 @@ export async function testDeepScanPublication({
     const coordinator = new DeepScanCoordinator({
       run: fixture.run, store, executor, pluginRoot: fixture.pluginRoot,
       clock: immediateClock,
-      onComplete: async (draft) => completed.push(structuredClone(draft)),
+      onComplete: async (draft) => completed.push(parseScanDraft(draft)),
     });
     coordinator.start();
     const terminal = await coordinator.wait(undefined, 5_000);
     assert.equal(terminal?.status, "succeeded", terminal?.error);
     assert.equal(completed.length, 1);
-    assert.deepEqual(completed[0].coverage, {
-      completeness: "complete", surfaces: [], explicitExclusions: [], deferred: [],
-    });
+    const coverage = completed[0].coverage;
+    assert.equal(coverage.completeness, "partial");
+    assert.deepEqual(coverage.surfaces.map((surface) => surface.disposition).sort(), [
+      "needs_follow_up", "needs_follow_up", "no_issue_found",
+    ]);
+    assert.deepEqual(coverage.surfaces.map((surface) => surface.notes).sort(), [
+      "Unresolved proof from discovery-0002.", "Unresolved proof from discovery-0003.", "Verified bound values.",
+    ]);
+    assert.deepEqual(coverage.deferred.map((item) => item.candidate.proof).sort(), [
+      "Independent evidence from discovery-0002.", "Independent evidence from discovery-0003.",
+    ]);
+    assert.equal(coverage.explicitExclusions.some((item) => item.pattern === "vendor/**"), true);
+    assert.deepEqual(coverage.openQuestions.map((item) => item.question).sort(), [
+      "Question from discovery-0002.", "Question from discovery-0003.",
+    ]);
+    for (const item of coverage.deferred) {
+      assert.equal(item.surfaceIds.every((id) => coverage.surfaces.some((surface) => surface.id === id)), true);
+    }
+    assert.equal(new Set(coverage.deferred.map((item) => item.candidateId)).size, 2);
+    assert.deepEqual(coverage.deferred.map((item) => item.sourceCandidateId).sort(), ["c".repeat(512), "candidate-1"].sort());
+    const receipts = await Promise.all(coverage.surfaces.flatMap((surface) => (
+      surface.receiptRefs.map((ref) => readFile(path.join(fixture.run.scanDir, ref), "utf8"))
+    )));
+    assert.deepEqual(receipts.sort(), ["discovery-0001", "discovery-0002", "discovery-0003"]);
     for (const worker of store.workers.values()) {
       if (worker.kind !== "discovery") continue;
       const draft = JSON.parse(await readFile(worker.resultManifestPath, "utf8"));
-      assert.notEqual(draft.coverage.completeness, "complete");
-      assert.deepEqual(draft.coverage.surfaces, [workerReviewed, followUp]);
-      assert.equal(draft.coverage.deferred.length, 1);
+      assert.deepEqual(draft.coverage, sourceCoverage.get(path.basename(path.dirname(worker.promptPath))));
     }
   }
 
-  async function testSaturationIgnoresDiscoveryCancellationWriteFailure() {
+  async function testSaturationRequiresNoWorkerCancellation() {
     const fixture = await fixtureRun({ workers: 2, subagents: 0, stopAfterNoNew: 2, maxDiscoveryRuns: 6 });
     const store = new FakeStore(fixture.run);
-    const executor = new FakeExecutor({ blockDedup: true, blockDiscoveryAfterCalls: 2 });
+    const executor = new FakeExecutor();
     const updateWorker = store.updateWorker.bind(store);
-    const rejectedCancellations = new Set();
+    const cancellations = [];
     store.updateWorker = async (update) => {
-      if (update.kind === "discovery" && update.status === "canceled") {
-        assert.equal(executor.dedupSignal?.aborted, true);
-        assert.equal(store.run.noNewStreak, 2);
-        rejectedCancellations.add(update.id);
-        throw new Error("fixture cancellation persistence failure");
-      }
+      if (update.status === "canceled") cancellations.push(update.id);
       return updateWorker(update);
     };
     const completed = [];
@@ -121,31 +153,20 @@ export async function testDeepScanPublication({
       onComplete: async (draft) => completed.push(structuredClone(draft)),
     });
     coordinator.start();
-    await executor.dedupStarted;
-    await eventually(() => executor.discoveryCalls === 4 && executor.runningDiscovery === 2);
-    executor.releaseDedup();
-
     const terminal = await coordinator.wait(undefined, 5_000);
-    assert.equal(rejectedCancellations.size, 2, "the redundant discoveries reached the failing cancellation write");
     assert.equal(terminal?.status, "succeeded", terminal?.error);
     assert.equal(terminal.terminalReason, "saturated");
+    assert.deepEqual(cancellations, []);
+    assert.equal(executor.discoveryCalls, 2);
+    assert.equal(executor.dedupCalls, 1);
     assert.equal(store.failCalls, 0);
     assert.equal(store.finishCalls.length, 1);
-    assert.equal(store.finishCalls[0].reason, "saturated");
-    assert.equal(executor.discoveryCalls, 4, "cancellation persistence failures must not dispatch replacement reviews after saturation");
-    assert.equal(executor.dedupCalls, 1, "cancellation persistence failures must not restart reduction after saturation");
-    assert.equal(executor.runningDiscovery, 0);
     assert.equal(completed.length, 1);
-    assert.equal(completed[0].coverage.completeness, "complete");
-    const acceptedReducer = [...store.workers.values()].find((worker) => (
-      worker.kind === "dedup" && worker.status === "succeeded"
-    ));
+    const acceptedReducer = [...store.workers.values()].find((worker) => worker.kind === "dedup" && worker.status === "succeeded");
     const { coverage, ...publishedReduction } = completed[0];
-    assert.deepEqual(
-      publishedReduction,
-      JSON.parse(await readFile(acceptedReducer.resultManifestPath, "utf8")),
-      "the accepted aggregate still reaches publication when redundant cancellation writes fail",
-    );
+    assert.deepEqual(publishedReduction, JSON.parse(await readFile(acceptedReducer.resultManifestPath, "utf8")));
+    assert.equal(coverage.completeness, "complete");
+    assert.equal(coverage.surfaces.some((surface) => surface.label === "Fixture query"), true);
   }
 
   async function testPublicationUsesAcceptedReducerSnapshot() {
@@ -176,8 +197,8 @@ export async function testDeepScanPublication({
     assert.equal(completed[0].coverage.completeness, "complete");
   }
 
-  await testSaturationOmitsWorkerAcceptedDuringCancellation();
-  await testSuccessfulDeepCoverageIgnoresWorkerAndReducerReviewStatus();
-  await testSaturationIgnoresDiscoveryCancellationWriteFailure();
+  await testPublicationWaitsForAllAcceptedBatchResults();
+  await testIndependentPassCoveragePreservesConflictingOutcomesAndEvidence();
+  await testSaturationRequiresNoWorkerCancellation();
   await testPublicationUsesAcceptedReducerSnapshot();
 }

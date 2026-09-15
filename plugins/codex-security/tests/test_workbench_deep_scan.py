@@ -2830,27 +2830,8 @@ def test_discovery_deadline_caps_after_reducing_a_single_discovery_result(
     )
     if not deadline_reached:
         assert "before reaching its configured maximum" in str(premature_completion["stderr"])
-        reducer_prompt, reducer_dir, _ = worker_paths(scan_dir, "premature-reducer")
-        premature_reducer = run_workbench(
-            state_dir,
-            "claim-deep-scan-dedup",
-            "--scan-id",
-            scan_id,
-            "--worker-id",
-            str(uuid.uuid4()),
-            "--prompt-path",
-            str(reducer_prompt),
-            "--artifact-dir",
-            str(reducer_dir),
-            "--input-worker-id",
-            worker_id,
-            environment=deep_environment(codex_home),
-            check=False,
-        )
-        assert "requires two buffered discovery results" in str(premature_reducer["stderr"])
-        return
-
-    assert "without canonical discovery artifacts" in str(premature_completion["stderr"])
+    else:
+        assert "without canonical discovery artifacts" in str(premature_completion["stderr"])
     reduced = commit_reducer(
         state_dir,
         codex_home,
@@ -2862,6 +2843,22 @@ def test_discovery_deadline_caps_after_reducing_a_single_discovery_result(
     )
     assert reduced["dispatchedCount"] == 1
     assert reduced["config"]["maxDiscoveryRuns"] == 3
+    if not deadline_reached:
+        premature_completion = run_workbench(
+            state_dir,
+            "finish-deep-scan",
+            "--scan-id",
+            scan_id,
+            "--terminal-reason",
+            "capped",
+            "--manifest-path",
+            str(manifest),
+            environment=deep_environment(codex_home),
+            check=False,
+        )
+        assert "before reaching its configured maximum" in str(premature_completion["stderr"])
+        return
+
     ledger_path = scan_dir / "artifacts" / "02_discovery" / "candidate_ledger.jsonl"
     existing_finding = '{"title": "Finding recorded before the deadline"}\n'
     ledger_path.write_text(existing_finding)

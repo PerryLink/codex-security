@@ -477,10 +477,10 @@ async function testDeepScanStdioLifecycle() {
         event.event === "coordinator_started" && event.scanId === resumedScanId
       ))) return false;
       partial = await getDeepScan({ environment, scanId: resumedScanId, threadId: resumedThreadId });
-      return partial.workers.some((worker) => worker.status === "succeeded")
-        && partial.workers.some((worker) => worker.status === "running");
-    }, "one completed discovery and one interrupted discovery");
-    const completedWorker = partial.workers.find((worker) => worker.status === "succeeded");
+      return partial.workers.some((worker) => worker.kind === "discovery" && worker.status === "succeeded")
+        && partial.workers.some((worker) => worker.kind === "dedup" && worker.status === "running");
+    }, "one accepted Standard scan and its interrupted singleton merge");
+    const completedWorker = partial.workers.find((worker) => worker.kind === "discovery" && worker.status === "succeeded");
     const completedDraft = JSON.parse(await readFile(completedWorker.resultManifestPath, "utf8"));
     assert.equal(completedDraft.scanId, resumedScanId);
     assert.deepEqual(completedDraft.findings, []);
@@ -492,7 +492,7 @@ async function testDeepScanStdioLifecycle() {
       completed: 1,
       active: 0,
       maximum: 2,
-      consolidating: false
+      consolidating: true
     });
     assert.deepEqual(
       [paused.scan.reportAvailable, paused.scan.findingCount, paused.scan.artifacts],
@@ -538,12 +538,18 @@ async function testDeepScanStdioLifecycle() {
       });
       assert.equal(finished.status, "succeeded");
       assert.equal(finished.coordinatorGeneration, partial.coordinatorGeneration + 1);
-      assert.equal(finished.dispatchedCount, 2);
+      assert.equal(finished.dispatchedCount, 1, "restart must merge the accepted singleton before another scan");
       const successfulDiscoveries = finished.workers.filter((worker) => (
         worker.kind === "discovery" && worker.status === "succeeded"
       ));
-      assert.equal(successfulDiscoveries.length, 2);
+      assert.equal(successfulDiscoveries.length, 1);
       assert.equal(successfulDiscoveries[0].id, completedWorker.id);
+      assert.equal(finished.terminalReason, "saturated");
+      assert.equal(finished.noNewStreak, 1);
+      const completedContext = await runWorkbench(environment, ["get-scan", "--scan-id", resumedScanId]);
+      assert.deepEqual(completedContext.scan.progress.independentReviews, {
+        completed: 1, active: 0, maximum: 2, consolidating: false
+      });
       assert.equal(finished.workers.some((worker) => (
         worker.kind === "dedup" && worker.status === "succeeded"
       )), true);
@@ -555,6 +561,9 @@ async function testDeepScanStdioLifecycle() {
         []
       );
       const executions = (await readJsonLines(startLogPath)).slice(restartStartIndex);
+      assert.deepEqual(executions.map((execution) => (
+        discoveryPromptContext(execution.stdin).claimedWorkerIds ? "merge" : "scan"
+      )), ["scan", "merge", "merge"]);
       for (const execution of executions) {
         assert.equal(execution.argv.includes('model_reasoning_summary="none"'), true);
       }
