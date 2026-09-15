@@ -2,13 +2,18 @@ import { createInterface } from "node:readline";
 import type { Readable } from "node:stream";
 import { z } from "zod";
 import type { JsonObject } from "../config.js";
-import type { Finding } from "../models.js";
+import type { DeduplicationIdentity } from "./record-types.js";
+import { requireEvidenceRecord } from "./record-evidence.js";
 import { workflowDigest } from "../finding-workflow.js";
 import { requireFinding } from "./deduplication-reviewer.js";
-import { deduplicateRecords } from "./records.js";
+import {
+  deduplicateRecords,
+  type DeduplicationReviewRequest,
+} from "./records.js";
 
 const object = z.record(z.string(), z.json());
 const runParams = z.strictObject({
+  recordFormat: z.enum(["finding-v1", "evidence-v1"]).optional(),
   observations: z.array(z.unknown()),
   candidates: z.array(z.unknown()),
   candidateRelationships: z.array(
@@ -50,22 +55,31 @@ const initializeParams = z.strictObject({
 });
 
 /** Resolve the complete host-selected graph before any source or model callback. */
-function preloadedCandidates(params: z.infer<typeof runParams>) {
-  const records = new Map<string, Finding>();
+function preloadedCandidates<TRecord extends DeduplicationIdentity>(
+  params: z.infer<typeof runParams>,
+  requireRecord: (value: unknown) => asserts value is TRecord,
+) {
+  const records = new Map<string, TRecord>();
   for (const input of [...params.observations, ...params.candidates]) {
-    requireFinding(input);
+    requireRecord(input);
     const previous = records.get(input.findingId);
     if (previous && workflowDigest(previous) !== workflowDigest(input))
       throw new Error("Conflicting finding content in the comparison batch.");
     records.set(input.findingId, input);
   }
+  const validated = (inputs: readonly unknown[]): TRecord[] =>
+    inputs.map((input) => {
+      requireRecord(input);
+      return input;
+    });
+  const observationRecords = validated(params.observations);
   const observations = new Set(
-    (params.observations as Finding[]).map((finding) => finding.findingId),
+    observationRecords.map((finding) => finding.findingId),
   );
   const candidates = new Set(
-    (params.candidates as Finding[]).map((finding) => finding.findingId),
+    validated(params.candidates).map((finding) => finding.findingId),
   );
-  const neighborhoods = new Map<string, readonly Finding[]>();
+  const neighborhoods = new Map<string, readonly TRecord[]>();
   for (const relationship of params.candidateRelationships) {
     if (
       !observations.has(relationship.observationId) ||
@@ -88,8 +102,11 @@ function preloadedCandidates(params: z.infer<typeof runParams>) {
   if (neighborhoods.size !== observations.size)
     throw new Error("Candidate relationships must name each observation once.");
   return {
-    potentialDuplicates: async (finding: Finding) =>
-      neighborhoods.get(finding.findingId)!,
+    observations: observationRecords,
+    candidateProvider: {
+      potentialDuplicates: async (finding: TRecord) =>
+        neighborhoods.get(finding.findingId)!,
+    },
   };
 }
 const rpcId = z.union([z.string(), z.number().int()]);
@@ -292,16 +309,16 @@ export async function runRecordDedupeProtocol(
     }
     runId = message.id;
     const params = runParams.parse(message.params);
-    const candidateProvider = preloadedCandidates(params);
-    void deduplicateRecords({
-      ...params,
-      observations: params.observations as Finding[],
+    const { recordFormat, ...settings } = params;
+    const options = {
+      ...settings,
       sourceManifest: params.sourceManifest as JsonObject,
-      candidateProvider,
       reviewRunner: {
-        run: (review) => call("review.run", { request: review }),
+        run: (review: DeduplicationReviewRequest) =>
+          call("review.run", { request: review }),
       },
-      verifySource: (manifest) => acknowledge("source.verify", { manifest }),
+      verifySource: (manifest: JsonObject) =>
+        acknowledge("source.verify", { manifest }),
       ...(checkpoints
         ? {
             checkpointStore: {
@@ -312,7 +329,20 @@ export async function runRecordDedupeProtocol(
           }
         : {}),
       signal: controller.signal,
-    }).then(
+    };
+    const execution =
+      recordFormat === "evidence-v1"
+        ? deduplicateRecords({
+            ...options,
+            ...preloadedCandidates(params, requireEvidenceRecord),
+            recordFormat,
+          })
+        : deduplicateRecords({
+            ...options,
+            ...preloadedCandidates(params, requireFinding),
+            recordFormat,
+          });
+    void execution.then(
       (result) => {
         if (finished) return;
         try {

@@ -124,10 +124,16 @@ export {
   deduplicateScan,
   deduplicateScanDirectory,
 } from "./deduplication/scan.js";
+export type {
+  EvidenceRecord,
+  MergedEvidenceSummary,
+  EvidenceDuplicateDecision,
+} from "./deduplication/record-evidence.js";
 export { deduplicateRecords } from "./deduplication/records.js";
 export type {
   BoundDeduplicationPairOutcome,
   DeduplicateRecordsOptions,
+  DeduplicateEvidenceRecordsOptions,
   DeduplicateRecordsResult,
   DeduplicationCandidateProvider,
   DeduplicationCheckpointStore,

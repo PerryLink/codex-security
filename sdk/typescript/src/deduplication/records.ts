@@ -6,7 +6,13 @@ import {
 import type { Finding } from "../models.js";
 import { workflowDigest } from "../finding-workflow.js";
 import { VERSION } from "../version.js";
-import type { CodexReview } from "./codex-review.js";
+import type { CodexReview, CodexReviewRunner } from "./codex-review.js";
+import type { DeduplicationIdentity } from "./record-types.js";
+import {
+  EvidenceDeduplicationReviewer,
+  requireEvidenceRecord,
+  type EvidenceRecord,
+} from "./record-evidence.js";
 import {
   FindingDeduplicator,
   deduplicationConcurrency,
@@ -16,6 +22,7 @@ import {
 import {
   CodexDeduplicationReviewer,
   requireFinding,
+  type DeduplicationReviewer,
 } from "./deduplication-reviewer.js";
 import {
   DEFAULT_RESULT_TOOL_NAMESPACE,
@@ -73,9 +80,11 @@ export interface DeduplicationReviewRunner {
   ): Promise<unknown>;
 }
 
-export interface DeduplicationCandidateProvider {
+export interface DeduplicationCandidateProvider<
+  TRecord extends DeduplicationIdentity = Finding,
+> {
   /** Return complete candidate records; the supplied observation is authoritative. */
-  potentialDuplicates(finding: Finding): Promise<readonly Finding[]>;
+  potentialDuplicates(finding: TRecord): Promise<readonly TRecord[]>;
 }
 
 /** Reuse an earlier pair outcome only with its original immutable-input binding. */
@@ -85,9 +94,9 @@ export interface PriorDeduplicationDecision {
   bindingDigest: string;
 }
 
-export interface DeduplicateRecordsOptions {
-  observations: readonly Finding[];
-  candidateProvider: DeduplicationCandidateProvider;
+interface RecordOptions<TRecord extends DeduplicationIdentity> {
+  observations: readonly TRecord[];
+  candidateProvider: DeduplicationCandidateProvider<TRecord>;
   reviewRunner: DeduplicationReviewRunner;
   /** Host-established repository identities and exact revisions, without credentials. */
   sourceManifest: JsonObject;
@@ -104,6 +113,14 @@ export interface DeduplicateRecordsOptions {
   /** Defaults to the existing SDK dedupe concurrency (8). */
   concurrency?: number;
   signal?: AbortSignal;
+}
+
+export interface DeduplicateRecordsOptions extends RecordOptions<Finding> {
+  recordFormat?: "finding-v1";
+}
+
+export interface DeduplicateEvidenceRecordsOptions extends RecordOptions<EvidenceRecord> {
+  recordFormat: "evidence-v1";
 }
 
 export interface BoundDeduplicationPairOutcome extends DeduplicationPairOutcome {
@@ -132,8 +149,44 @@ function freeze<T>(value: T): T {
  * Review normalized records with host-owned retrieval, source access and storage.
  * This never loads scan artifacts, spawns a model runtime, or publishes groups.
  */
-export async function deduplicateRecords(
+export function deduplicateRecords(
   options: DeduplicateRecordsOptions,
+): Promise<DeduplicateRecordsResult>;
+export function deduplicateRecords(
+  options: DeduplicateEvidenceRecordsOptions,
+): Promise<DeduplicateRecordsResult>;
+export async function deduplicateRecords(
+  options: DeduplicateRecordsOptions | DeduplicateEvidenceRecordsOptions,
+): Promise<DeduplicateRecordsResult> {
+  if (options.recordFormat === "evidence-v1")
+    return await runRecords(
+      options,
+      requireEvidenceRecord,
+      (runner, namespace) =>
+        new EvidenceDeduplicationReviewer(runner, namespace),
+      { version: 4, recordFormat: "evidence-v1" },
+    );
+  if (
+    options.recordFormat !== undefined &&
+    options.recordFormat !== "finding-v1"
+  )
+    throw new CodexSecurityError("Unsupported deduplication record format.");
+  return await runRecords(
+    options,
+    requireFinding,
+    (runner, namespace) => new CodexDeduplicationReviewer(runner, namespace),
+    { version: RECORD_REVIEW_CONTRACT_VERSION },
+  );
+}
+
+async function runRecords<TRecord extends DeduplicationIdentity>(
+  options: RecordOptions<TRecord>,
+  requireRecord: (value: unknown) => asserts value is TRecord,
+  reviewer: (
+    runner: Pick<CodexReviewRunner, "run">,
+    namespace: string,
+  ) => DeduplicationReviewer<TRecord>,
+  contract: { version: number; recordFormat?: "evidence-v1" },
 ): Promise<DeduplicateRecordsResult> {
   options.signal?.throwIfAborted();
   const concurrency = deduplicationConcurrency(options.concurrency);
@@ -178,7 +231,7 @@ export async function deduplicateRecords(
     ),
   );
   const context = freeze({
-    version: RECORD_REVIEW_CONTRACT_VERSION,
+    ...contract,
     sdkVersion: VERSION,
     scopeKey: options.scopeKey,
     settingsDigest: options.settingsDigest,
@@ -188,9 +241,9 @@ export async function deduplicateRecords(
   });
   // A finding ID cannot silently acquire another record's evidence in the union
   // of neighborhoods. Freeze before giving any record to a provider or reviewer.
-  const records = new Map<string, { finding: Finding; digest: string }>();
-  function register(input: Finding): Finding {
-    requireFinding(input);
+  const records = new Map<string, { finding: TRecord; digest: string }>();
+  function register(input: TRecord): TRecord {
+    requireRecord(input);
     const finding = freeze(structuredClone(input));
     const digest = workflowDigest(finding);
     const existing = records.get(finding.findingId);
@@ -281,7 +334,7 @@ export async function deduplicateRecords(
         const candidates =
           await options.candidateProvider.potentialDuplicates(finding);
         options.signal?.throwIfAborted();
-        const neighbors = new Map<string, Finding>();
+        const neighbors = new Map<string, TRecord>();
         for (const candidate of candidates) {
           const registered = register(candidate);
           if (registered.findingId !== id)
@@ -290,7 +343,7 @@ export async function deduplicateRecords(
         return { finding, potentialDuplicates: [...neighbors.values()] };
       },
     },
-    new CodexDeduplicationReviewer(runner, resultToolNamespace),
+    reviewer(runner, resultToolNamespace),
     options.signal,
     concurrency,
   );

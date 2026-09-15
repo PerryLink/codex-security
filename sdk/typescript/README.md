@@ -1990,8 +1990,9 @@ associations in the service before `deduplicationStatus` becomes `completed`.
 
 ### Deduplicate records with an external host
 
-`deduplicateRecords` accepts complete SDK `Finding` records and host-provided
-candidate retrieval, review execution, source access and checkpoint storage.
+`deduplicateRecords` accepts complete SDK `Finding` records by default, or
+lossless imported evidence envelopes with `recordFormat: "evidence-v1"`. The host
+provides candidate retrieval, review execution, source access and checkpoint storage.
 It reuses scan deduplication's screening and grouping without loading scan
 artifacts, starting a model process or publishing duplicate groups.
 

@@ -3,6 +3,7 @@ import { join } from "node:path";
 import { createInterface } from "node:readline";
 import { PassThrough, Writable } from "node:stream";
 import { expect, test } from "bun:test";
+import type { EvidenceRecord } from "../src/deduplication/record-evidence.js";
 import type { Finding, FindingsDocument } from "../src/models.js";
 import {
   deduplicateRecords,
@@ -115,6 +116,8 @@ async function drive(
   checkpoints: Map<string, unknown>,
   options: {
     malformedReview?: boolean;
+    runParams?: Record<string, unknown>;
+    review?: (request: DeduplicationReviewRequest) => unknown;
     onPut?: () => Promise<void>;
     priorDecisions?: unknown[];
     loseCheckpointAck?: boolean;
@@ -125,7 +128,7 @@ async function drive(
   try {
     await s.initialize(true);
     s.run({
-      ...params,
+      ...(options.runParams ?? params),
       ...(options.priorDecisions
         ? { priorDecisions: options.priorDecisions }
         : {}),
@@ -159,7 +162,7 @@ async function drive(
             message,
             options.malformedReview
               ? {}
-              : reviewResult(
+              : (options.review ?? reviewResult)(
                   message.params["request"] as DeduplicationReviewRequest,
                 ),
           );
@@ -213,7 +216,13 @@ test("preloaded relationships produce the same results and checkpoints as the SD
     },
   });
   const cliCheckpoints = new Map<string, unknown>();
-  const preloaded = await drive(cliCheckpoints);
+  // Equal candidate content must not replace the observation's JSON field order.
+  const preloaded = await drive(cliCheckpoints, {
+    runParams: {
+      ...params,
+      candidates: [Object.fromEntries(Object.entries(first).reverse()), second],
+    },
+  });
   expect(preloaded.message.result).toEqual(direct);
   expect(cliCheckpoints).toEqual(directCheckpoints);
   const recovered = await drive(directCheckpoints);
@@ -625,5 +634,110 @@ test.each([false, true])(
     } finally {
       s.close();
     }
+  },
+);
+
+const evidenceFirst: EvidenceRecord = {
+  findingId: "synthetic-import-1",
+  severity: { level: "high" },
+  evidence: { description: "Original path one", relevant_lines: null },
+  provenance: { revision: "a".repeat(40) },
+};
+const evidenceSecond: EvidenceRecord = {
+  findingId: "synthetic-import-2",
+  severity: { level: "medium" },
+  evidence: {
+    description: "Original path two",
+    custom: { labels: ["original"] },
+  },
+  provenance: { revision: "b".repeat(40) },
+};
+const evidenceParams = {
+  ...params,
+  recordFormat: "evidence-v1" as const,
+  observations: [evidenceFirst],
+  candidates: [evidenceSecond],
+  candidateRelationships: [
+    {
+      observationId: evidenceFirst.findingId,
+      candidateIds: [evidenceSecond.findingId],
+    },
+  ],
+};
+function evidenceReview(request: DeduplicationReviewRequest): unknown {
+  if (request.stage === "screening") return reviewResult(request);
+  return {
+    decision: "SAME",
+    rationale: "One correction closes both original paths.",
+    canonicalFindingId: evidenceFirst.findingId,
+    mergedFinding: {
+      findingId: evidenceFirst.findingId,
+      severity: evidenceFirst.severity,
+      summary: "Both original paths share the same correction.",
+      originalFindingIds: [evidenceFirst.findingId, evidenceSecond.findingId],
+    },
+  };
+}
+
+test("evidence preloaded CLI and SDK preserve identical bindings and recover lost checkpoint ACKs", async () => {
+  const directCheckpoints = new Map<string, unknown>();
+  const direct = await deduplicateRecords({
+    ...evidenceParams,
+    candidateProvider: { potentialDuplicates: async () => [evidenceSecond] },
+    reviewRunner: { run: async (request) => evidenceReview(request) },
+    verifySource: async () => {},
+    checkpointStore: {
+      getReview: async (key) => directCheckpoints.get(key) ?? null,
+      saveReview: async (key, _binding, result) => {
+        directCheckpoints.set(key, result);
+      },
+    },
+  });
+  const state = new Map<string, unknown>();
+  const options = { runParams: evidenceParams, review: evidenceReview };
+  const fresh = await drive(state, options);
+  expect(fresh.exit).toBe(0);
+  expect(fresh.message.result).toEqual(direct);
+  expect(state).toEqual(directCheckpoints);
+  expect(fresh.methods).not.toContain("candidates.get");
+  const cached = await drive(state, options);
+  expect(cached.message.result).toEqual(direct);
+  expect(cached.methods).not.toContain("review.run");
+  const interruptedState = new Map<string, unknown>();
+  const interrupted = await drive(interruptedState, {
+    ...options,
+    loseCheckpointAck: true,
+  });
+  expect(interrupted.exit).toBe(2);
+  expect(interruptedState.size).toBe(1);
+  const recovered = await drive(interruptedState, options);
+  expect(recovered.message.result).toEqual(direct);
+  expect(
+    recovered.methods.filter((method) => method === "review.run"),
+  ).toHaveLength(1);
+  expect(interruptedState).toEqual(directCheckpoints);
+});
+
+test.each([
+  { recordFormat: "future-evidence" },
+  { observations: [first] },
+  { candidates: [second] },
+  { candidates: [{ ...evidenceSecond, severity: { level: "unknown" } }] },
+  { candidateRelationships: [] },
+  {
+    candidateRelationships: [
+      { observationId: evidenceFirst.findingId, candidateIds: ["missing"] },
+    ],
+  },
+  { candidates: [{ ...evidenceFirst, evidence: { changed: true } }] },
+])(
+  "evidence batch validation fails before any source/model/checkpoint callback: %j",
+  async (change) => {
+    const result = await drive(new Map(), {
+      runParams: { ...evidenceParams, ...change },
+      review: evidenceReview,
+    });
+    expect(result.exit).toBe(2);
+    expect(result.methods).toEqual([]);
   },
 );

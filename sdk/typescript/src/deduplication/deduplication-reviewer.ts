@@ -2,6 +2,7 @@ import { z } from "zod";
 import { readFileSync } from "node:fs";
 import Ajv2020, { type ValidateFunction } from "ajv/dist/2020.js";
 import type { Finding } from "../models.js";
+import type { DeduplicationIdentity } from "./record-types.js";
 import type { CodexReviewRunner } from "./codex-review.js";
 import {
   DEFAULT_RESULT_TOOL_NAMESPACE,
@@ -87,9 +88,11 @@ function requireMergedFinding(result: DuplicateDecision): void {
 export type ScreeningResult = z.infer<typeof screeningSchema>;
 export type DuplicateDecision = z.infer<typeof reviewSchema>;
 
-export interface DeduplicationReviewer {
-  screen(findings: readonly Finding[]): Promise<ScreeningResult>;
-  reviewPair(findings: readonly Finding[]): Promise<DuplicateDecision>;
+export interface DeduplicationReviewer<
+  TRecord extends DeduplicationIdentity = Finding,
+> {
+  screen(findings: readonly TRecord[]): Promise<ScreeningResult>;
+  reviewPair(findings: readonly TRecord[]): Promise<DuplicateDecision>;
 }
 
 export function pairKey(ids: readonly string[]): string {
@@ -119,7 +122,7 @@ export function validateReview(
 
 export function validateScreening(
   value: unknown,
-  findings: readonly Finding[],
+  findings: readonly unknown[],
 ): ScreeningResult {
   const result = screeningSchema.parse(value);
   const required = findings
@@ -135,7 +138,7 @@ export function validateScreening(
   return result;
 }
 
-function screeningToolSchema(neighborCount: number): object {
+export function screeningToolSchema(neighborCount: number): object {
   const decisionSchema = z.toJSONSchema(screeningDecisionSchema, {
     target: "openapi-3.0",
   });

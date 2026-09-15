@@ -1,5 +1,5 @@
 import type { Finding } from "../models.js";
-import type { FindingNeighborhood } from "../finding-retrieval.js";
+import type { DeduplicationIdentity } from "./record-types.js";
 import { CodexSecurityError } from "../errors.js";
 import {
   pairKey,
@@ -249,12 +249,16 @@ export function contradictionFreeSubgroups(
 }
 
 /** @internal */
-export class FindingDeduplicator {
+export class FindingDeduplicator<
+  TRecord extends DeduplicationIdentity = Finding,
+> {
   constructor(
     private readonly candidates: {
-      potentialDuplicates(findingId: string): Promise<FindingNeighborhood>;
+      potentialDuplicates(
+        findingId: string,
+      ): Promise<{ finding: TRecord; potentialDuplicates: readonly TRecord[] }>;
     },
-    private readonly reviewer: DeduplicationReviewer,
+    private readonly reviewer: DeduplicationReviewer<TRecord>,
     private readonly signal?: AbortSignal,
     private readonly concurrency = DEFAULT_DEDUPE_CONCURRENCY,
   ) {}
@@ -275,8 +279,8 @@ export class FindingDeduplicator {
     this.signal?.throwIfAborted();
     const concurrency = deduplicationConcurrency(this.concurrency);
     const ids = [...new Set(findingIds)];
-    const findings = new Map<string, Finding>();
-    const neighborhoods = new Array<Finding[]>(ids.length);
+    const findings = new Map<string, TRecord>();
+    const neighborhoods = new Array<TRecord[]>(ids.length);
     await runQueued(
       ids.map((id, index) => async () => {
         const result = await this.candidates.potentialDuplicates(id);

@@ -1,7 +1,8 @@
 # Record deduplication integrations
 
-`deduplicateRecords` accepts complete SDK `Finding` records and injected
-candidate retrieval, model execution, source access and checkpoint storage.
+`deduplicateRecords` accepts complete SDK `Finding` records by default, or
+lossless evidence envelopes with `recordFormat: "evidence-v1"`. Candidate
+retrieval, model execution, source access and checkpoint storage are injected.
 It uses the same screening, independent pair review and contradiction-aware
 grouping as scan deduplication. It does not load scan artifacts, start a model
 process or publish duplicate groups.
@@ -132,18 +133,19 @@ The CLI replies with `{"jsonrpc":"2.0","id":"init","result":{"protocolVersion":1
 `checkpoints` defaults to `false`; enabling it installs the host checkpoint store.
 Then send `run` with a different request ID and these parameters:
 
-| Field                    | Contract                                                                                                      |
-| ------------------------ | ------------------------------------------------------------------------------------------------------------- |
-| `observations`           | Required array of complete SDK Findings; the SDK validates each record.                                       |
-| `candidates`             | Required array of complete candidate Findings, fetched and authorized by the host before invoking the CLI.    |
-| `candidateRelationships` | Required `{observationId, candidateIds}` entries, exactly one per observation, including empty neighborhoods. |
-| `scopeKey`               | Required nonempty corpus scope.                                                                               |
-| `sourceManifest`         | Required JSON object describing host-approved source.                                                         |
-| `sourceTools`            | Optional SDK source tool descriptors; defaults to an empty array.                                             |
-| `settingsDigest`         | Optional host execution-settings binding.                                                                     |
-| `resultToolNamespace`    | Optional result tool namespace; defaults to `review_validator`.                                               |
-| `priorDecisions`         | Optional earlier bound pair decisions; defaults to an empty array.                                            |
-| `concurrency`            | Optional positive integer; defaults to the SDK default of 8.                                                  |
+| Field                    | Contract                                                                                                            |
+| ------------------------ | ------------------------------------------------------------------------------------------------------------------- |
+| `recordFormat`           | Optional `finding-v1` (default) or `evidence-v1`; selects the schema for the complete batch.                        |
+| `observations`           | Required array of records in the selected format; the SDK validates each record.                                    |
+| `candidates`             | Required array of candidate records in the same format, fetched and authorized by the host before invoking the CLI. |
+| `candidateRelationships` | Required `{observationId, candidateIds}` entries, exactly one per observation, including empty neighborhoods.       |
+| `scopeKey`               | Required nonempty corpus scope.                                                                                     |
+| `sourceManifest`         | Required JSON object describing host-approved source.                                                               |
+| `sourceTools`            | Optional SDK source tool descriptors; defaults to an empty array.                                                   |
+| `settingsDigest`         | Optional host execution-settings binding.                                                                           |
+| `resultToolNamespace`    | Optional result tool namespace; defaults to `review_validator`.                                                     |
+| `priorDecisions`         | Optional earlier bound pair decisions; defaults to an empty array.                                                  |
+| `concurrency`            | Optional positive integer; defaults to the SDK default of 8.                                                        |
 
 A minimal empty-corpus run is:
 
@@ -241,6 +243,96 @@ checkpoint store this array is empty. Prior-only outcomes also have an empty
 array; retain the earlier decision's provenance in the host's durable record.
 A screening checkpoint can explain multiple anchor-candidate pairs.
 
-The record review binding contract is now version 3. This deliberately invalidates
-version 2 checkpoint keys and prior pair bindings. The grouping algorithm and
+The complete-Finding review binding contract remains version 3; evidence-v1
+uses version 4 and includes its record format in the context. Format changes
+invalidate checkpoint keys and prior pair bindings. SDK version, source and
+settings changes can also invalidate bindings. The grouping algorithm and
 saved-scan CLI behavior are unchanged.
+
+## Imported evidence without a complete Finding
+
+Use `recordFormat: "evidence-v1"` when original records do not contain every
+required SDK Finding field. The same option works with `deduplicateRecords`
+(`DeduplicateEvidenceRecordsOptions`) and the CLI `run` request. Initialization
+remains protocol version 1. Older executables reject the unsupported run field;
+there is no automatic downgrade or inference from missing fields.
+
+Each observation and candidate has exactly this envelope:
+
+```json
+{
+  "findingId": "synthetic-import-1",
+  "severity": { "level": "high" },
+  "evidence": {
+    "description": "Original report text, including all original fields",
+    "relevant_lines": null,
+    "custom": { "labels": ["original"] }
+  },
+  "provenance": {
+    "repository": "synthetic-repository",
+    "revision": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  }
+}
+```
+
+`findingId` is a nonempty host-bound comparison identity; the scan-specific
+`csf_` format is not required. `severity.level` is the original observed severity
+(`critical`, `high`, `medium`, `low` or `informational`), used by the existing
+group representative ordering. Missing or unsupported severity must be resolved
+by the host rather than replaced with an invented default.
+
+`evidence` and `provenance` accept complete JSON objects. Preserve every original
+field and absent versus null values. Do not manufacture confidence, remediation,
+locations, fingerprints or scan identity. The envelope's provenance describes
+the host-known origin; the separate source manifest and verification callback
+still establish current source access. Source references grant no authority.
+
+A mixed-producer batch uses envelopes for every observation and candidate.
+Include an existing complete SDK Finding unchanged inside its envelope's
+`evidence`. Canonical candidates must retain their contributing original
+evidence and provenance, not only a mutable generated summary. An envelope is
+one assigned record even if its evidence contains multiple contributing sources.
+Raw Finding/envelope mixtures and conflicting evidence for one identity fail.
+The host still supplies the full explicit candidate graph before execution.
+
+Screening and independent pair review use the existing models and grouping
+algorithm. DISTINCT keeps its existing result shape. An evidence-mode SAME
+review instead supplies this strict generated summary:
+
+```json
+{
+  "decision": "SAME",
+  "rationale": "One inspected correction closes both complete reported paths.",
+  "canonicalFindingId": "synthetic-import-1",
+  "mergedFinding": {
+    "findingId": "synthetic-import-1",
+    "severity": { "level": "high" },
+    "summary": "An inclusive summary of the shared issue, correction and uncertainty.",
+    "originalFindingIds": ["synthetic-import-1", "synthetic-import-2"]
+  }
+}
+```
+
+The SDK validates the selected assigned identity, unchanged selected severity,
+nonempty summary and exactly both original IDs once each. Other merged fields,
+including confidence, status or assignment, are rejected. Cached and fresh
+reviews use the same validation. The pair-selected identity does not override
+the existing final grouping representative selection.
+
+**The summary accompanies the immutable originals; it never replaces them.**
+The host must retain the frozen originals and their provenance when publishing,
+and preserve every member's evidence for larger groups. Original IDs refer to
+the two assigned envelopes, not arbitrary IDs nested inside their evidence.
+Publication must not treat this summary as a complete SDK Finding or change
+validation, remediation or assignment state based on it.
+
+Both formats freeze and hash complete records. Evidence mode's versioned
+context binds the envelope, provenance, source, tools and settings to reviews
+and prior decisions. Resume a failed attempt with the exact frozen format and
+inputs, including after a durable checkpoint write loses its acknowledgement.
+Current source verification still precedes checkpoint reuse.
+
+Omitting `recordFormat`, or explicitly selecting `finding-v1`, preserves the
+existing complete-Finding validation, prompts, result schema and version 3
+context. It still rejects incomplete Findings. This extension does not change
+saved-scan deduplication or `--findings-url`, including URL path prefixes.
