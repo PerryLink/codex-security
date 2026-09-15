@@ -1747,7 +1747,18 @@ export async function main(
   ) {
     const { runRecordDedupeCli } =
       await import("./deduplication/records-cli.js");
-    return await runRecordDedupeCli(argv, output, errorOutput);
+    const stream = (destination: Writable): NodeWritable =>
+      destination instanceof NodeWritable
+        ? destination
+        : new NodeWritable({
+            write(chunk, _encoding, callback) {
+              void writeCliOutput(destination, chunk).then(
+                () => callback(),
+                callback,
+              );
+            },
+          });
+    return await runRecordDedupeCli(argv, stream(output), stream(errorOutput));
   }
   argv = normalizeScanImportArguments(defaultListCommand(argv));
   const policyFullOutput =

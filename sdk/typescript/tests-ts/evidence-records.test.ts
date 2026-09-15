@@ -85,10 +85,13 @@ function options(
   return {
     recordFormat: "evidence-v1",
     observations: records,
-    candidateProvider: {
-      potentialDuplicates: async (anchor) =>
-        records.filter((record) => record.findingId !== anchor.findingId),
-    },
+    candidates: records,
+    candidateRelationships: records.map((record) => ({
+      observationId: record.findingId,
+      candidateIds: records
+        .filter((candidate) => candidate.findingId !== record.findingId)
+        .map((candidate) => candidate.findingId),
+    })),
     reviewRunner: { run: async (request) => review(request) },
     scopeKey: "synthetic-scope",
     sourceManifest: { repository: "synthetic", revision: "a".repeat(40) },
@@ -156,8 +159,8 @@ test.each([
 
 test("evidence registration rejects one identity with conflicting original provenance", async () => {
   const input = options();
-  input.candidateProvider.potentialDuplicates = async (original) => [
-    { ...original, provenance: { revision: "different" } },
+  input.candidates = [
+    { ...input.observations[0]!, provenance: { revision: "different" } },
   ];
   await expect(deduplicateRecords(input)).rejects.toThrow(
     "Conflicting finding content",
@@ -276,11 +279,13 @@ test("explicit finding-v1 preserves default prompts, schemas, checkpoint context
     ...options(),
     recordFormat: "finding-v1",
     observations: records,
-    priorRecords: [],
-    candidateProvider: {
-      potentialDuplicates: async (anchor) =>
-        records.filter((record) => record.findingId !== anchor.findingId),
-    },
+    candidates: records,
+    candidateRelationships: records.map((record) => ({
+      observationId: record.findingId,
+      candidateIds: records
+        .filter((candidate) => candidate.findingId !== record.findingId)
+        .map((candidate) => candidate.findingId),
+    })),
     reviewRunner: {
       run: async (request) => {
         requests.push(request);
@@ -363,11 +368,13 @@ test("both formats use the same screening veto, pair orientation and contradicti
     ...options(),
     recordFormat: "finding-v1",
     observations: records,
-    priorRecords: [],
-    candidateProvider: {
-      potentialDuplicates: async (anchor) =>
-        records.filter((record) => record.findingId !== anchor.findingId),
-    },
+    candidates: records,
+    candidateRelationships: records.map((record) => ({
+      observationId: record.findingId,
+      candidateIds: records
+        .filter((candidate) => candidate.findingId !== record.findingId)
+        .map((candidate) => candidate.findingId),
+    })),
     reviewRunner: { run: runReview("finding") },
   });
   const adapted = await deduplicateRecords({

@@ -271,9 +271,7 @@ export class FindingDeduplicator<
 
   async runDetailed(
     findingIds: readonly string[],
-    priorDecisions:
-      | readonly DeduplicationPairConstraint[]
-      | (() => readonly DeduplicationPairConstraint[]) = [],
+    priorDecisions: readonly DeduplicationPairConstraint[] = [],
     includeEvidence = true,
     priorFindings: readonly TRecord[] = [],
   ): Promise<DetailedDeduplicationResult> {
@@ -336,9 +334,7 @@ export class FindingDeduplicator<
       if (!findings.has(finding.findingId))
         findings.set(finding.findingId, finding);
 
-    for (const prior of typeof priorDecisions === "function"
-      ? priorDecisions()
-      : priorDecisions) {
+    for (const prior of priorDecisions) {
       const [left, right] = prior.findingIds;
       if (left === right || !findings.has(left) || !findings.has(right))
         throw new CodexSecurityError(

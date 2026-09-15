@@ -23,6 +23,7 @@ import {
   CodexDeduplicationReviewer,
   requireFinding,
   type DeduplicationReviewer,
+  pairKey,
 } from "./deduplication-reviewer.js";
 import {
   DEFAULT_RESULT_TOOL_NAMESPACE,
@@ -80,13 +81,6 @@ export interface DeduplicationReviewRunner {
   ): Promise<unknown>;
 }
 
-export interface DeduplicationCandidateProvider<
-  TRecord extends DeduplicationIdentity = Finding,
-> {
-  /** Return complete candidate records; the supplied observation is authoritative. */
-  potentialDuplicates(finding: TRecord): Promise<readonly TRecord[]>;
-}
-
 /** Reuse an earlier pair outcome only with its original immutable-input binding. */
 export interface PriorDeduplicationDecision {
   findingIds: readonly [string, string];
@@ -96,9 +90,11 @@ export interface PriorDeduplicationDecision {
 
 interface RecordOptions<TRecord extends DeduplicationIdentity> {
   observations: readonly TRecord[];
-  candidateProvider: DeduplicationCandidateProvider<TRecord>;
-  /** Complete prior-decision endpoints that are no longer candidate nominations. */
-  priorRecords?: readonly TRecord[];
+  candidates: readonly TRecord[];
+  candidateRelationships: readonly {
+    observationId: string;
+    candidateIds: readonly string[];
+  }[];
   reviewRunner: DeduplicationReviewRunner;
   /** Host-established repository identities and exact revisions, without credentials. */
   sourceManifest: JsonObject;
@@ -242,7 +238,7 @@ async function runRecords<TRecord extends DeduplicationIdentity>(
     sourceTools,
   });
   // A finding ID cannot silently acquire another record's evidence in the union
-  // of neighborhoods. Freeze before giving any record to a provider or reviewer.
+  // of neighborhoods. Snapshot the complete batch before any host callback.
   const records = new Map<string, { finding: TRecord; digest: string }>();
   function register(input: TRecord): TRecord {
     requireRecord(input);
@@ -256,11 +252,40 @@ async function runRecords<TRecord extends DeduplicationIdentity>(
     if (!existing) records.set(finding.findingId, { finding, digest });
     return existing?.finding ?? finding;
   }
-  const observations = options.observations.map(register);
-  const priorIds = new Set(priorDecisions.flatMap((prior) => prior.findingIds));
-  const priorRecords = (options.priorRecords ?? [])
-    .map(register)
-    .filter((record) => priorIds.has(record.findingId));
+  const observations = new Set(
+    options.observations.map(register).map(({ findingId }) => findingId),
+  );
+  const candidates = new Map(
+    options.candidates
+      .map(register)
+      .map((finding) => [finding.findingId, finding]),
+  );
+  const neighborhoods = new Map<string, TRecord[]>();
+  for (const {
+    observationId,
+    candidateIds,
+  } of options.candidateRelationships) {
+    if (!observations.has(observationId) || neighborhoods.has(observationId))
+      throw new CodexSecurityError(
+        "Candidate relationships must name each observation once.",
+      );
+    const neighbors = new Set(
+      candidateIds.map((id) => {
+        const candidate = candidates.get(id);
+        if (!candidate)
+          throw new CodexSecurityError(
+            "Candidate relationship names a missing candidate record.",
+          );
+        return candidate;
+      }),
+    );
+    neighbors.delete(records.get(observationId)!.finding);
+    neighborhoods.set(observationId, [...neighbors]);
+  }
+  if (neighborhoods.size !== observations.size)
+    throw new CodexSecurityError(
+      "Candidate relationships must name each observation once.",
+    );
   const assertSourceUnchanged = async () => {
     options.signal?.throwIfAborted();
     await options.verifySource(sourceManifest);
@@ -283,7 +308,6 @@ async function runRecords<TRecord extends DeduplicationIdentity>(
   }
   const checkpointKeys = new Set<string>();
   const pairCheckpointKeys = new Map<string, Set<string>>();
-  const pairKey = (ids: readonly string[]) => JSON.stringify([...ids].sort());
   const runner = {
     async run<T>(review: CodexReview<T>): Promise<T> {
       await assertSourceUnchanged();
@@ -336,43 +360,38 @@ async function runRecords<TRecord extends DeduplicationIdentity>(
   const core = new FindingDeduplicator(
     {
       async potentialDuplicates(id) {
-        const finding = records.get(id)!.finding;
-        const candidates =
-          await options.candidateProvider.potentialDuplicates(finding);
-        options.signal?.throwIfAborted();
-        const neighbors = new Map<string, TRecord>();
-        for (const candidate of candidates) {
-          const registered = register(candidate);
-          if (registered.findingId !== id)
-            neighbors.set(registered.findingId, registered);
-        }
-        return { finding, potentialDuplicates: [...neighbors.values()] };
+        return {
+          finding: records.get(id)!.finding,
+          potentialDuplicates: neighborhoods.get(id)!,
+        };
       },
     },
     reviewer(runner, resultToolNamespace),
     options.signal,
     concurrency,
   );
+  for (const prior of priorDecisions) {
+    if (
+      prior.findingIds.length !== 2 ||
+      !["SAME", "DISTINCT"].includes(prior.decision)
+    )
+      throw new CodexSecurityError(
+        "Prior decisions require one assigned pair and a SAME or DISTINCT decision.",
+      );
+    if (prior.bindingDigest !== pairBinding(prior.findingIds))
+      throw new CodexSecurityError(
+        "Prior decision does not match the current record/source binding.",
+      );
+  }
+  const priorIds = new Set(priorDecisions.flatMap((prior) => prior.findingIds));
+  const priorFindings = [...records.values()]
+    .filter(({ finding }) => priorIds.has(finding.findingId))
+    .map(({ finding }) => finding);
   const result = await core.runDetailed(
-    observations.map((finding) => finding.findingId),
-    () => {
-      for (const prior of priorDecisions) {
-        if (
-          prior.findingIds.length !== 2 ||
-          !["SAME", "DISTINCT"].includes(prior.decision)
-        )
-          throw new CodexSecurityError(
-            "Prior decisions require one assigned pair and a SAME or DISTINCT decision.",
-          );
-        if (prior.bindingDigest !== pairBinding(prior.findingIds))
-          throw new CodexSecurityError(
-            "Prior decision does not match the current record/source binding.",
-          );
-      }
-      return priorDecisions;
-    },
+    [...observations],
+    priorDecisions,
     true,
-    priorRecords,
+    priorFindings,
   );
   await assertSourceUnchanged();
   return {

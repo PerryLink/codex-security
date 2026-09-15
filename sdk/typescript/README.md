@@ -1990,9 +1990,9 @@ associations in the service before `deduplicationStatus` becomes `completed`.
 
 ### Deduplicate records with an external host
 
-`deduplicateRecords` accepts complete SDK `Finding` records by default, or
-lossless imported evidence envelopes with `recordFormat: "evidence-v1"`. The host
-provides candidate retrieval, review execution, source access and checkpoint storage.
+`deduplicateRecords` accepts a complete batch of SDK `Finding` records or
+lossless imported evidence, plus candidate relationships, with host-owned review execution, source access and
+checkpoint storage.
 It reuses scan deduplication's screening and grouping without loading scan
 artifacts, starting a model process or publishing duplicate groups.
 
@@ -2459,7 +2459,3 @@ paths. See the security policy below for the full threat model.
   feature requests
 - [Security policy](https://github.com/openai/codex-security/blob/main/SECURITY.md)
   for private vulnerability reporting and safe operation
-
-For host-owned candidate lookup, source access, model execution and checkpoints,
-`codex-security dedupe --records` exposes the record SDK through a bidirectional
-JSON-RPC stream. See [the record integration protocol](../../docs/record-deduplication.md#headless-cli-protocol).

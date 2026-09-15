@@ -1,19 +1,17 @@
 import { createInterface } from "node:readline";
-import type { Readable } from "node:stream";
+import type { Readable, Writable } from "node:stream";
 import { z } from "zod";
 import type { JsonObject } from "../config.js";
-import type { DeduplicationIdentity } from "./record-types.js";
-import { requireEvidenceRecord } from "./record-evidence.js";
-import { workflowDigest } from "../finding-workflow.js";
-import { requireFinding } from "./deduplication-reviewer.js";
-import {
-  deduplicateRecords,
-  type DeduplicationReviewRequest,
-} from "./records.js";
+import type { Finding } from "../models.js";
+import type { EvidenceRecord } from "./record-evidence.js";
+import type { DeduplicationReviewRequest } from "./records.js";
+import { deduplicateRecords } from "./records.js";
 
 const object = z.record(z.string(), z.json());
 const runParams = z.strictObject({
+  protocolVersion: z.literal(1),
   recordFormat: z.enum(["finding-v1", "evidence-v1"]).optional(),
+  checkpoints: z.boolean().default(false),
   observations: z.array(z.unknown()),
   candidates: z.array(z.unknown()),
   candidateRelationships: z.array(
@@ -49,67 +47,6 @@ const runParams = z.strictObject({
     .optional(),
   concurrency: z.number().int().positive().optional(),
 });
-const initializeParams = z.strictObject({
-  protocolVersion: z.literal(1),
-  checkpoints: z.boolean().default(false),
-});
-
-/** Resolve the complete host-selected graph before any source or model callback. */
-function preloadedCandidates<TRecord extends DeduplicationIdentity>(
-  params: z.infer<typeof runParams>,
-  requireRecord: (value: unknown) => asserts value is TRecord,
-) {
-  const records = new Map<string, TRecord>();
-  for (const input of [...params.observations, ...params.candidates]) {
-    requireRecord(input);
-    const previous = records.get(input.findingId);
-    if (previous && workflowDigest(previous) !== workflowDigest(input))
-      throw new Error("Conflicting finding content in the comparison batch.");
-    records.set(input.findingId, input);
-  }
-  const validated = (inputs: readonly unknown[]): TRecord[] =>
-    inputs.map((input) => {
-      requireRecord(input);
-      return input;
-    });
-  const observationRecords = validated(params.observations);
-  const observations = new Set(
-    observationRecords.map((finding) => finding.findingId),
-  );
-  const candidates = new Set(
-    validated(params.candidates).map((finding) => finding.findingId),
-  );
-  const neighborhoods = new Map<string, readonly TRecord[]>();
-  for (const relationship of params.candidateRelationships) {
-    if (
-      !observations.has(relationship.observationId) ||
-      neighborhoods.has(relationship.observationId)
-    )
-      throw new Error(
-        "Candidate relationships must name each observation once.",
-      );
-    neighborhoods.set(
-      relationship.observationId,
-      relationship.candidateIds.map((id) => {
-        if (!candidates.has(id))
-          throw new Error(
-            "Candidate relationship names a missing candidate record.",
-          );
-        return records.get(id)!;
-      }),
-    );
-  }
-  if (neighborhoods.size !== observations.size)
-    throw new Error("Candidate relationships must name each observation once.");
-  return {
-    observations: observationRecords,
-    priorRecords: validated(params.candidates),
-    candidateProvider: {
-      potentialDuplicates: async (finding: TRecord) =>
-        neighborhoods.get(finding.findingId)!,
-    },
-  };
-}
 const rpcId = z.union([z.string(), z.number().int()]);
 const request = z.strictObject({
   jsonrpc: z.literal("2.0"),
@@ -135,17 +72,12 @@ const cancel = z.strictObject({
 });
 
 type Id = z.infer<typeof rpcId>;
-type Output = {
-  write(text: string, callback?: (error?: Error | null) => void): unknown;
-  on?(event: "error", listener: () => void): unknown;
-  removeListener?(event: "error", listener: () => void): unknown;
-};
 type Pending = { resolve(value: unknown): void; reject(error: Error): void };
 
-function writeDiagnostic(stream: Output, message: string): void {
+function writeDiagnostic(stream: Writable, message: string): void {
   const ignoreError = () => {};
-  const release = () => stream.removeListener?.("error", ignoreError);
-  stream.on?.("error", ignoreError);
+  const release = () => stream.removeListener("error", ignoreError);
+  stream.on("error", ignoreError);
   try {
     // Diagnostics never delay the result; retain their observer for late errors.
     stream.write(message, () => setImmediate(release));
@@ -157,17 +89,14 @@ function writeDiagnostic(stream: Output, message: string): void {
 /** One isolated attempt: all source, model and durable state operations belong to the host. */
 export async function runRecordDedupeProtocol(
   input: Readable,
-  output: Output,
+  output: Writable,
   signal?: AbortSignal,
 ): Promise<number> {
   const lines = createInterface({ input, crlfDelay: Infinity });
   const controller = new AbortController();
   const pending = new Map<string, Pending>();
   let sequence = 0;
-  let initialized = false;
-  let checkpoints = false;
   let runId: Id | undefined;
-  let initializeId: Id | undefined;
   let requestId: Id | null = null;
   let finished = false;
   let outputFailed = false;
@@ -204,22 +133,20 @@ export async function runRecordDedupeProtocol(
       signal?.removeEventListener("abort", aborted);
       input.removeListener("error", inputError);
       const drained = () => {
-        output.removeListener?.("error", outputError);
+        output.removeListener("error", outputError);
         resolveExit(outputFailed ? 2 : code);
       };
-      if (output.on) {
-        try {
-          // Keep the error listener through queued writes and their error events.
-          output.write("", (error) => {
-            if (error) outputFailed = true;
-            // Writable error events can follow callbacks in the same turn.
-            setImmediate(drained);
-          });
-        } catch {
-          outputFailed = true;
+      try {
+        // Keep the error listener through queued writes and their error events.
+        output.write("", (error) => {
+          if (error) outputFailed = true;
+          // Writable error events can follow callbacks in the same turn.
           setImmediate(drained);
-        }
-      } else drained();
+        });
+      } catch {
+        outputFailed = true;
+        setImmediate(drained);
+      }
     }
   }
   function aborted(): void {
@@ -287,27 +214,8 @@ export async function runRecordDedupeProtocol(
       return;
     }
     const message = request.parse(value);
-    if (message.method === "initialize") {
-      if (initialized || runId !== undefined)
-        throw new Error("Record protocol is already initialized.");
-      const params = initializeParams.parse(message.params);
-      initialized = true;
-      initializeId = message.id;
-      checkpoints = params.checkpoints;
-      send({ jsonrpc: "2.0", id: message.id, result: { protocolVersion: 1 } });
-      requestId = null;
-      return;
-    }
-    if (
-      message.method !== "run" ||
-      !initialized ||
-      runId !== undefined ||
-      message.id === initializeId
-    ) {
-      throw new Error(
-        "Expected one run request with a new ID after initialize.",
-      );
-    }
+    if (message.method !== "run" || runId !== undefined)
+      throw new Error("Expected one run request.");
     runId = message.id;
     const params = runParams.parse(message.params);
     const { recordFormat, ...settings } = params;
@@ -320,7 +228,7 @@ export async function runRecordDedupeProtocol(
       },
       verifySource: (manifest: JsonObject) =>
         acknowledge("source.verify", { manifest }),
-      ...(checkpoints
+      ...(params.checkpoints
         ? {
             checkpointStore: {
               getReview: (key: string) => call("checkpoint.get", { key }),
@@ -335,13 +243,15 @@ export async function runRecordDedupeProtocol(
       recordFormat === "evidence-v1"
         ? deduplicateRecords({
             ...options,
-            ...preloadedCandidates(params, requireEvidenceRecord),
             recordFormat,
+            observations: params.observations as EvidenceRecord[],
+            candidates: params.candidates as EvidenceRecord[],
           })
         : deduplicateRecords({
             ...options,
-            ...preloadedCandidates(params, requireFinding),
             recordFormat,
+            observations: params.observations as Finding[],
+            candidates: params.candidates as Finding[],
           });
     void execution.then(
       (result) => {
@@ -384,7 +294,7 @@ export async function runRecordDedupeProtocol(
   });
   lines.on("error", inputError);
   input.on("error", inputError);
-  output.on?.("error", outputError);
+  output.on("error", outputError);
   signal?.addEventListener("abort", aborted, { once: true });
   if (signal?.aborted) aborted();
   return await exit;
@@ -393,8 +303,8 @@ export async function runRecordDedupeProtocol(
 /** Bypass interactive CLI setup and update checks for the headless transport. */
 export async function runRecordDedupeCli(
   argv: readonly string[],
-  output: Output,
-  diagnostics: Output,
+  output: Writable,
+  diagnostics: Writable,
 ): Promise<number> {
   if (argv.length !== 2 || argv[0] !== "dedupe" || argv[1] !== "--records") {
     writeDiagnostic(

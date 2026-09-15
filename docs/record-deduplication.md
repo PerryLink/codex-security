@@ -1,8 +1,7 @@
 # Record deduplication integrations
 
-`deduplicateRecords` accepts complete SDK `Finding` records by default, or
-lossless evidence envelopes with `recordFormat: "evidence-v1"`. Candidate
-retrieval, model execution, source access and checkpoint storage are injected.
+`deduplicateRecords` accepts a complete batch of SDK `Finding` records and
+candidate relationships, with host-owned model execution, source access and checkpoint storage.
 It uses the same screening, independent pair review and contradiction-aware
 grouping as scan deduplication. It does not load scan artifacts, start a model
 process or publish duplicate groups.
@@ -10,37 +9,30 @@ process or publish duplicate groups.
 ## Call the SDK
 
 ```typescript
-import {
-  deduplicateRecords,
-  type DeduplicateRecordsOptions,
-  type Finding,
-} from "@openai/codex-security";
+import { deduplicateRecords } from "@openai/codex-security";
 
-async function reviewImportedFindings(
-  observations: Finding[],
-  host: Pick<
-    DeduplicateRecordsOptions,
-    | "candidateProvider"
-    | "reviewRunner"
-    | "sourceManifest"
-    | "sourceTools"
-    | "verifySource"
-    | "checkpointStore"
-  >,
-) {
-  return await deduplicateRecords({
-    ...host,
-    observations,
-    scopeKey: "synthetic-repository-v1",
-    concurrency: 1,
-  });
-}
+const result = await deduplicateRecords({
+  observations,
+  candidates,
+  candidateRelationships,
+  reviewRunner,
+  sourceManifest,
+  sourceTools,
+  verifySource,
+  checkpointStore,
+  scopeKey: "synthetic-repository-v1",
+  concurrency: 1,
+});
 ```
 
 ## Finding identities and candidates
 
-The candidate provider receives an immutable observation and returns complete
-candidate Findings. Finding IDs must satisfy the SDK schema (`csf_` followed by
+Supply `observations`, `candidates`, and one `candidateRelationships` entry per
+observation, including empty neighborhoods. Candidate IDs resolve only against
+`candidates`; supplying a record does not nominate it for every observation.
+The SDK validates and snapshots the complete batch before any host callback.
+Missing neighborhoods, dangling references, and conflicting record content fail the call.
+Finding IDs must satisfy the SDK schema (`csf_` followed by
 24 lowercase hexadecimal characters) and identify the same content throughout
 the run. Integrations with another identifier format must retain their own
 mapping; the SDK does not change original finding identities.
@@ -94,11 +86,9 @@ contradiction subgrouping. Each pair outcome records its screening, pair-review
 or prior origin and an immutable-input `bindingDigest`. Previously persisted
 outcomes can be supplied as `priorDecisions`; their records must be present in
 the current corpus and their bindings must still match. Stale or conflicting
-constraints fail the call. SDK callers can supply complete endpoints through
-`priorRecords` when their candidate provider no longer nominates those records.
-The CLI retains prior endpoints from the preloaded candidate array. These records
-participate in prior constraints and grouping without adding model comparisons;
-unrelated preloaded records remain excluded. A prior DISTINCT remains a grouping constraint even
+constraints fail the call. Prior endpoints are retained from the preloaded
+records for grouping even when they are no longer nominated; this does not add
+model comparisons or include unrelated candidates. A prior DISTINCT remains a grouping constraint even
 if current nearest-neighbor retrieval did not nominate that pair.
 
 For this record-level API, `deduplicationStatus: "completed"` means review and
@@ -117,39 +107,29 @@ does not prompt, load local scan state, start a model runtime or publish results
 The transport is bidirectional JSON-RPC 2.0, one UTF-8 JSON object per line on
 stdin/stdout. Stdout contains only protocol messages; protocol execution does not
 write diagnostics to stderr.
-There are no batch messages. A process serves one initialized attempt and exits
+There are no JSON-RPC batch messages. A process serves one `run` request and exits
 when its run succeeds, fails or is canceled. Keep stdin open and service callbacks
 until the final run response; piping only a run request and closing stdin cancels
 unfinished work.
 
-The host first sends:
+Send a `run` request with these parameters. `protocolVersion` must be `1`;
+`checkpoints` defaults to `false` and enables host checkpoint callbacks when true.
 
-```json
-{
-  "jsonrpc": "2.0",
-  "id": "init",
-  "method": "initialize",
-  "params": { "protocolVersion": 1, "checkpoints": true }
-}
-```
-
-The CLI replies with `{"jsonrpc":"2.0","id":"init","result":{"protocolVersion":1}}`.
-`checkpoints` defaults to `false`; enabling it installs the host checkpoint store.
-Then send `run` with a different request ID and these parameters:
-
-| Field                    | Contract                                                                                                            |
-| ------------------------ | ------------------------------------------------------------------------------------------------------------------- |
-| `recordFormat`           | Optional `finding-v1` (default) or `evidence-v1`; selects the schema for the complete batch.                        |
-| `observations`           | Required array of records in the selected format; the SDK validates each record.                                    |
-| `candidates`             | Required array of candidate records in the same format, fetched and authorized by the host before invoking the CLI. |
-| `candidateRelationships` | Required `{observationId, candidateIds}` entries, exactly one per observation, including empty neighborhoods.       |
-| `scopeKey`               | Required nonempty corpus scope.                                                                                     |
-| `sourceManifest`         | Required JSON object describing host-approved source.                                                               |
-| `sourceTools`            | Optional SDK source tool descriptors; defaults to an empty array.                                                   |
-| `settingsDigest`         | Optional host execution-settings binding.                                                                           |
-| `resultToolNamespace`    | Optional result tool namespace; defaults to `review_validator`.                                                     |
-| `priorDecisions`         | Optional earlier bound pair decisions; defaults to an empty array.                                                  |
-| `concurrency`            | Optional positive integer; defaults to the SDK default of 8.                                                        |
+| Field                    | Contract                                                                                                      |
+| ------------------------ | ------------------------------------------------------------------------------------------------------------- |
+| `protocolVersion`        | Required protocol version `1`.                                                                                |
+| `recordFormat`           | Optional `finding-v1` (default) or `evidence-v1`; selects the schema for every observation and candidate.     |
+| `checkpoints`            | Optional boolean enabling the host checkpoint store; defaults to `false`.                                     |
+| `observations`           | Required observation records in the selected format; the SDK validates each record.                           |
+| `candidates`             | Required candidate records in the selected format, fetched and authorized before invoking the CLI.            |
+| `candidateRelationships` | Required `{observationId, candidateIds}` entries, exactly one per observation, including empty neighborhoods. |
+| `scopeKey`               | Required nonempty corpus scope.                                                                               |
+| `sourceManifest`         | Required JSON object describing host-approved source.                                                         |
+| `sourceTools`            | Optional SDK source tool descriptors; defaults to an empty array.                                             |
+| `settingsDigest`         | Optional host execution-settings binding.                                                                     |
+| `resultToolNamespace`    | Optional result tool namespace; defaults to `review_validator`.                                               |
+| `priorDecisions`         | Optional earlier bound pair decisions; defaults to an empty array.                                            |
+| `concurrency`            | Optional positive integer; defaults to the SDK default of 8.                                                  |
 
 A minimal empty-corpus run is:
 
@@ -159,6 +139,7 @@ A minimal empty-corpus run is:
   "id": "run",
   "method": "run",
   "params": {
+    "protocolVersion": 1,
     "observations": [],
     "candidates": [],
     "candidateRelationships": [],
@@ -168,9 +149,9 @@ A minimal empty-corpus run is:
 }
 ```
 
-The host fetches, authorizes and freezes the entire comparison batch before launching the CLI: observations, candidate records, explicit neighborhoods, exact source revisions, execution settings and prior decisions. Candidate IDs resolve only against the supplied `candidates` array. Missing neighborhoods, dangling references and conflicting record content fail before callbacks. The CLI uses an in-memory candidate provider for the existing algorithm; it never requests candidates from the host or an HTTP endpoint. Supplying a candidate record does not nominate it for every observation.
-
-Saved-scan mode retains `--findings-url`, including base URLs with path prefixes (for example `https://example.test/security/findings`). Record mode needs no findings service. Model reviews, source verification and durable checkpoint acknowledgements remain host operations; canonical publication follows only after the host receives and verifies the results.
+The host fetches and authorizes the complete batch before invoking the CLI.
+The SDK uses the same batch inputs and validation for direct calls. The CLI
+never requests candidates from the host or an HTTP endpoint.
 
 The CLI sends callback requests with contiguous increasing IDs `sdk:1`, `sdk:2`,
 and so on, in emission order within each process. Requests can overlap;
@@ -205,11 +186,8 @@ The host registers and executes the request's source and result tools, enforces
 access to the approved repositories, and owns model execution and durable state.
 Before a run is accepted, a rejected request receives an error with its own ID;
 unidentifiable input uses `null`. Once accepted, the run ID identifies its terminal
-response. An acknowledged initialization ID is not reused for later input errors.
-
-Protocol execution does not write diagnostics to stderr. Use the structured
-stdout error and process exit status; an unread stderr pipe cannot block the
-attempt. Static command-usage errors may still use stderr.
+response. Use the structured stdout error and process exit status. Static command-usage
+errors may still use stderr.
 
 The CLI does not execute source tool descriptors itself. Credentials belong in
 the host's execution environment, not protocol arguments or source descriptors.
@@ -247,18 +225,12 @@ checkpoint store this array is empty. Prior-only outcomes also have an empty
 array; retain the earlier decision's provenance in the host's durable record.
 A screening checkpoint can explain multiple anchor-candidate pairs.
 
-The complete-Finding review binding contract remains version 3; evidence-v1
-uses version 4 and includes its record format in the context. Format changes
-invalidate checkpoint keys and prior pair bindings. SDK version, source and
-settings changes can also invalidate bindings. The grouping algorithm and
-saved-scan CLI behavior are unchanged.
-
 ## Imported evidence without a complete Finding
 
 Use `recordFormat: "evidence-v1"` when original records do not contain every
 required SDK Finding field. The same option works with `deduplicateRecords`
-(`DeduplicateEvidenceRecordsOptions`) and the CLI `run` request. Initialization
-remains protocol version 1. Older executables reject the unsupported run field;
+(`DeduplicateEvidenceRecordsOptions`) and the single CLI `run` request, which
+uses protocol version 1. Older executables reject the unsupported run field;
 there is no automatic downgrade or inference from missing fields.
 
 Each observation and candidate has exactly this envelope:

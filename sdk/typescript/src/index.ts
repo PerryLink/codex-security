@@ -135,7 +135,6 @@ export type {
   DeduplicateRecordsOptions,
   DeduplicateEvidenceRecordsOptions,
   DeduplicateRecordsResult,
-  DeduplicationCandidateProvider,
   DeduplicationCheckpointStore,
   DeduplicationReviewRequest,
   DeduplicationReviewRunner,
