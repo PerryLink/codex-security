@@ -93,6 +93,7 @@ from workbench_findings import (
 from workbench_remediation import remediation_claim_is_active
 from workbench_scan_start import (
     archive_scan,
+    composition_children,
     create_scan_directory,
     insert_running_scan,
     read_composition_checkpoint,
@@ -1307,27 +1308,65 @@ def complete_scan_locked(
             )
     wrote = False
     try:
+        documents = None
+        if current_manifest_path is not None and not already_sealed:
+            checkpoint = read_composition_checkpoint(scan) if scan["mode"] == "deep" else None
+            if (
+                checkpoint is not None
+                and checkpoint.get("terminalReason") == "capped"
+                and any(
+                    item.get("scanId") not in checkpoint["mergedScanIds"]
+                    for item in checkpoint["passes"]
+                )
+            ):
+                # A saved deadline can expire before resumed children run again.
+                for child in composition_children(connection, scan):
+                    if (
+                        child["id"] not in checkpoint["mergedScanIds"]
+                        and child["status"] == "running"
+                    ):
+                        saved_results.fail_scan(
+                            _WORKBENCH_DB_CONTEXT,
+                            connection,
+                            argparse.Namespace(
+                                scan_id=child["id"],
+                                claim_token=child["handoff_claim_token"],
+                                cost_json=None,
+                                message="Parent Deep Scan reached its configured limit.",
+                            ),
+                        )
+                recovered = saved_results.save_composed_checkpoint(
+                    _WORKBENCH_DB_CONTEXT, connection, scan, scan_dir
+                )
+                coverage = read_json_object(scan_dir / ARTIFACTS["coverage"])
+                coverage["completeness"] = "partial"
+                for field in ("surfaces", "explicitExclusions", "deferred", "openQuestions"):
+                    rows = coverage.setdefault(field, [])
+                    for row in recovered["coverage"].get(field, []):
+                        if row not in rows:
+                            rows.append(row)
+                documents = current_manifest, {"findings": recovered["findings"]}, coverage
+            elif scan["mode"] != "deep":
+                documents = saved_results.merge_saved_results(
+                    scan_dir,
+                    scan["id"],
+                    completion_binding,
+                    connection.execute(
+                        "SELECT * FROM deep_scan_workers WHERE scan_id = ? ORDER BY created_at, id",
+                        (scan["id"],),
+                    ).fetchall(),
+                    warnings,
+                    stopped=False,
+                    reason="",
+                )
         prepared = _prepare_scan_finalization(
             scan_dir,
             expected_coverage_mode=expected_coverage_mode(scan),
             completion_binding=completion_binding,
-            # Save the finished Deep result as submitted. Worker drafts and
-            # recovery repairs belong to the stopped-scan path.
-            completion_warnings=warnings if scan["mode"] != "deep" else None,
-            draft_documents=saved_results.merge_saved_results(
-                scan_dir,
-                scan["id"],
-                completion_binding,
-                connection.execute(
-                    "SELECT * FROM deep_scan_workers WHERE scan_id = ? ORDER BY created_at, id",
-                    (scan["id"],),
-                ).fetchall(),
-                warnings,
-                stopped=False,
-                reason="",
-            )
-            if scan["mode"] != "deep" and current_manifest_path is not None and not already_sealed
+            completion_warnings=warnings
+            if scan["mode"] != "deep" or documents is not None
             else None,
+            draft_documents=documents,
         )
         add_warning()
         wrote = True

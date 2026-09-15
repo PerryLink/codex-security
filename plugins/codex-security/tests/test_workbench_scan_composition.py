@@ -21,7 +21,9 @@ def recipe(target: Path, mode: str = "standard") -> dict:
     }
 
 
-def register(state: Path, target: Path, directory: Path, *, mode="standard", parent=None) -> dict:
+def register(
+    state: Path, target: Path, directory: Path, *, mode="standard", parent=None, paths=()
+) -> dict:
     missing = []
     current = directory
     while not current.exists():
@@ -29,6 +31,9 @@ def register(state: Path, target: Path, directory: Path, *, mode="standard", par
         current = current.parent
     for path in reversed(missing):
         path.mkdir(mode=0o700)
+    saved_recipe = recipe(target, mode)
+    if paths:
+        saved_recipe["target"] = {"kind": "paths", "paths": list(paths)}
     return run_workbench(
         state,
         "register-cli-scan",
@@ -37,7 +42,7 @@ def register(state: Path, target: Path, directory: Path, *, mode="standard", par
         "--scan-dir",
         str(directory),
         "--recipe-json",
-        json.dumps(recipe(target, mode)),
+        json.dumps(saved_recipe),
         *(("--parent-scan-id", parent) if parent else ()),
     )
 
@@ -339,6 +344,30 @@ def test_stopped_standard_cannot_resume_and_preserves_checkpoint(
     )
 
 
+def test_stopped_standard_does_not_rebind_another_scans_coverage(tmp_path: Path) -> None:
+    target = tmp_path / "target"
+    target.mkdir()
+    (target / "app.py").write_text("\n" * 50)
+    state = tmp_path / "state"
+    scan = register(state, target, tmp_path / "scan")
+    directory = Path(scan["scanDir"])
+    write_completed_contract(directory, scan["scanId"], target, relative_path="app.py")
+    coverage = json.loads((directory / "coverage.json").read_text())
+    coverage["scanId"] = "00000000-0000-4000-8000-000000000000"
+    raw = json.dumps(coverage).encode()
+    (directory / "coverage.json").write_bytes(raw)
+    for name in ("scan-manifest.json", "findings.json", "report.md"):
+        (directory / name).unlink()
+    run_workbench(state, "fail-scan", "--scan-id", scan["scanId"], "--message", "Interrupted.")
+    assert (directory / "coverage.json").read_bytes() == raw
+    assert not (directory / "scan-manifest.json").exists()
+    assert not (directory / "findings.json").exists()
+    assert not list((directory / "checkpoints").glob("*.json"))
+    assert (
+        run_workbench(state, "get-scan", "--scan-id", scan["scanId"])["scan"]["findingCount"] == 0
+    )
+
+
 @pytest.mark.parametrize("accepted_membership", ["merged", "represented"])
 def test_native_cancel_retains_accepted_and_later_unmerged_findings(
     tmp_path: Path, accepted_membership: str
@@ -429,6 +458,206 @@ def test_native_cancel_retains_accepted_and_later_unmerged_findings(
             == "complete"
         )
     assert json.loads((parent_dir / CHECKPOINT).read_text()) == saved
+
+
+@pytest.mark.parametrize("has_aggregate", [False, True])
+@pytest.mark.parametrize("child_state", ["failed", "checkpoint", "coverage"])
+def test_capped_scoped_parent_preserves_unmerged_child_results(
+    tmp_path: Path, has_aggregate: bool, child_state: str
+) -> None:
+    target = tmp_path / "target"
+    (target / "src").mkdir(parents=True)
+    (target / "src/app.py").write_text("\n" * 50)
+    (target / "outside.py").write_text("print('outside selected scope')\n")
+    state = tmp_path / "state"
+    parent = register(state, target, tmp_path / "scan", mode="deep", paths=["src"])
+    parent_dir = Path(parent["scanDir"])
+    children = []
+    for index in (1, 2):
+        directory = parent_dir / f"artifacts/deep-scan/passes/pass-{index}"
+        child = register(state, target, directory, parent=parent["scanId"], paths=["src"])
+        write_completed_contract(
+            directory,
+            child["scanId"],
+            target,
+            relative_path="src/app.py",
+            identity_anchor=f"independent-{index}",
+            include_paths=["src"],
+            coverage_mode="scoped_path",
+            inventory_strategy="scoped_path",
+        )
+        findings = json.loads((directory / "findings.json").read_text())["findings"]
+        coverage = json.loads((directory / "coverage.json").read_text())
+        (directory / "artifacts").mkdir()
+        (directory / "artifacts/receipt.json").write_text(json.dumps({"pass": index}))
+        coverage["surfaces"][0]["receiptRefs"] = ["artifacts/receipt.json"]
+        if index == 2 and child_state == "coverage":
+            coverage["surfaces"][0]["disposition"] = "needs_follow_up"
+            coverage["deferred"] = [
+                {
+                    "id": "unvalidated",
+                    "reason": "Candidate requires validation.",
+                    "candidate": {
+                        "title": "Unvalidated observation",
+                        "summary": "Needs a source trace.",
+                    },
+                    "surfaceIds": ["surface_archive_extraction"],
+                }
+            ]
+        (directory / "coverage.json").write_text(json.dumps(coverage))
+        if index == 1:
+            run_workbench(state, "complete-scan", "--scan-id", child["scanId"])
+        else:
+            if child_state != "coverage":
+                write_checkpoint(
+                    directory / "checkpoints",
+                    {
+                        "scanId": child["scanId"],
+                        "findings": findings,
+                        "coverage": coverage,
+                        "complete": False,
+                    },
+                )
+                (directory / "coverage.json").unlink()
+            for name in ("scan-manifest.json", "findings.json", "report.md"):
+                (directory / name).unlink()
+            if child_state in {"failed", "coverage"}:
+                run_workbench(
+                    state,
+                    "fail-scan",
+                    "--scan-id",
+                    child["scanId"],
+                    "--message",
+                    "Discovery deadline reached.",
+                )
+        protected = {
+            path.relative_to(directory).as_posix(): path.read_bytes()
+            for path in directory.rglob("*")
+            if path.is_file()
+        }
+        children.append((child, directory, protected))
+    first, first_dir, _ = children[0]
+    original = json.loads((first_dir / "findings.json").read_text())["findings"][0]
+    accepted = copy.deepcopy(original)
+    accepted["provenance"]["sourceFindingIds"] = [f"{first['scanId']}:0"]
+    accepted["provenance"]["sourceFindings"] = [{"id": f"{first['scanId']}:0", "finding": original}]
+    saved = checkpoint(
+        state,
+        parent,
+        passes=[
+            {"directory": directory.relative_to(parent_dir).as_posix(), "scanId": child["scanId"]}
+            for child, directory, _ in children
+        ],
+        merged=[first["scanId"]] if has_aggregate else [],
+        terminal="capped",
+    )
+    saved["noNewStreak"] = 2
+    saved["consecutiveErrors"] = 1
+    saved["aggregate"] = (
+        {
+            "scanId": parent["scanId"],
+            "findings": [accepted],
+            "coverage": {
+                "completeness": "partial",
+                "surfaces": [],
+                "deferred": [{"reason": "Accepted partial coverage."}],
+            },
+        }
+        if has_aggregate
+        else None
+    )
+    run_workbench(
+        state,
+        "save-scan-artifact",
+        "--scan-id",
+        parent["scanId"],
+        "--artifact-path",
+        CHECKPOINT,
+        input_text=json.dumps(saved),
+    )
+    checkpoint_bytes = (parent_dir / CHECKPOINT).read_bytes()
+    write_completed_contract(
+        parent_dir,
+        parent["scanId"],
+        target,
+        relative_path="src/app.py",
+        include_paths=["src"],
+        coverage_mode="scoped_path",
+        inventory_strategy="scoped_path",
+    )
+    manifest_before = json.loads((parent_dir / "scan-manifest.json").read_text())
+    coverage_path = parent_dir / "coverage.json"
+    submitted_coverage = json.loads(coverage_path.read_text())
+    submitted_coverage["deferred"] = [{"id": "limit", "reason": "Configured cost limit reached."}]
+    coverage_path.write_text(json.dumps(submitted_coverage))
+    (parent_dir / "findings.json").write_text(
+        json.dumps({"findings": [accepted] if has_aggregate else []})
+    )
+    run_workbench(state, "prepare-scan-completion", "--scan-id", parent["scanId"])
+    prepared = {
+        name: (parent_dir / name).read_bytes()
+        for name in ("scan-manifest.json", "findings.json", "coverage.json", "report.md")
+    }
+    for _ in range(2):
+        run_workbench(state, "complete-scan", "--scan-id", parent["scanId"])
+    context = run_workbench(state, "get-scan", "--scan-id", parent["scanId"])["scan"]
+    assert context["findingCount"] == (1 if child_state == "coverage" else 2)
+    assert context["progress"]["status"] == "complete"
+    assert context["progress"]["independentReviews"]["active"] == 0
+    findings = json.loads((parent_dir / "findings.json").read_text())["findings"]
+    coverage = json.loads((parent_dir / "coverage.json").read_text())
+    manifest = json.loads((parent_dir / "scan-manifest.json").read_text())
+    assert manifest["scan"]["target"] == manifest_before["scan"]["target"]
+    assert manifest["scan"]["scope"] == manifest_before["scan"]["scope"]
+    assert coverage["mode"] == "scoped_path"
+    assert coverage["includePaths"] == ["src"]
+    assert coverage["completeness"] == "partial"
+    assert submitted_coverage["deferred"][0] in coverage["deferred"]
+    assert (parent_dir / CHECKPOINT).read_bytes() == checkpoint_bytes
+    for name, contents in prepared.items():
+        assert (parent_dir / name).read_bytes() == contents
+    for index, (child, directory, protected) in enumerate(children, 1):
+        source_id = f"{child['scanId']}:0"
+        if index == 2 and child_state == "coverage":
+            assert all(source_id not in item["provenance"]["sourceFindingIds"] for item in findings)
+            row = next(
+                row for row in coverage["deferred"] if row["id"] == f"{child['scanId']}/unvalidated"
+            )
+            assert row["candidate"] == {
+                "title": "Unvalidated observation",
+                "summary": "Needs a source trace.",
+            }
+            assert row["surfaceIds"] == [f"{child['scanId']}/surface_archive_extraction"]
+        else:
+            finding = next(
+                item for item in findings if item["provenance"]["sourceFindingIds"] == [source_id]
+            )
+            source = finding["provenance"]["sourceFindings"][0]
+            assert (
+                source["finding"]
+                == json.loads((directory / "findings.json").read_text())["findings"][0]
+            )
+        if index == 1 and has_aggregate:
+            assert finding["findingId"] == accepted["findingId"]
+            assert finding["identity"] == accepted["identity"]
+        else:
+            row = next(
+                row
+                for row in coverage["surfaces"]
+                if row["id"] == f"{child['scanId']}/surface_archive_extraction"
+            )
+            assert row["receiptRefs"] == [
+                f"artifacts/deep-scan/passes/pass-{index}/artifacts/receipt.json"
+            ]
+        for name, contents in protected.items():
+            assert (directory / name).read_bytes() == contents
+        assert run_workbench(state, "get-scan", "--scan-id", child["scanId"])["scan"]["progress"][
+            "status"
+        ] == ("complete" if index == 1 else "failed")
+    assert any("artifacts/deep-scan/passes/pass-2" in row["reason"] for row in coverage["deferred"])
+    assert [scan["scanId"] for scan in run_workbench(state, "list-scans")["scans"]] == [
+        parent["scanId"]
+    ]
 
 
 @pytest.mark.parametrize("child_state", ["complete", "checkpoint"])

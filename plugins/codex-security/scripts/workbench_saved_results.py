@@ -643,7 +643,20 @@ def merge_saved_results(
         parent = next((draft for relative, draft, _ in sources if relative == latest_reducer), None)
 
     if parent is None and not sources:
-        return None
+        if not stopped or frozen_source_digests is not None:
+            return None
+        try:
+            coverage = _read_scan_local_json(scan_dir, "coverage.json", "Saved scan coverage")
+        except (ContractError, OSError, ValueError):
+            return None
+        if coverage.get("scanId", scan_id) != scan_id:
+            return None
+        parent = {"scanId": scan_id, "findings": [], "coverage": coverage, "complete": False}
+        payload = _encoded(parent)
+        digest = hashlib.sha256(payload).hexdigest()
+        relative = f"checkpoints/{digest}.json"
+        write_scan_local_bytes(scan_dir, relative, payload)
+        source_digests[relative] = digest
     if (
         parent_manifest
         and parent_manifest["scan"].get("sealedAt")
@@ -1372,11 +1385,13 @@ def _stopped_child_draft(db: Any, child: Any, scan_dir: Path) -> dict[str, Any] 
     return {"findings": findings["findings"], "coverage": coverage}
 
 
-def save_composed_checkpoint(db: Any, connection: Any, scan: Any, scan_dir: Path) -> None:
+def save_composed_checkpoint(
+    db: Any, connection: Any, scan: Any, scan_dir: Path
+) -> dict[str, Any] | None:
     """Retain accepted progress and unmerged ordinary child observations."""
     checkpoint = read_composition_checkpoint(scan)
     if checkpoint is None:
-        return
+        return None
     children = {child["scan_dir"]: child for child in composition_children(connection, scan)}
     aggregate = copy.deepcopy(checkpoint["aggregate"])
     if not isinstance(aggregate, dict):
@@ -1429,6 +1444,7 @@ def save_composed_checkpoint(db: Any, connection: Any, scan: Any, scan_dir: Path
     write_scan_local_bytes(
         scan_dir, f"checkpoints/{hashlib.sha256(payload).hexdigest()}.json", payload
     )
+    return aggregate
 
 
 def preserve_scan_results_locked(
