@@ -91,10 +91,15 @@ export class DeepScanCoordinator {
   private externallyFailed = false;
   private phase: CoordinatorPhase = "setup";
   private discoveryDeadlineReached = false;
+  private readonly deadlineInterruptedPasses: Set<string>;
   private state: DeepScanRunState;
 
   constructor(private readonly options: CoordinatorOptions) {
     this.state = cloneState(options.run);
+    this.deadlineInterruptedPasses = new Set((this.state.persistedWorkers ?? [])
+      .filter((worker) => worker.kind === "discovery" && worker.status === "canceled"
+        && worker.error === "deep_scan_discovery_deadline_reached")
+      .map((worker) => worker.artifactDir));
     this.clock = options.clock ?? systemClock;
     this.log = options.log ?? (() => undefined);
     this.artifacts = createDeepScanArtifacts(this.state.scanDir);
@@ -272,6 +277,17 @@ export class DeepScanCoordinator {
               ]
             }
           });
+      if (this.deadlineInterruptedPasses.size > 0) {
+        draft.coverage.completeness = "partial";
+        draft.coverage.deferred = [
+          ...(draft.coverage.deferred as unknown[]),
+          ...[...this.deadlineInterruptedPasses].map((directory) => ({
+            reason: "The discovery time limit interrupted a Standard scan. " +
+              "Its unfinished work was not merged; any saved checkpoints remain under " +
+              `${relative(this.state.scanDir, directory).split(sep).join("/")}.`
+          }))
+        ];
+      }
       if (draft.scanId !== this.state.scanId) {
         throw new Error("Deep Scan aggregate does not match its authoritative scan identity.");
       }
@@ -670,6 +686,8 @@ export class DeepScanCoordinator {
                 outcome.error
               );
             }
+          } else if (this.discoveryDeadlineReached) {
+            this.deadlineInterruptedPasses.add(join(this.artifacts.workersRoot, label, "output"));
           } else if (!this.discoveryAbortController.signal.aborted) {
             throw new Error(`Discovery worker ${workerId} was canceled unexpectedly.`);
           }

@@ -505,87 +505,6 @@ async function testDirectReducerCannotDropAcceptedFinding() {
   assert.equal([...store.workers.values()].filter((worker) => worker.kind === "discovery" && worker.status === "succeeded").length, 2);
 }
 
-async function testDiscoveryDeadlineDrainsActiveReducerAndPreservesFindings() {
-  const fixture = await fixtureRun({ workers: 2, subagents: 0, stopAfterNoNew: 99, maxDiscoveryRuns: 12 });
-  const store = new FakeStore(fixture.run);
-  const deadline = deferred();
-  const executor = new FakeExecutor({ blockDedup: true, discoveryCandidateId: "candidate-1" });
-  const coordinator = new DeepScanCoordinator({
-    run: fixture.run, store, executor, pluginRoot: fixture.pluginRoot,
-    clock: immediateClock, discoveryTimeoutMs: 500,
-    log: (event) => { if (event.event === "discovery_deadline_reached") deadline.resolve(); }
-  });
-  coordinator.start();
-  const terminalPromise = coordinator.wait(undefined, 5_000);
-  await executor.dedupStarted;
-  await deadline.promise;
-  assert.equal(executor.discoveryCalls, 2);
-  assert.equal(executor.runningDiscovery, 0);
-  assert.equal(executor.runningDedup, 1, "the deadline lets the active merge finish");
-  assert.equal(executor.dedupSignal.aborted, false);
-  assert.equal(store.finishCalls.length, 0);
-  executor.releaseDedup();
-  const terminal = await terminalPromise;
-  assert.equal(terminal?.status, "succeeded", terminal?.error);
-  assert.equal(terminal.terminalReason, "capped");
-  assert.equal(executor.discoveryCalls, 2);
-  assert.equal(store.failCalls, 0);
-  assert.equal(store.dedupCommits.length, 1);
-  assert.deepEqual(store.finishCalls[0].omittedWorkerIds, []);
-  const manifest = JSON.parse(await readFile(terminal.manifestPath, "utf8"));
-  assert.deepEqual(manifest.findings.map((finding) => finding.provenance.candidateId), ["candidate-1"]);
-  assert.equal([...store.workers.values()].every((worker) => worker.status === "succeeded"), true);
-}
-
-async function testDiscoveryDeadlineReducesSingleBufferedFinding() {
-  const fixture = await fixtureRun({
-    workers: 1,
-    subagents: 0,
-    stopAfterNoNew: 99,
-    maxDiscoveryRuns: 8
-  });
-  const store = new FakeStore(fixture.run);
-  const executor = new FakeExecutor({
-    blockDiscoveryAfterCalls: 1,
-    discoveryCandidateId: "candidate-1",
-    dedupNewFindings: [1]
-  });
-  const coordinator = new DeepScanCoordinator({
-    run: fixture.run,
-    store,
-    executor,
-    pluginRoot: fixture.pluginRoot,
-    clock: immediateClock,
-    discoveryTimeoutMs: 500
-  });
-  coordinator.start();
-
-  await eventually(() => (
-    executor.discoveryCalls === 2
-    && executor.runningDiscovery === 1
-    && [...store.workers.values()].some((worker) => (
-      worker.kind === "discovery" && worker.status === "succeeded"
-    ))
-  ));
-  assert.equal(executor.dedupCalls, 1, "the first singleton is committed before the next scan begins");
-
-  const terminal = await coordinator.wait(undefined, 5_000);
-  assert.equal(terminal?.status, "succeeded");
-  assert.equal(terminal?.terminalReason, "capped");
-  assert.equal(terminal.dispatchedCount, 2);
-  assert.equal(terminal.dispatchedCount < fixture.run.config.maxDiscoveryRuns, true);
-  assert.equal(store.failCalls, 0);
-  assert.equal(executor.dedupCalls, 1);
-  assert.equal(executor.runningDiscovery, 0);
-
-  const manifest = JSON.parse(await readFile(terminal.manifestPath, "utf8"));
-  assert.equal(store.dedupClaims[0].workerIds.length, 1);
-  assert.deepEqual(store.finishCalls[0].omittedWorkerIds, []);
-  assert.equal([...store.workers.values()].filter((worker) => worker.status === "canceled").length, 1);
-  assert.equal(store.dedupCommits.length, 1);
-  assert.deepEqual(manifest.findings.map((finding) => finding.provenance.candidateId), ["candidate-1"]);
-}
-
 async function testDiscoveryAcceptedAtDeadlineIsReduced() {
   const fixture = await fixtureRun({
     workers: 1,
@@ -675,9 +594,9 @@ async function testDiscoveryDeadlineWithoutAcceptedWorkersReturnsPartialEvidence
   const manifest = JSON.parse(await readFile(terminal.manifestPath, "utf8"));
   assert.deepEqual(manifest.findings, []);
   assert.equal(manifest.coverage.completeness, "partial");
-  assert.deepEqual(completedDrafts[0].coverage.deferred, [{
+  assert.deepEqual(completedDrafts[0].coverage.deferred[0], {
     reason: "The configured discovery time limit elapsed before any source review completed."
-  }]);
+  });
   assert.deepEqual(store.finishCalls[0].omittedWorkerIds, []);
   assert.equal([...store.workers.values()].filter((worker) => worker.status === "canceled").length, 1);
   assert.equal(store.dedupCommits.length, 0);
@@ -3876,12 +3795,10 @@ try {
   await testSlowBatchFindingIsMergedBeforeSaturation();
   await testDeepScanPublication({
     fixtureRun, FakeStore, FakeExecutor, DeepScanCoordinator, deferred,
-    immediateClock, eventually,
+    immediateClock, eventually, standardScanDraft,
   });
   await testDirectReducerCannotDropAcceptedFinding();
   await testSaturationCountsCompletedBatchWithoutCancelingWorkers();
-  await testDiscoveryDeadlineDrainsActiveReducerAndPreservesFindings();
-  await testDiscoveryDeadlineReducesSingleBufferedFinding();
   await testDiscoveryAcceptedAtDeadlineIsReduced();
   await testDiscoveryDeadlineWithoutAcceptedWorkersReturnsPartialEvidence();
   await testDiscoveryDeadlineBeforeWorkerDispatchReturnsPartialEvidence();

@@ -572,7 +572,9 @@ export class DeepScanWorkerRunner {
       threadId,
       ...(coordinatorShutdown
         ? { error: "coordinator_shutdown: mcp_transport_closed" }
-        : {})
+        : this.options.signal.reason === "deep_scan_discovery_deadline_reached"
+          ? { error: "deep_scan_discovery_deadline_reached" }
+          : {})
     });
   }
 
