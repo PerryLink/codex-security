@@ -175,8 +175,10 @@ export interface ScanComparisonOptions extends ReadOnlyCodexOptions {
 
 interface CompletedScanMatchingOptions extends Pick<
   ScanComparisonOptions,
-  "environment" | "inheritedPermissions" | "model" | "signal"
+  "environment" | "model" | "signal"
 > {
+  /** @internal */
+  inheritedPermissions?: { filesystem: JsonObject; network: JsonObject };
   scanId: string;
   repository: string;
   previousFindings: readonly Record<string, unknown>[];

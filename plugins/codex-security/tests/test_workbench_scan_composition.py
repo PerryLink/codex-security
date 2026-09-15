@@ -5,7 +5,7 @@ import sqlite3
 from pathlib import Path
 
 import pytest
-from workbench_test_support import run_workbench, write_completed_contract
+from workbench_test_support import run_workbench, write_checkpoint, write_completed_contract
 
 CHECKPOINT = "artifacts/deep-scan/checkpoint.json"
 
@@ -355,6 +355,145 @@ def test_native_cancel_retains_atomic_aggregate_and_marks_unmerged_child(tmp_pat
         run_workbench(state, "get-scan", "--scan-id", child["scanId"])["scan"]["progress"]["status"]
         == "complete"
     )
+
+
+@pytest.mark.parametrize("child_state", ["complete", "checkpoint"])
+def test_cancel_before_first_merge_preserves_ordinary_children(
+    tmp_path: Path, child_state: str
+) -> None:
+    target = tmp_path / "target"
+    target.mkdir()
+    (target / "app.py").write_text("\n" * 50)
+    state = tmp_path / "state"
+    parent = register(state, target, tmp_path / "scan", mode="deep")
+    parent_dir = Path(parent["scanDir"])
+    children = []
+    for index in (1, 2):
+        directory = parent_dir / f"artifacts/deep-scan/passes/pass-{index}"
+        child = register(state, target, directory, parent=parent["scanId"])
+        write_completed_contract(directory, child["scanId"], target, relative_path="app.py")
+        findings_path = directory / "findings.json"
+        findings = json.loads(findings_path.read_text())["findings"]
+        findings[0]["provenance"]["candidateId"] = "shared-candidate"
+        findings[0]["writeup"] = {"reportPath": "findings/proof/proof.md"}
+        report_dir = directory / "findings/proof"
+        report_dir.mkdir(parents=True)
+        (report_dir / "proof.md").write_text(f"# Observation {index}\n[Trace](trace.txt)\n")
+        (report_dir / "trace.txt").write_text(f"trace-{index}\n")
+        findings_path.write_text(json.dumps({"scanId": child["scanId"], "findings": findings}))
+        (directory / "artifacts").mkdir()
+        (directory / "artifacts/receipt.json").write_text(json.dumps({"pass": index}))
+        coverage_path = directory / "coverage.json"
+        coverage = json.loads(coverage_path.read_text())
+        coverage["completeness"] = "partial"
+        coverage["surfaces"] = [
+            {
+                "id": "shared-surface",
+                "label": f"Pass {index}",
+                "disposition": "needs_follow_up",
+                "candidateId": "coverage-candidate",
+                "receiptRefs": ["artifacts/receipt.json"],
+            }
+        ]
+        coverage["deferred"] = [
+            {
+                "id": "shared-deferred",
+                "reason": "Dependency review remains.",
+                "surfaceIds": ["shared-surface"],
+            }
+        ]
+        coverage_path.write_text(json.dumps(coverage))
+        if child_state == "complete":
+            run_workbench(state, "complete-scan", "--scan-id", child["scanId"])
+            findings = json.loads(findings_path.read_text())["findings"]
+            protected = {
+                name: (directory / name).read_bytes()
+                for name in (
+                    "scan-manifest.json",
+                    "findings.json",
+                    "coverage.json",
+                )
+            }
+        else:
+            write_checkpoint(
+                directory / "checkpoints",
+                {
+                    "scanId": child["scanId"],
+                    "findings": findings,
+                    "coverage": coverage,
+                    "complete": False,
+                },
+            )
+            for name in ("scan-manifest.json", "findings.json", "coverage.json"):
+                (directory / name).unlink()
+            protected = {}
+        children.append((child, directory, findings[0], protected))
+    saved = checkpoint(
+        state,
+        parent,
+        passes=[
+            {
+                "directory": directory.relative_to(parent_dir).as_posix(),
+                "scanId": child["scanId"],
+            }
+            for child, directory, _, _ in children
+        ],
+    )
+    saved["aggregate"] = None
+    run_workbench(
+        state,
+        "save-scan-artifact",
+        "--scan-id",
+        parent["scanId"],
+        "--artifact-path",
+        CHECKPOINT,
+        input_text=json.dumps(saved),
+    )
+    run_workbench(state, "cancel-scan", "--scan-id", parent["scanId"])
+    assert (
+        run_workbench(state, "get-scan", "--scan-id", parent["scanId"])["scan"]["findingCount"] == 2
+    )
+    assert [scan["scanId"] for scan in run_workbench(state, "list-scans")["scans"]] == [
+        parent["scanId"]
+    ]
+    retained = json.loads((parent_dir / "findings.json").read_text())["findings"]
+    coverage = json.loads((parent_dir / "coverage.json").read_text())
+    assert coverage["completeness"] == "partial"
+    for child, directory, original, protected in children:
+        source_id = f"{child['scanId']}:0"
+        finding = next(
+            value for value in retained if value["provenance"]["sourceFindingIds"] == [source_id]
+        )
+        source = finding["provenance"]["sourceFindings"][0]
+        assert source["id"] == source_id
+        if child_state == "complete":
+            assert source["finding"] == original
+        else:
+            for field in ("codeEvidence", "locations", "validation", "writeup"):
+                assert source["finding"][field] == original[field]
+        report = parent_dir / finding["writeup"]["reportPath"]
+        assert report.read_bytes() == (directory / "findings/proof/proof.md").read_bytes()
+        assert (report.parent / "trace.txt").read_bytes() == (
+            directory / "findings/proof/trace.txt"
+        ).read_bytes()
+        row = next(
+            row for row in coverage["surfaces"] if row["id"] == f"{child['scanId']}/shared-surface"
+        )
+        receipt = f"{directory.relative_to(parent_dir).as_posix()}/artifacts/receipt.json"
+        assert row["receiptRefs"] == [receipt]
+        assert (parent_dir / receipt).is_file()
+        assert row["candidateId"].startswith(child["scanId"] + ":")
+        deferred = next(
+            row for row in coverage["deferred"] if row["id"] == f"{child['scanId']}/shared-deferred"
+        )
+        assert deferred["surfaceIds"] == [row["id"]]
+        for name, contents in protected.items():
+            assert (directory / name).read_bytes() == contents
+    assert json.loads((parent_dir / CHECKPOINT).read_text()) == saved
+    manifest = json.loads((parent_dir / "scan-manifest.json").read_text())["scan"]
+    assert manifest["status"] == "canceled"
+    assert manifest["sealedAt"]
+    assert manifest["preservedSources"]
 
 
 def test_running_pass_retains_paid_receipt_before_resume_and_failure(tmp_path: Path) -> None:

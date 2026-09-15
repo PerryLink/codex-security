@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -130,6 +130,84 @@ test("native cancellation drains only its parent; shutdown drains the rest", asy
   await secondRejected;
   assert.deepEqual(closed, ["first", "second"]);
 });
+
+test(
+  "native-selected credentials reach actual SDK child processes",
+  {
+    skip:
+      process.platform === "win32"
+        ? "Synthetic executable uses a POSIX shebang."
+        : false,
+  },
+  async () => {
+    const root = await mkdtemp(join(tmpdir(), "native-auth-child-"));
+    const executable = join(root, "codex");
+    const capture = join(root, "capture.json");
+    const keys = [
+      "CODEX_HOME",
+      "CODEX_CLI_PATH",
+      "CODEX_SECURITY_CONFIG_PATH",
+      "CODEX_SECURITY_DEEP_SCAN_CONFIG_PATH",
+      "CODEX_API_KEY",
+      "OPENAI_API_KEY",
+    ];
+    const before = Object.fromEntries(
+      keys.map((key) => [key, process.env[key]]),
+    );
+    try {
+      await writeFile(
+        executable,
+        `#!${process.execPath}
+const fs = require("node:fs");
+fs.writeFileSync(process.env.NATIVE_AUTH_CAPTURE, JSON.stringify({
+  codex: process.env.CODEX_API_KEY,
+  openai: process.env.OPENAI_API_KEY,
+  executable: process.execPath,
+}));
+console.log(JSON.stringify({ type: "thread.started", thread_id: "synthetic-auth-thread" }));
+console.log(JSON.stringify({ type: "turn.completed", usage: { input_tokens: 0, cached_input_tokens: 0, output_tokens: 0 } }));
+`,
+      );
+      await chmod(executable, 0o700);
+      Object.assign(process.env, {
+        CODEX_HOME: root,
+        CODEX_CLI_PATH: executable,
+        CODEX_API_KEY: "synthetic-native-selected",
+        OPENAI_API_KEY: "synthetic-competing-key",
+      });
+      delete process.env.CODEX_SECURITY_CONFIG_PATH;
+      delete process.env.CODEX_SECURITY_DEEP_SCAN_CONFIG_PATH;
+      for (const recipe of [
+        undefined,
+        { auth: "api-key", config: { model_provider: "openai" } },
+      ]) {
+        const prepared = await prepareNativeScan({ ...input(), recipe });
+        const sdk = prepared.client.dependencies.createCodex({
+          codexPathOverride: executable,
+          env: {
+            ...prepared.client.dependencies.environment,
+            NATIVE_AUTH_CAPTURE: capture,
+          },
+        });
+        await sdk
+          .startThread({ workingDirectory: root, skipGitRepoCheck: true })
+          .run("Synthetic credential launch only.");
+        const observed = JSON.parse(await readFile(capture, "utf8"));
+        assert.equal(observed.codex, "synthetic-native-selected");
+        assert.equal(observed.openai, undefined);
+        assert.equal(observed.executable, process.execPath);
+        assert.equal(process.env.CODEX_API_KEY, "synthetic-native-selected");
+        assert.equal(process.env.OPENAI_API_KEY, "synthetic-competing-key");
+      }
+    } finally {
+      for (const key of keys) {
+        if (before[key] === undefined) delete process.env[key];
+        else process.env[key] = before[key];
+      }
+      await rm(root, { recursive: true, force: true });
+    }
+  },
+);
 
 test("native saved scans retain settings, auth environment, permissions and identity", async () => {
   const root = await mkdtemp(join(tmpdir(), "native-scan-settings-"));

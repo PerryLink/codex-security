@@ -1285,20 +1285,115 @@ def migrate_legacy_scan(db: Any, connection: Any, scan: Any) -> Any:
     return db.require_scan(connection, scan["id"])
 
 
-def save_composed_checkpoint(connection: Any, scan: Any, scan_dir: Path) -> None:
-    """Preserve the accepted aggregate if cancellation beat its canonical draft publication."""
+def _stopped_child_draft(db: Any, child: Any, scan_dir: Path) -> dict[str, Any] | None:
+    """Read one ordinary saved scan through its normal validation and recovery path."""
+    child_dir = db.require_canonical_scan_directory(Path(child["scan_dir"]))
+    manifest_path = db.artifact_path(child_dir, "scan-manifest.json", required=False)
+    manifest_scan = db.read_json_object(manifest_path).get("scan", {}) if manifest_path else {}
+    if child["seal_manifest_digest"] is not None or (
+        manifest_scan.get("sealedAt") is not None or manifest_scan.get("artifacts") is not None
+    ):
+        db.require_recorded_manifest_digest(child, child_dir)
+        _, _, manifest, findings, coverage, _, _ = _prepare_scan_finalization(child_dir)
+    else:
+        binding = {**db.workbench_completion_binding(child, db.now()), "status": "interrupted"}
+        warnings: list[str] = []
+        documents = merge_saved_results(
+            child_dir,
+            child["id"],
+            binding,
+            [],
+            warnings,
+            stopped=True,
+            reason="Independent scan stopped before aggregation.",
+        )
+        if documents is None:
+            return None
+        _, _, manifest, findings, coverage, _, _ = _prepare_scan_finalization(
+            child_dir,
+            completion_binding=binding,
+            completion_warnings=warnings,
+            draft_documents=documents,
+        )
+    db.verify_manifest_binding(child, manifest)
+    prefix = child_dir.relative_to(scan_dir).as_posix()
+    for index, finding in enumerate(findings["findings"]):
+        original = copy.deepcopy(finding)
+        source_id = f"{child['id']}:{index}"
+        for field in ("findingId", "occurrenceId", "fingerprints"):
+            finding.pop(field, None)
+        # No semantic merge has accepted these independent observations yet.
+        identity = finding["identity"]
+        identity["instance"] = f"{child['id']}-{identity.get('instance', 'saved')}"
+        finding.setdefault("provenance", {}).update(
+            sourceFindingIds=[source_id],
+            sourceFindings=[{"id": source_id, "finding": original}],
+        )
+        writeup = finding.get("writeup")
+        if isinstance(writeup, dict):
+            report = Path(writeup["reportPath"])
+            slug = f"{child['id']}-{report.parent.name}"
+            writeup["reportPath"] = f"findings/{slug}/{slug}.md"
+            for path in (child_dir / report.parent).rglob("*"):
+                if path.is_dir():
+                    continue
+                relative = path.relative_to(child_dir).as_posix()
+                destination = (
+                    writeup["reportPath"]
+                    if relative == report.as_posix()
+                    else f"findings/{slug}/{path.relative_to(child_dir / report.parent).as_posix()}"
+                )
+                with os.fdopen(
+                    open_scan_local_file_descriptor(
+                        child_dir,
+                        relative,
+                        "Saved finding writeup",
+                    ),
+                    "rb",
+                ) as handle:
+                    write_scan_local_bytes(scan_dir, destination, handle.read())
+    for field in ("surfaces", "explicitExclusions", "deferred", "openQuestions"):
+        for row in coverage.get(field, []):
+            if not isinstance(row, dict):
+                continue
+            if isinstance(row.get("id"), str):
+                row["id"] = f"{child['id']}/{row['id']}"
+            if isinstance(row.get("candidateId"), str):
+                row["sourceCandidateId"] = row["candidateId"]
+                row["candidateId"] = (
+                    f"{child['id']}:{hashlib.sha256(row['candidateId'].encode()).hexdigest()}"
+                )
+            if isinstance(row.get("surfaceIds"), list):
+                row["surfaceIds"] = [f"{child['id']}/{value}" for value in row["surfaceIds"]]
+            if isinstance(row.get("receiptRefs"), list):
+                row["receiptRefs"] = [f"{prefix}/{value}" for value in row["receiptRefs"]]
+    return {"findings": findings["findings"], "coverage": coverage}
+
+
+def save_composed_checkpoint(db: Any, connection: Any, scan: Any, scan_dir: Path) -> None:
+    """Retain accepted progress, or ordinary child observations before the first merge."""
     checkpoint = read_composition_checkpoint(scan)
     if checkpoint is None:
         return
+    children = {child["scan_dir"]: child for child in composition_children(connection, scan)}
     aggregate = copy.deepcopy(checkpoint["aggregate"])
     if not isinstance(aggregate, dict):
-        return
+        aggregate = {"findings": [], "coverage": {}}
+        for child in children.values():
+            try:
+                draft = _stopped_child_draft(db, child, scan_dir)
+            except (ContractError, OSError, SystemExit, ValueError):
+                continue
+            if draft is None:
+                continue
+            aggregate["findings"].extend(draft["findings"])
+            for field in ("surfaces", "explicitExclusions", "deferred", "openQuestions"):
+                aggregate["coverage"].setdefault(field, []).extend(draft["coverage"].get(field, []))
     aggregate["scanId"] = scan["id"]
     aggregate["complete"] = False
     coverage = aggregate.setdefault("coverage", {})
     coverage["completeness"] = "partial"
     deferred = coverage.setdefault("deferred", [])
-    children = {child["scan_dir"]: child for child in composition_children(connection, scan)}
     for item in checkpoint["passes"]:
         directory = Path(scan["scan_dir"]) / item["directory"]
         child = children.get(str(directory))
@@ -1341,7 +1436,7 @@ def preserve_scan_results_locked(
         )
     scan_dir = db.require_canonical_scan_directory(Path(scan["scan_dir"]))
     if frozen_source_digests is None:
-        save_composed_checkpoint(connection, scan, scan_dir)
+        save_composed_checkpoint(db, connection, scan, scan_dir)
     deep_run = connection.execute(
         "SELECT status FROM deep_scan_runs WHERE scan_id = ?", (scan_id,)
     ).fetchone()
