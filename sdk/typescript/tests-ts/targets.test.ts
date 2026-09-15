@@ -707,3 +707,64 @@ describe("scan target normalization", () => {
     ]);
   });
 });
+
+test("Windows drive-root metadata probes keep executable trust scoped to the checkout", () => {
+  // Model a checkout directly beneath C:\\ without requiring writable drive roots
+  // in CI. Use real Windows path handling and the real executable resolver.
+  const script = String.raw`
+    import { mock } from "bun:test";
+    import * as paths from "node:path";
+    import * as filesystem from "node:fs/promises";
+    import * as processes from "node:child_process";
+    const repository = "C:\\project";
+    const trusted = "C:\\Program Files\\Git\\cmd";
+    const executable = paths.win32.join(trusted, "git.exe");
+    const head = paths.win32.join(repository, "HEAD");
+    const marker = paths.win32.join(repository, ".git");
+    Object.defineProperty(process, "platform", { value: "win32" });
+    for (const name of Object.keys(process.env))
+      if (name.toUpperCase() === "PATH") delete process.env[name];
+    process.env.Path = [repository, trusted].join(";");
+    mock.module("node:path", () => ({ ...paths.win32, default: paths.win32 }));
+    const missing = () => { throw Object.assign(new Error("not found"), { code: "ENOENT" }); };
+    mock.module("node:fs/promises", () => ({
+      ...filesystem,
+      lstat: async (path) => path === head
+        ? { isFile: () => true, isSymbolicLink: () => false }
+        : path === marker ? { isDirectory: () => true } : missing(),
+      realpath: async (path) => [repository, trusted, executable].includes(path) ? path : missing(),
+      stat: async (path) => path === executable ? { isFile: () => true } : missing(),
+      access: async (path) => path === executable ? undefined : missing(),
+    }));
+    let calls = 0;
+    mock.module("node:child_process", () => ({
+      ...processes,
+      execFile(command, args, options, callback) {
+        if (command !== executable || args[3] !== "C:\\" ||
+            args.slice(4).join("|") !== ["rev-parse", "--resolve-git-dir", repository].join("|"))
+          throw new Error("Metadata probe changed executable or working directory");
+        if (options.env.PATH !== trusted) throw new Error("Repository executable remained on PATH");
+        calls++;
+        callback(Object.assign(new Error("ordinary source"), {
+          code: 128, stderr: "fatal: not a gitdir '" + repository + "'\n",
+        }));
+      },
+    }));
+    const { isGitMetadataDirectory } = await import(process.argv[1]);
+    if (await isGitMetadataDirectory(repository)) throw new Error("Ordinary source became metadata");
+    if (calls !== 1) throw new Error("Expected one metadata probe");
+    console.log("CHECKOUT_SCOPED_PROBE");
+  `;
+  const result = spawnSync(
+    process.execPath,
+    [
+      "-e",
+      script,
+      fileURLToPath(new URL("../src/targets.ts", import.meta.url)),
+    ],
+    { encoding: "utf8" },
+  );
+  expect(result.status).toBe(0);
+  expect(result.stderr).toBe("");
+  expect(result.stdout.trim()).toBe("CHECKOUT_SCOPED_PROBE");
+});

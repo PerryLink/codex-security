@@ -103,6 +103,7 @@ function preloadedCandidates<TRecord extends DeduplicationIdentity>(
     throw new Error("Candidate relationships must name each observation once.");
   return {
     observations: observationRecords,
+    priorRecords: validated(params.candidates),
     candidateProvider: {
       potentialDuplicates: async (finding: TRecord) =>
         neighborhoods.get(finding.findingId)!,

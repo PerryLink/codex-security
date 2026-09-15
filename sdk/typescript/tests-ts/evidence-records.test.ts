@@ -276,6 +276,7 @@ test("explicit finding-v1 preserves default prompts, schemas, checkpoint context
     ...options(),
     recordFormat: "finding-v1",
     observations: records,
+    priorRecords: [],
     candidateProvider: {
       potentialDuplicates: async (anchor) =>
         records.filter((record) => record.findingId !== anchor.findingId),
@@ -362,6 +363,7 @@ test("both formats use the same screening veto, pair orientation and contradicti
     ...options(),
     recordFormat: "finding-v1",
     observations: records,
+    priorRecords: [],
     candidateProvider: {
       potentialDuplicates: async (anchor) =>
         records.filter((record) => record.findingId !== anchor.findingId),

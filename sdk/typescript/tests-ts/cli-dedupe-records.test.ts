@@ -741,3 +741,91 @@ test.each([
     expect(result.methods).toEqual([]);
   },
 );
+
+test.each(["finding-v1", "evidence-v1"] as const)(
+  "%s reuses prior endpoints absent from nominations without screening unrelated candidates",
+  async (recordFormat) => {
+    const evidence = recordFormat === "evidence-v1";
+    const runParams = evidence ? evidenceParams : params;
+    const review = evidence ? evidenceReview : reviewResult;
+    const fresh = await drive(new Map(), { runParams, review });
+    expect(fresh.exit).toBe(0);
+    const { pairOutcomes } = fresh.message.result as {
+      pairOutcomes: {
+        findingIds: string[];
+        decision: string;
+        bindingDigest: string;
+      }[];
+    };
+    const [observation] = runParams.observations;
+    const [candidate] = runParams.candidates;
+    const unrelated = {
+      ...candidate!,
+      findingId: evidence ? "unrelated-import" : finding(3).findingId,
+    };
+    for (const decision of ["SAME", "DISTINCT"]) {
+      const replay = await drive(new Map(), {
+        runParams: {
+          ...runParams,
+          candidates: [candidate, unrelated],
+          candidateRelationships: [
+            { observationId: observation!.findingId, candidateIds: [] },
+          ],
+          priorDecisions: pairOutcomes.map((outcome) => ({
+            ...outcome,
+            decision,
+          })),
+        },
+        review,
+      });
+      expect(replay.exit).toBe(0);
+      expect(replay.methods).not.toContain("review.run");
+      expect(replay.message.result).toMatchObject({
+        pairOutcomes: [
+          {
+            findingIds: pairOutcomes[0]!.findingIds,
+            decision,
+            origin: "prior",
+            checkpointKeys: [],
+          },
+        ],
+      });
+      const result = replay.message.result as {
+        uniqueFindingIds: string[];
+        duplicateGroups: string[][];
+      };
+      expect(result.uniqueFindingIds).not.toContain(unrelated.findingId);
+      if (decision === "DISTINCT") {
+        expect(result.uniqueFindingIds).toEqual([observation!.findingId]);
+        expect(result.duplicateGroups).toEqual([]);
+      } else {
+        expect(result.uniqueFindingIds).toHaveLength(1);
+        expect(result.duplicateGroups).toHaveLength(1);
+        expect(result.duplicateGroups[0]!.toSorted()).toEqual(
+          [observation!.findingId, candidate!.findingId].toSorted(),
+        );
+      }
+    }
+    const changed = await drive(new Map(), {
+      runParams: {
+        ...runParams,
+        candidates: [
+          {
+            ...candidate,
+            severity: { ...candidate!.severity, level: "critical" },
+          },
+        ],
+        candidateRelationships: [
+          { observationId: observation!.findingId, candidateIds: [] },
+        ],
+        priorDecisions: pairOutcomes,
+      },
+      review,
+    });
+    expect(changed.exit).toBe(2);
+    expect(changed.methods).not.toContain("review.run");
+    expect(changed.message.error?.message).toContain(
+      "current record/source binding",
+    );
+  },
+);

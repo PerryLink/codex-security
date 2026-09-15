@@ -94,7 +94,11 @@ contradiction subgrouping. Each pair outcome records its screening, pair-review
 or prior origin and an immutable-input `bindingDigest`. Previously persisted
 outcomes can be supplied as `priorDecisions`; their records must be present in
 the current corpus and their bindings must still match. Stale or conflicting
-constraints fail the call. A prior DISTINCT remains a grouping constraint even
+constraints fail the call. SDK callers can supply complete endpoints through
+`priorRecords` when their candidate provider no longer nominates those records.
+The CLI retains prior endpoints from the preloaded candidate array. These records
+participate in prior constraints and grouping without adding model comparisons;
+unrelated preloaded records remain excluded. A prior DISTINCT remains a grouping constraint even
 if current nearest-neighbor retrieval did not nominate that pair.
 
 For this record-level API, `deduplicationStatus: "completed"` means review and

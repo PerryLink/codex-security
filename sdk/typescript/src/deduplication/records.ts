@@ -97,6 +97,8 @@ export interface PriorDeduplicationDecision {
 interface RecordOptions<TRecord extends DeduplicationIdentity> {
   observations: readonly TRecord[];
   candidateProvider: DeduplicationCandidateProvider<TRecord>;
+  /** Complete prior-decision endpoints that are no longer candidate nominations. */
+  priorRecords?: readonly TRecord[];
   reviewRunner: DeduplicationReviewRunner;
   /** Host-established repository identities and exact revisions, without credentials. */
   sourceManifest: JsonObject;
@@ -255,6 +257,10 @@ async function runRecords<TRecord extends DeduplicationIdentity>(
     return existing?.finding ?? finding;
   }
   const observations = options.observations.map(register);
+  const priorIds = new Set(priorDecisions.flatMap((prior) => prior.findingIds));
+  const priorRecords = (options.priorRecords ?? [])
+    .map(register)
+    .filter((record) => priorIds.has(record.findingId));
   const assertSourceUnchanged = async () => {
     options.signal?.throwIfAborted();
     await options.verifySource(sourceManifest);
@@ -365,6 +371,8 @@ async function runRecords<TRecord extends DeduplicationIdentity>(
       }
       return priorDecisions;
     },
+    true,
+    priorRecords,
   );
   await assertSourceUnchanged();
   return {

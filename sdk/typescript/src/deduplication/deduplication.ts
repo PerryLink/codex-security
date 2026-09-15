@@ -275,6 +275,7 @@ export class FindingDeduplicator<
       | readonly DeduplicationPairConstraint[]
       | (() => readonly DeduplicationPairConstraint[]) = [],
     includeEvidence = true,
+    priorFindings: readonly TRecord[] = [],
   ): Promise<DetailedDeduplicationResult> {
     this.signal?.throwIfAborted();
     const concurrency = deduplicationConcurrency(this.concurrency);
@@ -329,6 +330,11 @@ export class FindingDeduplicator<
         }
       }
     }
+
+    // Retain earlier constraint endpoints without adding screening nominations.
+    for (const finding of priorFindings)
+      if (!findings.has(finding.findingId))
+        findings.set(finding.findingId, finding);
 
     for (const prior of typeof priorDecisions === "function"
       ? priorDecisions()

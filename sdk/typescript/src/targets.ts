@@ -282,6 +282,7 @@ export async function isGitMetadataDirectory(
       ["rev-parse", "--resolve-git-dir", repository],
       signal,
       { LC_ALL: "C" },
+      repository,
     );
     return (
       relative(await realpath(directory), await realpath(repository)) === ""
@@ -725,12 +726,14 @@ async function gitOutput(
   args: readonly string[],
   signal?: AbortSignal,
   environment: NodeJS.ProcessEnv = {},
+  executableTrustRoot = repository,
 ): Promise<string> {
   throwIfAborted(signal);
   const command = await resolveTrustedExecutable(
     "git",
     isolatedGitEnvironment(args[0] === "rev-parse" || args[0] === "config"),
-    (await gitMarkerRoot(repository, signal, "outermost")) ?? repository,
+    (await gitMarkerRoot(executableTrustRoot, signal, "outermost")) ??
+      executableTrustRoot,
   );
   if (command === null)
     throw new Error("Git is not available on a trusted PATH.");
