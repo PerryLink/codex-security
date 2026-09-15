@@ -11,11 +11,12 @@ import tempfile
 from collections.abc import Callable
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 # Some plugin hosts launch Python with safe-path isolation enabled.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from filesystem_identity import serialize_filesystem_identity
-from finalize_scan_contract import write_scan_local_bytes
+from finalize_scan_contract import ContractError, _read_scan_local_json, write_scan_local_bytes
 from workbench_feedback import get_scan_feedback
 from workbench_target import (
     directory_content_digest,
@@ -23,6 +24,54 @@ from workbench_target import (
     worktree_content_digest,
 )
 from workbench_validation import optional_text, user_text
+
+COMPOSITION_CHECKPOINT = "artifacts/deep-scan/checkpoint.json"
+
+
+def read_composition_checkpoint(scan: sqlite3.Row) -> dict[str, Any] | None:
+    scan_dir = Path(scan["scan_dir"])
+    try:
+        (scan_dir / COMPOSITION_CHECKPOINT).lstat()
+    except FileNotFoundError:
+        return None
+    checkpoint = _read_scan_local_json(scan_dir, COMPOSITION_CHECKPOINT, "Deep Scan checkpoint")
+    if checkpoint.get("version") != 2:
+        raise ContractError("Unsupported Deep Scan checkpoint version.")
+    return checkpoint
+
+
+def composition_children(connection: sqlite3.Connection, scan: sqlite3.Row) -> list[sqlite3.Row]:
+    checkpoint = read_composition_checkpoint(scan)
+    if checkpoint is None:
+        return []
+    directories = {str(Path(scan["scan_dir"]) / item["directory"]) for item in checkpoint["passes"]}
+    return [
+        child
+        for child in connection.execute(
+            "SELECT * FROM scans WHERE parent_scan_id = ? AND mode = 'standard' ORDER BY started_at, id",
+            (scan["id"],),
+        )
+        if child["scan_dir"] in directories
+    ]
+
+
+def composition_child_ids(connection: sqlite3.Connection) -> set[str]:
+    parents = connection.execute(
+        "SELECT * FROM scans WHERE mode = 'deep' AND id IN "
+        "(SELECT parent_scan_id FROM scans WHERE mode = 'standard')"
+    ).fetchall()
+    return {child["id"] for parent in parents for child in composition_children(connection, parent)}
+
+
+def create_scan_directory(directory: Path) -> None:
+    """Create new output ancestors with the permissions required by the ordinary runner."""
+    missing = []
+    current = directory
+    while not current.exists():
+        missing.append(current)
+        current = current.parent
+    for path in reversed(missing):
+        path.mkdir(mode=0o700, exist_ok=True)
 
 
 def safe_segment(value: str) -> str:

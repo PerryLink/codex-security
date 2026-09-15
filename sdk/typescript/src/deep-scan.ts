@@ -1,0 +1,455 @@
+import { lstat } from "node:fs/promises";
+import { join, relative } from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
+import type { CodexSecurity, ScanOptions } from "./api.js";
+import type { JsonObject } from "./config.js";
+import { loadContract, readScanFile } from "./contract.js";
+import type { ScanCost } from "./cost.js";
+import { ScanCostLimitExceededError, safeErrorMessage } from "./errors.js";
+import type { DeepScanOptions } from "./scan-settings.js";
+import {
+  combineScanCoverage,
+  createScanMergeValidator,
+  projectScanMergeWriteups,
+  scanMergeInput,
+  scanMergePrompt,
+  type ScanMergeInput,
+} from "./scan-merge.js";
+import type { ScanArtifactRestorer } from "./runtime.js";
+import type { SemanticScan } from "./scan-semantics.js";
+
+export const DEEP_SCAN_CHECKPOINT = "artifacts/deep-scan/checkpoint.json";
+
+export interface DeepScanCheckpoint {
+  version: 2;
+  startedAt: string;
+  passes: Array<{ directory: string; scanId?: string }>;
+  mergedScanIds: string[];
+  aggregate: SemanticScan | null;
+  noNewStreak: number;
+  consecutiveErrors: number;
+  legacy?: {
+    discoveryRuns: number;
+    coverage: JsonObject;
+    cost?: ScanCost;
+    originThreadId?: string;
+  };
+  terminalReason?: "saturated" | "capped" | "failed" | "canceled";
+}
+
+interface SavedPass {
+  scanId: string;
+  scanDir: string;
+  parentScanId: string;
+  targetPath: string;
+  continuationThreadId?: string | null;
+  progress: { status: string };
+  cost?: ScanCost;
+}
+
+export interface DeepScanComposition {
+  scanId: string;
+  scanDir: string;
+  repository: string;
+  pluginRoot: string;
+  startedAt: string;
+  settings: Required<DeepScanOptions>;
+  scanOptions: ScanOptions;
+  signal: AbortSignal;
+  createClient(): Pick<CodexSecurity, "run" | "close">;
+  workbench(args: readonly string[], input?: string): Promise<JsonObject>;
+  merge(prompt: string, signal: AbortSignal): Promise<unknown>;
+  onRetry?(message: string): void;
+  writer: ScanArtifactRestorer;
+  publish(draft: SemanticScan): Promise<void>;
+  onCost(key: string, cost: Readonly<ScanCost>): void;
+  historicalCost?(threadId: string): Promise<ScanCost | null>;
+}
+
+/** Compose complete ordinary scans; only accepted merge state belongs to the parent. */
+export async function runDeepScans(
+  input: DeepScanComposition,
+): Promise<DeepScanCheckpoint> {
+  const { scanId, scanDir, settings, signal, workbench } = input;
+  let state: DeepScanCheckpoint;
+  try {
+    state = JSON.parse(
+      (
+        await readScanFile(
+          scanDir,
+          DEEP_SCAN_CHECKPOINT,
+          "Deep Scan checkpoint",
+        )
+      ).toString("utf8"),
+    );
+  } catch (error) {
+    // No parent checkpoint exists on a new normal scan registration.
+    if (
+      await lstat(join(scanDir, DEEP_SCAN_CHECKPOINT)).then(
+        () => true,
+        (cause: NodeJS.ErrnoException) => {
+          if (cause.code === "ENOENT") return false;
+          throw cause;
+        },
+      )
+    )
+      throw error;
+    state = {
+      version: 2,
+      startedAt: input.startedAt,
+      passes: [],
+      mergedScanIds: [],
+      aggregate: null,
+      noNewStreak: 0,
+      consecutiveErrors: 0,
+    };
+  }
+  if (state.version !== 2)
+    throw new Error("Unsupported saved Deep Scan checkpoint.");
+  const passDirectory = (index: number): string =>
+    `artifacts/deep-scan/passes/pass-${index + 1}`;
+  for (const [index, pass] of state.passes.entries()) {
+    if (pass.directory !== passDirectory(index))
+      throw new Error("Saved scan pass escaped its parent.");
+  }
+  const save = async (): Promise<void> => {
+    await workbench(
+      [
+        "save-scan-artifact",
+        "--scan-id",
+        scanId,
+        "--artifact-path",
+        DEEP_SCAN_CHECKPOINT,
+      ],
+      JSON.stringify(state),
+    );
+  };
+  await save();
+  const previousRuns = state.legacy?.discoveryRuns ?? 0;
+  if (state.legacy && !state.legacy.cost) {
+    const cost = state.legacy.originThreadId
+      ? await input.historicalCost?.(state.legacy.originThreadId)
+      : null;
+    if (cost) {
+      state.legacy.cost = cost;
+      await save();
+    }
+    if (!cost && input.scanOptions.requireCost)
+      throw new Error(
+        "Restore the original Deep Scan session logs to verify its saved cost limit.",
+      );
+  }
+  if (state.legacy?.cost) input.onCost("legacy", state.legacy.cost);
+  const validateMerge = await createScanMergeValidator(input.pluginRoot);
+  const accepted = new Map<string, ScanMergeInput>();
+  const saved = new Map<string, SavedPass>();
+  const refreshPasses = async (): Promise<void> => {
+    const listed = await workbench([
+      "list-scans",
+      "--scan-root",
+      join(scanDir, "artifacts/deep-scan/passes"),
+    ]);
+    for (const record of listed["scans"] as unknown as SavedPass[]) {
+      const index = state.passes.findIndex(
+        (pass) =>
+          relative(join(scanDir, pass.directory), record.scanDir) === "",
+      );
+      if (index < 0) continue;
+      if (
+        record.parentScanId !== scanId ||
+        record.targetPath !== input.repository
+      ) {
+        throw new Error("Saved scan pass belongs to another parent or target.");
+      }
+      const pass = state.passes[index]!;
+      if (pass.scanId !== undefined && pass.scanId !== record.scanId) {
+        throw new Error("Saved scan pass registration changed.");
+      }
+      pass.scanId = record.scanId;
+      saved.set(record.scanId, record);
+      if (record.cost) input.onCost(pass.directory, record.cost);
+      if (
+        record.progress.status === "complete" &&
+        !accepted.has(record.scanId)
+      ) {
+        const contract = await loadContract(record.scanDir, {
+          pluginRoot: input.pluginRoot,
+          signal,
+        });
+        if (contract.manifest.scan.id !== record.scanId)
+          throw new Error("Saved scan artifacts changed identity.");
+        accepted.set(
+          record.scanId,
+          await projectScanMergeWriteups(
+            scanMergeInput({ ...contract, scanDir: record.scanDir }, scanId),
+            input.writer,
+            signal,
+          ),
+        );
+      }
+    }
+    await save();
+  };
+  await refreshPasses();
+  if (state.mergedScanIds.some((id) => !accepted.has(id))) {
+    throw new Error(
+      "An accepted merge input is no longer a sealed child scan.",
+    );
+  }
+  const deadline =
+    Date.parse(state.startedAt) + settings.maxTimeHours * 3_600_000;
+  const deadlineController = new AbortController();
+  let deadlineTimer: ReturnType<typeof setTimeout> | undefined;
+  const tick = (): void => {
+    const remaining = deadline - Date.now();
+    if (remaining <= 0)
+      deadlineController.abort(
+        new Error("deep_scan_discovery_deadline_reached"),
+      );
+    else deadlineTimer = setTimeout(tick, Math.min(remaining, 2_147_483_647));
+  };
+  tick();
+  const externalStop = new AbortController();
+  const executionSignal = AbortSignal.any([signal, externalStop.signal]);
+  const discoverySignal = AbortSignal.any([
+    executionSignal,
+    deadlineController.signal,
+  ]);
+  let polling = false;
+  const cancellationTimer = setInterval(() => {
+    if (polling) return;
+    polling = true;
+    void workbench(["get-scan", "--scan-id", scanId])
+      .then((result) => {
+        const scan = result["scan"] as JsonObject;
+        const progress = scan["progress"] as JsonObject;
+        if (
+          progress["status"] === "canceled" ||
+          progress["status"] === "failed"
+        ) {
+          externalStop.abort(new Error("The saved parent scan stopped."));
+        }
+      })
+      .catch(() => undefined)
+      .finally(() => {
+        polling = false;
+      });
+  }, 1_000);
+  cancellationTimer.unref();
+  const mergePending = async (allowEmpty = false): Promise<void> => {
+    const pending = state.passes.flatMap((pass) => {
+      const result =
+        pass.scanId === undefined ? undefined : accepted.get(pass.scanId);
+      return result && !state.mergedScanIds.includes(result.scanId)
+        ? [result]
+        : [];
+    });
+    if (!pending.length && (!allowEmpty || state.aggregate !== null)) return;
+    let merged: ReturnType<typeof validateMerge>;
+    for (;;) {
+      executionSignal.throwIfAborted();
+      try {
+        merged = validateMerge(
+          await input.merge(
+            scanMergePrompt(scanId, pending, state.aggregate),
+            executionSignal,
+          ),
+          pending,
+          state.aggregate,
+        );
+        break;
+      } catch (error) {
+        if (executionSignal.aborted) throw error;
+        state.consecutiveErrors += 1;
+        await save();
+        if (state.consecutiveErrors >= settings.stopAfterConsecutiveErrors)
+          throw error;
+      }
+    }
+    executionSignal.throwIfAborted();
+    state.aggregate = {
+      ...merged.aggregate,
+      coverage: combineScanCoverage(
+        [...accepted.values()],
+        scanDir,
+        [],
+        state.legacy?.coverage,
+      ),
+    };
+    state.mergedScanIds.push(...pending.map((result) => result.scanId));
+    state.noNewStreak =
+      merged.newFindings > 0 ? 0 : state.noNewStreak + pending.length;
+    state.consecutiveErrors = 0;
+    await save();
+    await input.publish(state.aggregate);
+  };
+  const runPass = async (
+    pass: DeepScanCheckpoint["passes"][number],
+  ): Promise<void> => {
+    const client = input.createClient();
+    let latestCost: Readonly<ScanCost> | undefined;
+    try {
+      // These existing retry delays do not create another logical scan.
+      const retries = [60_000, 180_000, 540_000];
+      for (let attempt = 0; ; attempt += 1) {
+        discoverySignal.throwIfAborted();
+        try {
+          const result = await client.run(input.repository, {
+            ...input.scanOptions,
+            mode: "standard",
+            outputDir: join(scanDir, pass.directory),
+            ...(pass.scanId === undefined
+              ? { parentScanId: scanId }
+              : { resumeScanId: pass.scanId, parentScanId: undefined }),
+            deepScanPass: true,
+            signal: discoverySignal,
+            onRegisteredScan: async (registration) => {
+              pass.scanId = registration["scanId"] as string;
+              await save();
+            },
+            onCost: (cost) => {
+              latestCost = cost;
+              input.onCost(pass.directory, cost);
+            },
+          });
+          accepted.set(
+            result.manifest.scan.id,
+            await projectScanMergeWriteups(
+              scanMergeInput(result, scanId),
+              input.writer,
+              signal,
+            ),
+          );
+          if (result.cost) input.onCost(pass.directory, result.cost);
+          state.consecutiveErrors = 0;
+          await save();
+          return;
+        } catch (error) {
+          if (discoverySignal.aborted) throw error;
+          if (attempt >= retries.length) {
+            if (pass.scanId !== undefined) {
+              await workbench([
+                "fail-scan",
+                "--scan-id",
+                pass.scanId,
+                "--message",
+                safeErrorMessage(error),
+                ...(latestCost
+                  ? ["--cost-json", JSON.stringify(latestCost)]
+                  : []),
+              ]);
+            }
+            state.consecutiveErrors += 1;
+            await save();
+            return;
+          }
+          input.onRetry?.(
+            `Deep Scan pass ${state.passes.indexOf(pass) + 1} will retry: ${safeErrorMessage(error)}`,
+          );
+          await delay(retries[attempt], undefined, { signal: discoverySignal });
+        }
+      }
+    } catch (error) {
+      if (discoverySignal.aborted && pass.scanId !== undefined) {
+        await workbench([
+          "fail-scan",
+          "--scan-id",
+          pass.scanId,
+          "--message",
+          safeErrorMessage(discoverySignal.reason),
+          ...(latestCost ? ["--cost-json", JSON.stringify(latestCost)] : []),
+        ]).catch(() => undefined);
+      }
+      throw error;
+    } finally {
+      await client.close();
+    }
+  };
+  try {
+    while (state.terminalReason === undefined) {
+      executionSignal.throwIfAborted();
+      await mergePending();
+      if (state.noNewStreak >= settings.stopAfterNoNew) {
+        state.terminalReason = "saturated";
+        break;
+      }
+      if (state.consecutiveErrors >= settings.stopAfterConsecutiveErrors) {
+        throw new Error("Deep Scan reached its consecutive error limit.");
+      }
+      const unfinished = state.passes.filter(
+        (pass) =>
+          pass.scanId === undefined ||
+          saved.get(pass.scanId)?.progress.status === "running",
+      );
+      if (
+        deadlineController.signal.aborted ||
+        (unfinished.length === 0 &&
+          previousRuns + state.passes.length >= settings.maxDiscoveryRuns)
+      ) {
+        state.terminalReason = "capped";
+        break;
+      }
+      const batch = unfinished.slice(0, settings.workers);
+      while (
+        batch.length < settings.workers &&
+        previousRuns + state.passes.length < settings.maxDiscoveryRuns
+      ) {
+        const pass = { directory: passDirectory(state.passes.length) };
+        state.passes.push(pass);
+        batch.push(pass);
+      }
+      await save();
+      await Promise.allSettled(batch.map(runPass));
+      executionSignal.throwIfAborted();
+      await refreshPasses();
+    }
+    await mergePending(true);
+    const unresolved = state.passes
+      .filter((pass) => !pass.scanId || !accepted.has(pass.scanId))
+      .map((pass) => pass.directory);
+    state.aggregate = {
+      ...state.aggregate!,
+      coverage: combineScanCoverage(
+        [...accepted.values()],
+        scanDir,
+        unresolved,
+        state.legacy?.coverage,
+      ),
+    };
+    await save();
+    await input.publish(state.aggregate);
+    return state;
+  } catch (error) {
+    state.terminalReason =
+      signal.reason instanceof ScanCostLimitExceededError
+        ? "capped"
+        : executionSignal.aborted
+          ? "canceled"
+          : "failed";
+    if (state.aggregate !== null) {
+      state.aggregate = {
+        ...state.aggregate,
+        coverage: combineScanCoverage(
+          [...accepted.values()].filter((pass) =>
+            state.mergedScanIds.includes(pass.scanId),
+          ),
+          scanDir,
+          state.passes
+            .filter(
+              (pass) =>
+                !pass.scanId || !state.mergedScanIds.includes(pass.scanId),
+            )
+            .map((pass) => pass.directory),
+          state.legacy?.coverage,
+        ),
+      };
+    }
+    await save().catch(() => undefined);
+    if (state.aggregate !== null)
+      await input.publish(state.aggregate).catch(() => undefined);
+    throw error;
+  } finally {
+    if (deadlineTimer !== undefined) clearTimeout(deadlineTimer);
+    clearInterval(cancellationTimer);
+  }
+}

@@ -27,16 +27,12 @@ try {
   await testClaimedParentArtifactOperations(runtimeBundle, "source");
   await testSemanticScanDraftCompletion(runtimeBundle, "source");
   await testCompactDiffScanCompletion(runtimeBundle, "source");
-  await testDiscoveryWorkerToolList(runtimeBundle);
-  await testReducerWorkerToolList(runtimeBundle);
 
   const shippedRuntime = path.join(bundledPluginRoot, "mcp", "server.mjs");
   await testParentToolList(shippedRuntime);
   await testClaimedParentArtifactOperations(shippedRuntime, "shipped");
   await testSemanticScanDraftCompletion(shippedRuntime, "shipped");
   await testCompactDiffScanCompletion(shippedRuntime, "shipped");
-  await testDiscoveryWorkerToolList(shippedRuntime);
-  await testReducerWorkerToolList(shippedRuntime);
 } finally {
   await rm(temporaryRoot, { recursive: true, force: true });
 }
@@ -46,10 +42,11 @@ async function testCompactDiffScanCompletion(bundle, runtimeLabel) {
   const repoRoot = path.join(fixtureRoot, "repository");
   const stateRoot = path.join(fixtureRoot, "state");
   const scanRoot = path.join(fixtureRoot, "scans");
+  await mkdir(fixtureRoot, { mode: 0o700 });
   await Promise.all([
     mkdir(path.join(repoRoot, "src"), { recursive: true }),
     mkdir(stateRoot, { recursive: true }),
-    mkdir(scanRoot, { recursive: true })
+    mkdir(scanRoot, { recursive: true, mode: 0o700 })
   ]);
   const git = (...arguments_) => execFileSync(
     "git",
@@ -229,10 +226,11 @@ async function testSemanticScanDraftCompletion(bundle, runtimeLabel) {
   const repoRoot = path.join(fixtureRoot, "repository");
   const stateRoot = path.join(fixtureRoot, "state");
   const scanRoot = path.join(fixtureRoot, "scans");
+  await mkdir(fixtureRoot, { mode: 0o700 });
   await Promise.all([
     mkdir(path.join(repoRoot, "src"), { recursive: true }),
     mkdir(stateRoot, { recursive: true }),
-    mkdir(scanRoot, { recursive: true })
+    mkdir(scanRoot, { recursive: true, mode: 0o700 })
   ]);
   const sourceLine = "    return connection.execute(query)";
   await writeFile(
@@ -696,7 +694,7 @@ async function testClaimedParentArtifactOperations(bundle, runtimeLabel) {
   await Promise.all([
     mkdir(path.join(repoRoot, "src"), { recursive: true }),
     mkdir(stateRoot, { recursive: true }),
-    mkdir(scanRoot, { recursive: true })
+    mkdir(scanRoot, { recursive: true, mode: 0o700 })
   ]);
   await writeFile(path.join(repoRoot, "src", "fixture.py"), "print('fixture')\n");
 
@@ -1058,180 +1056,13 @@ async function testParentToolList(bundle) {
   }
 }
 
-async function testDiscoveryWorkerToolList(bundle) {
-  const repoRoot = path.join(temporaryRoot, "discovery-repository");
-  const artifactRoot = await mkdtemp(path.join(temporaryRoot, "discovery-output-"));
-  const scanId = randomUUID();
-  const resultPath = path.join(artifactRoot, "result.json");
-  await mkdir(path.join(repoRoot, "src"), { recursive: true });
-  await writeFile(path.join(repoRoot, "src", "fixture.py"), "print('fixture')\n");
-
-  const client = await startClient(bundle, {
-    CODEX_SECURITY_ARTIFACT_ROOT: artifactRoot,
-    CODEX_SECURITY_REPO_ROOT: repoRoot,
-    CODEX_SECURITY_ARTIFACT_LAYOUT: "worker",
-    CODEX_SECURITY_SCAN_ID: scanId,
-    CODEX_SECURITY_PLUGIN_ROOT: pluginRoot
-  });
-  try {
-    assert.deepEqual(
-      client.getServerCapabilities()?.experimental?.["codex/sandbox-state-meta"],
-      {},
-      "The discovery worker MCP must advertise actual parent sandbox-state metadata."
-    );
-    const tools = (await client.listTools()).tools;
-    assert.deepEqual(tools.map((tool) => tool.name), ["record_codex_security_scan_draft"]);
-
-    const [tool] = tools;
-    const projectedName = `mcp__cs_artifacts__${tool.name}`;
-    assert.ok(
-      projectedName.length <= 64,
-      `Nested worker MCP tool ${projectedName} exceeds Codex's 64-character limit.`
-    );
-    assert.deepEqual(tool.inputSchema.required, ["scanId", "findings", "coverage"]);
-    assert.equal(tool.inputSchema.additionalProperties, false);
-    for (const forbidden of ["path", "artifactPath", "outputPath", "root", "operation"]) {
-      assert.equal(
-        Object.hasOwn(tool.inputSchema.properties ?? {}, forbidden),
-        false,
-        `${tool.name} must not accept a model-selected ${forbidden}.`
-      );
-    }
-
-    const input = {
-      scanId,
-      findings: [],
-      coverage: {
-        completeness: "complete",
-        surfaces: [],
-        explicitExclusions: [],
-        deferred: []
-      }
-    };
-
-    requireToolError(
-      await client.callTool({
-        name: tool.name,
-        arguments: { ...input, scanId: randomUUID() }
-      }),
-      /scanId does not match/,
-      "The Standard worker draft must use the coordinator-bound scan identity."
-    );
-    await assert.rejects(readFile(resultPath), { code: "ENOENT" });
-
-    requireToolError(
-      await client.callTool({
-        name: tool.name,
-        arguments: {
-          ...input,
-          coverage: {
-            ...input.coverage,
-            deferred: [{ reason: "Review remains incomplete." }]
-          }
-        }
-      }),
-      /complete coverage cannot contain deferred/,
-      "The Standard worker must reject invalid coverage before writing its checkpoint."
-    );
-    await assert.rejects(readFile(resultPath), { code: "ENOENT" });
-
-    const result = await client.callTool({ name: tool.name, arguments: input });
-    assert.deepEqual(result.structuredContent, {
-      scanId,
-      findingCount: 0,
-      surfaceCount: 0,
-      operation: "replace",
-      status: "draft_written"
-    });
-    assert.deepEqual(JSON.parse(await readFile(resultPath, "utf8")), input);
-    for (const canonicalName of ["scan-manifest.json", "findings.json", "coverage.json"]) {
-      await assert.rejects(readFile(path.join(artifactRoot, canonicalName)), {
-        code: "ENOENT"
-      });
-    }
-  } finally {
-    await client.close();
-  }
-}
-
-async function testReducerWorkerToolList(bundle) {
-  const repoRoot = path.join(temporaryRoot, "reducer-repository");
-  const scanRoot = path.join(temporaryRoot, "reducer-scan");
-  const artifactRoot = path.join(scanRoot, "artifacts", "deep_discovery", "dedup", "output");
-  await Promise.all([
-    mkdir(repoRoot, { recursive: true }),
-    mkdir(artifactRoot, { recursive: true })
-  ]);
-
-  const client = await startClient(bundle, {
-    CODEX_SECURITY_ARTIFACT_ROOT: artifactRoot,
-    CODEX_SECURITY_REPO_ROOT: repoRoot,
-    CODEX_SECURITY_ARTIFACT_LAYOUT: "reducer",
-    CODEX_SECURITY_PLUGIN_ROOT: pluginRoot,
-    CODEX_SECURITY_REDUCER_CONTEXT_JSON: JSON.stringify({
-      scanRoot,
-      claimedWorkers: []
-    })
-  });
-  try {
-    assert.deepEqual(
-      client.getServerCapabilities()?.experimental?.["codex/sandbox-state-meta"],
-      {},
-      "The reducer worker MCP must advertise actual parent sandbox-state metadata."
-    );
-    const tools = (await client.listTools()).tools;
-    assert.equal(
-      tools.some((tool) => tool.name === "record_codex_security_worker_threat_model"),
-      false,
-      "The reducer MCP must not expose a discovery worker's threat-model tool."
-    );
-    assert.deepEqual(tools.map((tool) => tool.name).sort(), [
-      "get_codex_security_deep_reducer_inputs",
-      "record_codex_security_deep_reduction"
-    ]);
-
-    for (const tool of tools) {
-      const projectedName = `mcp__cs_artifacts__${tool.name}`;
-      assert.ok(
-        projectedName.length <= 64,
-        `Nested worker MCP tool ${projectedName} exceeds Codex's 64-character limit.`
-      );
-      assert.equal(
-        Object.hasOwn(tool.inputSchema.properties ?? {}, "scanId"),
-        tool.name === "record_codex_security_deep_reduction",
-        `${tool.name} must expose scanId only when submitting its complete reduction.`
-      );
-      if (tool.name === "record_codex_security_deep_reduction") {
-        assert.deepEqual(tool.inputSchema.required, ["scanId", "findings"]);
-        assert.equal(tool.inputSchema.additionalProperties, false);
-        assert.equal(Object.hasOwn(tool.inputSchema.properties, "coverage"), false,
-          "The reducer must not be asked to submit coverage.");
-      }
-      for (const forbidden of [
-        "path",
-        "artifactRoot",
-        "resultPath",
-        "consumedWorkerIds",
-        "schemaVersion"
-      ]) {
-        assert.equal(
-          Object.hasOwn(tool.inputSchema.properties ?? {}, forbidden),
-          false,
-          `${tool.name} must not accept coordinator-owned ${forbidden}.`
-        );
-      }
-    }
-  } finally {
-    await client.close();
-  }
-}
-
 async function bundleEntrypoint(entrypoint, outfile) {
   await build({
     bundle: true,
+    banner: { js: "const __codexSecurityModuleUrl = require('node:url').pathToFileURL(__filename).href;" },
     define: {
       __dirname: JSON.stringify(applicationRoot),
-      "import.meta.url": "__filename"
+      "import.meta.url": "__codexSecurityModuleUrl"
     },
     entryPoints: [path.join(applicationRoot, entrypoint)],
     external: ["fsevents"],

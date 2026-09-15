@@ -190,6 +190,11 @@ def _scan_root_thread_ids(
         if workspace is not None:
             candidates.append(workspace["thread_id"])
     if scan["mode"] == "deep":
+        from workbench_scan_start import composition_children
+
+        candidates.extend(
+            child["continuation_thread_id"] for child in composition_children(connection, scan)
+        )
         candidates.extend(
             row["sdk_thread_id"]
             for row in connection.execute(

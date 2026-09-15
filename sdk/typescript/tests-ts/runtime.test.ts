@@ -36,7 +36,6 @@ import { PassThrough } from "node:stream";
 import { setImmediate as nextTurn } from "node:timers/promises";
 import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
-import { brotliDecompressSync } from "node:zlib";
 import { afterEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { strToU8, zipSync } from "fflate";
 import { build } from "esbuild";
@@ -86,6 +85,7 @@ import {
   streamWindowsCredentialAclDescriptors,
 } from "../src/runtime.js";
 import { loadBundledRuntime, PLUGIN_ROOT } from "./plugin-root.js";
+import { prepareScanFindings } from "../src/scan-semantics.js";
 import { runTestInSubprocess } from "./support/test-subprocess.js";
 import {
   lowerUuid7Turn,
@@ -215,6 +215,7 @@ describe("plugin runtime preparation", () => {
     expect(candidates).toEqual([
       join(packageRoot, "dist", "_bundled_plugin"),
       join(packageRoot, "_bundled_plugin"),
+      packageRoot,
     ]);
     expect(
       candidates.every((candidate) => {
@@ -224,6 +225,9 @@ describe("plugin runtime preparation", () => {
         );
       }),
     ).toBe(true);
+    expect(bundledPluginCandidates(join(packageRoot, "mcp"))).toContain(
+      packageRoot,
+    );
   });
 
   test("forwards configured provider credentials through the MCP worker environment", async () => {
@@ -295,36 +299,16 @@ describe("plugin runtime preparation", () => {
   });
 
   test("derives distinct finding identities from canonical candidate IDs", async () => {
-    const parts = await Promise.all(
-      ["000", "001"].map((part) =>
-        readFile(join(PLUGIN_ROOT, "mcp", `server.mjs.br.part-${part}`)),
-      ),
-    );
-    const runtime = brotliDecompressSync(Buffer.concat(parts)).toString("utf8");
-    const source =
-      /function buildFindings\(findings, mode\) \{[\s\S]*?\n\}/u.exec(
-        runtime,
-      )?.[0];
-    expect(source).toBeDefined();
-    const buildFindings = new Function(
-      "semanticIdentifier",
-      `${source}\nreturn buildFindings;`,
-    )((value: string, fallback: string) => value || fallback) as (
-      findings: Array<{
-        title: string;
-        extensions: { candidateId: string };
-      }>,
-    ) => Array<{ identity: { anchor: string } }>;
-
-    const findings = buildFindings([
+    const findings = prepareScanFindings([
       { title: "Same finding", extensions: { candidateId: "candidate-a" } },
       { title: "Same finding", extensions: { candidateId: "candidate-b" } },
     ]);
 
-    expect(findings.map((finding) => finding.identity.anchor)).toEqual([
-      "candidate-a",
-      "candidate-b",
-    ]);
+    expect(
+      findings.map(
+        (finding) => (finding["identity"] as { anchor: string }).anchor,
+      ),
+    ).toEqual(["candidate-a", "candidate-b"]);
   });
 
   test("disambiguates duplicate coverage surface identities without losing evidence", async () => {

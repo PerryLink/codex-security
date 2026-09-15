@@ -1,3 +1,4 @@
+import { execFileSync } from "node:child_process";
 import {
   copyFile,
   mkdir,
@@ -10,6 +11,7 @@ import {
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, relative, win32 } from "node:path";
+import { pathToFileURL } from "node:url";
 import { parse, stringify } from "smol-toml";
 import {
   Codex,
@@ -92,6 +94,112 @@ describe("semantic scan comparison", () => {
       { surface: "cli" },
     );
     expect(calls.threadOptions?.threadSource).toBe("security_scan_comparison");
+  });
+
+  test("preserves inherited denies at the read-only matcher process boundary", async () => {
+    const home = await mkdtemp(
+      join(tmpdir(), "codex-security-matcher-permissions-"),
+    );
+    temporaryDirectories.push(home);
+    const captures = join(home, "launches.jsonl");
+    const preload = join(home, "capture.mjs");
+    await writeFile(
+      preload,
+      `
+import { appendFileSync } from "node:fs";
+appendFileSync(${JSON.stringify(captures)}, JSON.stringify(process.argv.slice(1)) + "\\n");
+await new Promise((resolve) => { process.stdin.resume(); process.stdin.on("end", resolve); });
+console.log(JSON.stringify({ type: "thread.started", thread_id: "synthetic-comparison" }));
+console.log(JSON.stringify({ type: "item.completed", item: {
+  id: "answer", type: "agent_message", text: '{"matches":[],"uncertain":[]}'
+} }));
+console.log(JSON.stringify({ type: "turn.completed", usage: {
+  input_tokens: 1, cached_input_tokens: 0, output_tokens: 1
+} }));
+process.exit(0);
+`,
+    );
+    const nodeExecutable = execFileSync("node", ["-p", "process.execPath"], {
+      encoding: "utf8",
+    }).trim();
+    const inheritedPermissions = {
+      filesystem: {
+        [join(home, "literal.[private]")]: { ".": "deny" },
+        [join(home, "**", "*.secret")]: "deny",
+        glob_scan_max_depth: 3,
+      },
+      network: { enabled: true },
+    };
+    const originalStartThread = Codex.prototype.startThread;
+    const startThread = spyOn(
+      Codex.prototype,
+      "startThread",
+    ).mockImplementation(function (this: Codex, options) {
+      const original = (this as unknown as { options: CodexOptions }).options;
+      return originalStartThread.call(
+        new Codex({
+          ...original,
+          codexPathOverride: nodeExecutable,
+          env: {
+            ...original.env,
+            NODE_OPTIONS: `--import=${JSON.stringify(pathToFileURL(preload).href)}`,
+          },
+        }),
+        options,
+      );
+    });
+    try {
+      for (const constraints of [inheritedPermissions, undefined]) {
+        await matchScanFindings(
+          { before: [finding("before")], after: [finding("after")] },
+          {
+            environment: {
+              PATH: process.env["PATH"],
+              SystemRoot: process.env["SystemRoot"],
+              TEMP: process.env["TEMP"],
+              TMP: process.env["TMP"],
+              CODEX_HOME: home,
+              CODEX_SECURITY_SCAN_ID: "synthetic-scan",
+              OPENAI_API_KEY: "synthetic-key",
+            },
+            workingDirectory: home,
+            inheritedPermissions: constraints,
+          },
+        );
+      }
+      const [constrained, ordinary] = (await readFile(captures, "utf8"))
+        .trim()
+        .split("\n")
+        .map((line) => JSON.parse(line) as string[]);
+      const overrides = constrained!.flatMap((value, index) =>
+        value === "--config" ? [constrained![index + 1]!] : [],
+      );
+      const permissionOverride = overrides.find((value) =>
+        value.startsWith("permissions.codex_security_comparison="),
+      );
+      expect(parse(permissionOverride!)).toEqual({
+        permissions: {
+          codex_security_comparison: {
+            extends: ":read-only",
+            filesystem: inheritedPermissions.filesystem,
+            network: { enabled: false },
+          },
+        },
+      });
+      expect(overrides).toContain(
+        'default_permissions="codex_security_comparison"',
+      );
+      expect(overrides).toContain('approval_policy="never"');
+      expect(overrides).toContain("features.shell_tool=false");
+      expect(overrides).toContain("features.plugins=false");
+      expect(constrained).not.toContain("--sandbox");
+      expect(ordinary![ordinary!.indexOf("--sandbox") + 1]).toBe("read-only");
+      expect(
+        ordinary!.some((value) => value.includes("codex_security_comparison")),
+      ).toBe(false);
+    } finally {
+      startThread.mockRestore();
+    }
   });
 
   test.each([
@@ -806,6 +914,10 @@ describe("semantic scan comparison", () => {
         previousFindings: [open],
         falsePositives: [{ findingId: "dismissed", sourceScanId: "prior" }],
         findings: [after],
+        inheritedPermissions: {
+          filesystem: { "/private": "deny", glob_scan_max_depth: 3 },
+          network: { enabled: false },
+        },
         environment: {
           CODEX_HOME: "/provider-home",
           CODEX_SECURITY_SCAN_ID: "current",
@@ -835,6 +947,10 @@ describe("semantic scan comparison", () => {
         async matchFindings(value, options) {
           input = value;
           expect(options).toMatchObject({
+            inheritedPermissions: {
+              filesystem: { "/private": "deny", glob_scan_max_depth: 3 },
+              network: { enabled: false },
+            },
             environment: {
               CODEX_HOME: "/provider-home",
               CODEX_SECURITY_SCAN_ID: "current",

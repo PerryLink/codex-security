@@ -19,6 +19,7 @@ import {
 import {
   deepMerge,
   hasCommandAuth,
+  inlineToml,
   mergedCodexConfig,
   modelProviderConfigOverride,
   resolveCommandAuthConfig,
@@ -157,6 +158,8 @@ export interface ReadOnlyCodexOptions {
   /** @internal */
   codex?: ReadOnlyCodex;
   environment?: NodeJS.ProcessEnv;
+  /** @internal Constraints inherited from the scan that owns this helper. */
+  inheritedPermissions?: { filesystem: JsonObject; network: JsonObject };
   model?: string;
   reasoningEffort?:
     "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | "ultra";
@@ -172,7 +175,7 @@ export interface ScanComparisonOptions extends ReadOnlyCodexOptions {
 
 interface CompletedScanMatchingOptions extends Pick<
   ScanComparisonOptions,
-  "environment" | "model" | "signal"
+  "environment" | "inheritedPermissions" | "model" | "signal"
 > {
   scanId: string;
   repository: string;
@@ -564,6 +567,20 @@ async function startReadOnlyCodexThread(
   }
   const sdkConfig = { ...config };
   if (commandAuth) delete sdkConfig["model_providers"];
+  const configOverrides = commandAuth
+    ? modelProviderConfigOverride(providerConfig)
+    : [];
+  if (options.inheritedPermissions !== undefined) {
+    delete sdkConfig["sandbox_mode"];
+    sdkConfig["default_permissions"] = "codex_security_comparison";
+    configOverrides.push(
+      `permissions.codex_security_comparison=${inlineToml({
+        extends: ":read-only",
+        filesystem: options.inheritedPermissions.filesystem,
+        network: { enabled: false },
+      })}`,
+    );
+  }
   const environment =
     options.codex === undefined
       ? await comparisonEnvironment(
@@ -586,9 +603,7 @@ async function startReadOnlyCodexThread(
         environmentEntry(environment!, "OPENAI_API_KEY")?.trim() ||
         environmentEntry(environment!, "CODEX_API_KEY")?.trim() ||
         undefined,
-      ...(commandAuth
-        ? { configOverrides: modelProviderConfigOverride(providerConfig) }
-        : {}),
+      ...(configOverrides.length === 0 ? {} : { configOverrides }),
       config: {
         ...sdkConfig,
         mcp_servers: await disabledMcpServers(
@@ -624,7 +639,9 @@ async function startReadOnlyCodexThread(
     threadSource: runtimeOptions.threadSource,
     ...(model === undefined ? {} : { model }),
     modelReasoningEffort: reasoningEffort as ModelReasoningEffort,
-    sandboxMode: "read-only",
+    ...(options.inheritedPermissions === undefined
+      ? { sandboxMode: "read-only" as const }
+      : {}),
     approvalPolicy: "never",
     networkAccessEnabled: false,
     webSearchMode: "disabled",
@@ -741,6 +758,7 @@ export async function matchCompletedScan(
   const comparison = await (options.matchFindings ?? matchScanFindings)(input, {
     allowHistoricalUncertainty: true,
     environment: options.environment,
+    inheritedPermissions: options.inheritedPermissions,
     model: options.model,
     signal: options.signal,
     workingDirectory: options.repository,

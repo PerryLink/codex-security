@@ -1660,6 +1660,8 @@ export function bundledPluginCandidates(moduleDirectory: string): string[] {
   return [
     resolve(moduleDirectory, "_bundled_plugin"),
     resolve(moduleDirectory, "../_bundled_plugin"),
+    // The standalone MCP bundle lives directly inside its own plugin payload.
+    resolve(moduleDirectory, ".."),
   ];
 }
 

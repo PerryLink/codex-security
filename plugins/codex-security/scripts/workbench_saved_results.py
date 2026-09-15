@@ -14,6 +14,7 @@ import stat
 import sys
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
+from datetime import timedelta
 from pathlib import Path
 from types import ModuleType
 from typing import Any
@@ -37,6 +38,12 @@ from finalize_scan_contract import (
     write_scan_local_bytes,
 )
 from workbench_constants import PHASES
+from workbench_scan_start import (
+    COMPOSITION_CHECKPOINT,
+    composition_children,
+    read_composition_checkpoint,
+)
+from workbench_scan_usage import _timestamp, stored_scan_cost_fields
 from workbench_validation import path_within_scope
 
 _PUBLISHED_OUTPUTS = (
@@ -59,7 +66,6 @@ _RESERVED_ARTIFACT_PATHS = json.loads(
 class WorkbenchDbContext:
     ARTIFACTS: dict[str, str]
     artifact_path: Callable[..., Path | None]
-    deep_scan: ModuleType
     expected_coverage_mode: Callable[..., str]
     handoff: ModuleType
     index_findings: Callable[..., None]
@@ -220,7 +226,11 @@ def _saved_results_changed(db: Any, connection: Any, scan: Any) -> bool:
             "FROM deep_scan_workers WHERE scan_id = ?",
             (scan["id"],),
         ).fetchall()
-        paths = dict(_saved_result_paths(scan_dir, workers))
+        paths = dict(
+            _saved_result_paths(
+                scan_dir, workers if read_composition_checkpoint(scan) is None else []
+            )
+        )
         frozen_sources = scan["retained_source_digests_json"]
 
         def has_saved_source() -> bool:
@@ -310,7 +320,9 @@ def _recovery_source_digests(db: Any, connection: Any, scan: Any) -> tuple[dict[
         "FROM deep_scan_workers WHERE scan_id = ?",
         (scan["id"],),
     ).fetchall()
-    paths = dict(_saved_result_paths(scan_dir, workers))
+    paths = dict(
+        _saved_result_paths(scan_dir, workers if read_composition_checkpoint(scan) is None else [])
+    )
     recovery_sources = dict(frozen_sources or {})
     for relative, expected_digest in recovery_sources.items():
         try:
@@ -1094,6 +1106,219 @@ def _restore_published_outputs(scan_dir: Path, snapshots: dict[str, bytes | None
             write_scan_local_bytes(scan_dir, relative, contents)
 
 
+def retire_legacy_run(connection: Any, scan_id: str) -> None:
+    with connection:
+        connection.execute(
+            "UPDATE deep_scan_runs SET status = 'interrupted', phase = 'terminal', cancel_requested = 1, "
+            "coordinator_generation = coordinator_generation + 1 WHERE scan_id = ? AND status = 'running'",
+            (scan_id,),
+        )
+
+
+def migrate_legacy_scan(db: Any, connection: Any, scan: Any) -> Any:
+    """Import committed v1 progress once; ordinary scans own all subsequent execution."""
+    scan = db.require_scan(connection, scan["id"])
+    if scan["mode"] != "deep":
+        return scan
+    checkpoint = read_composition_checkpoint(scan)
+    if checkpoint is not None:
+        if checkpoint.get("legacy") is not None:
+            retire_legacy_run(connection, scan["id"])
+        return scan
+    run = connection.execute(
+        "SELECT * FROM deep_scan_runs WHERE scan_id = ?", (scan["id"],)
+    ).fetchone()
+    if run is None:
+        return scan
+    if (
+        scan["status"] != "running"
+        or scan["canceled_at"] is not None
+        or run["status"] not in {"running", "succeeded"}
+        or run["cancel_requested"]
+    ):
+        raise SystemExit("This Deep Scan has stopped and cannot resume.")
+    scan_dir = db.require_canonical_scan_directory(Path(scan["scan_dir"]))
+    workers = connection.execute(
+        "SELECT * FROM deep_scan_workers WHERE scan_id = ? ORDER BY created_at, id", (scan["id"],)
+    ).fetchall()
+    if run["status"] == "running":
+        # These are the retired coordinator's existing leases, read only during conversion.
+        last_seen = _timestamp(run["updated_at"])
+        grace = 120 if run["coordinator_generation"] == 1 else 30
+        if run["coordinator_generation"] != 1:
+            relative = f"artifacts/deep_discovery/coordinator-heartbeat-{run['coordinator_generation']}.json"
+            if (scan_dir / relative).exists():
+                heartbeat = _read_scan_local_json(
+                    scan_dir, relative, "Previous coordinator heartbeat"
+                )
+                if heartbeat.get("coordinatorGeneration") == run["coordinator_generation"]:
+                    timestamp = _timestamp(heartbeat.get("updatedAt"))
+                    if timestamp is not None:
+                        last_seen = (
+                            max(last_seen, timestamp) if last_seen is not None else timestamp
+                        )
+        active = run["coordinator_generation"] != 1 or any(
+            worker["status"] in {"queued", "running"} for worker in workers
+        )
+        if (
+            active
+            and last_seen is not None
+            and last_seen > _timestamp(db.now()) - timedelta(seconds=grace)
+        ):
+            raise SystemExit(
+                "The previous Deep Scan owner is still active; stop it before resuming with this version."
+            )
+    reducer = _latest_successful_reducer(workers)
+    accepted = [
+        worker
+        for worker in workers
+        if worker == reducer
+        or (
+            worker["kind"] == "discovery"
+            and worker["status"] == "succeeded"
+            and worker["merge_state"] == "merged"
+        )
+    ]
+    warnings: list[str] = []
+    binding = db.workbench_completion_binding(scan, db.now())
+    documents = merge_saved_results(
+        scan_dir,
+        scan["id"],
+        binding,
+        accepted,
+        warnings,
+        stopped=True,
+        reason="Saved Deep Scan execution migrated to ordinary scans.",
+    )
+    aggregate = {
+        "scanId": scan["id"],
+        "findings": [],
+        "coverage": {
+            "completeness": "partial",
+            "surfaces": [],
+            "explicitExclusions": [],
+            "deferred": [],
+        },
+    }
+    if documents is not None:
+        documents[2]["deferred"] = [
+            item for item in documents[2]["deferred"] if item.get("id") != "scan-stopped"
+        ]
+        _, _, manifest, findings, coverage, _, _ = _prepare_scan_finalization(
+            scan_dir,
+            expected_coverage_mode=binding["coverageMode"],
+            completion_binding=binding,
+            draft_documents=documents,
+        )
+        aggregate.update(findings=findings["findings"], coverage=coverage)
+        for field in ("scope", "threatModel"):
+            if field in manifest["scan"]:
+                aggregate[field] = manifest["scan"][field]
+        for index, finding in enumerate(aggregate["findings"]):
+            original = copy.deepcopy(finding)
+            for field in ("findingId", "occurrenceId", "fingerprints"):
+                finding.pop(field, None)
+            source_id = f"legacy:{index}"
+            finding.setdefault("provenance", {}).update(
+                sourceFindingIds=[source_id],
+                sourceFindings=[{"id": source_id, "finding": original}],
+            )
+    coverage = aggregate["coverage"]
+    for field in (
+        "documentType",
+        "schemaVersion",
+        "scanId",
+        "mode",
+        "includePaths",
+        "excludePaths",
+        "receiptRefs",
+        "inventoryStrategy",
+    ):
+        coverage.pop(field, None)
+    for field in ("includePaths", "excludePaths"):
+        aggregate.get("scope", {}).pop(field, None)
+    for worker in workers:
+        if worker["kind"] != "discovery" or worker in accepted:
+            continue
+        directory = Path(worker["artifact_dir"]).relative_to(scan_dir).as_posix()
+        coverage["deferred"].append(
+            {
+                "id": f"legacy-{worker['id']}",
+                "reason": f"Earlier independent scan did not merge. Saved work: {directory}.",
+            }
+        )
+    coverage["deferred"].extend({"reason": warning} for warning in warnings)
+    checkpoint = {
+        "version": 2,
+        "startedAt": run["created_at"],
+        "passes": [],
+        "mergedScanIds": [],
+        "aggregate": aggregate,
+        "noNewStreak": run["consecutive_no_new"],
+        "consecutiveErrors": run["consecutive_errors"],
+        "legacy": {
+            "originThreadId": scan["continuation_thread_id"] or scan["deep_scan_owner_thread_id"],
+            "discoveryRuns": run["discovery_runs_dispatched"],
+            "coverage": copy.deepcopy(coverage),
+            **(
+                {"cost": cost}
+                if (cost := stored_scan_cost_fields(scan["cost_json"]).get("cost"))
+                else {}
+            ),
+        },
+        **(
+            {"terminalReason": run["terminal_reason"]}
+            if run["status"] == "succeeded" and run["terminal_reason"] is not None
+            else {}
+        ),
+    }
+    # Clear the old execution thread before publishing the checkpoint. A crash between
+    # these writes safely repeats conversion and never resumes the retired conversation.
+    with connection:
+        connection.execute(
+            "UPDATE scans SET deep_scan_owner_thread_id = COALESCE(deep_scan_owner_thread_id, "
+            "continuation_thread_id), continuation_thread_id = NULL WHERE id = ?",
+            (scan["id"],),
+        )
+    write_scan_local_bytes(scan_dir, COMPOSITION_CHECKPOINT, _encoded(checkpoint))
+    retire_legacy_run(connection, scan["id"])
+    return db.require_scan(connection, scan["id"])
+
+
+def save_composed_checkpoint(connection: Any, scan: Any, scan_dir: Path) -> None:
+    """Preserve the accepted aggregate if cancellation beat its canonical draft publication."""
+    checkpoint = read_composition_checkpoint(scan)
+    if checkpoint is None:
+        return
+    aggregate = copy.deepcopy(checkpoint["aggregate"])
+    if not isinstance(aggregate, dict):
+        return
+    aggregate["scanId"] = scan["id"]
+    aggregate["complete"] = False
+    coverage = aggregate.setdefault("coverage", {})
+    coverage["completeness"] = "partial"
+    deferred = coverage.setdefault("deferred", [])
+    children = {child["scan_dir"]: child for child in composition_children(connection, scan)}
+    for item in checkpoint["passes"]:
+        directory = Path(scan["scan_dir"]) / item["directory"]
+        child = children.get(str(directory))
+        if child is not None and child["id"] in checkpoint["mergedScanIds"]:
+            continue
+        relative = directory.relative_to(scan_dir).as_posix()
+        note = {
+            "id": f"unmerged-{child['id']}"
+            if child is not None
+            else f"unmerged-{_digest(relative)[:16]}",
+            "reason": f"Independent scan did not complete and merge. Saved work: {relative}.",
+        }
+        if note not in deferred:
+            deferred.append(note)
+    payload = _encoded(aggregate)
+    write_scan_local_bytes(
+        scan_dir, f"checkpoints/{hashlib.sha256(payload).hexdigest()}.json", payload
+    )
+
+
 def preserve_scan_results_locked(
     db: Any,
     connection: Any,
@@ -1115,6 +1340,8 @@ def preserve_scan_results_locked(
             json.loads(raw_frozen_sources), "Saved stopped-scan"
         )
     scan_dir = db.require_canonical_scan_directory(Path(scan["scan_dir"]))
+    if frozen_source_digests is None:
+        save_composed_checkpoint(connection, scan, scan_dir)
     deep_run = connection.execute(
         "SELECT status FROM deep_scan_runs WHERE scan_id = ?", (scan_id,)
     ).fetchone()
@@ -1122,7 +1349,9 @@ def preserve_scan_results_locked(
         "canceled"
         if scan["canceled_at"]
         else "interrupted"
-        if deep_run and deep_run["status"] == "interrupted"
+        if deep_run
+        and deep_run["status"] == "interrupted"
+        and read_composition_checkpoint(scan) is None
         else "failed"
     )
     stored_warnings = json.loads(scan["completion_warnings_json"])
@@ -1224,7 +1453,9 @@ def preserve_scan_results_locked(
         connection.execute(
             "SELECT * FROM deep_scan_workers WHERE scan_id = ? ORDER BY created_at, id",
             (scan_id,),
-        ).fetchall(),
+        ).fetchall()
+        if read_composition_checkpoint(scan) is None
+        else [],
         warnings,
         stopped=True,
         reason=(
@@ -1284,6 +1515,14 @@ def preserve_scan_results_locked(
     return True
 
 
+def clear_legacy_publication_error(connection: Any, scan_id: str) -> None:
+    with connection:
+        connection.execute(
+            "UPDATE deep_scan_runs SET publication_error_message = NULL WHERE scan_id = ?",
+            (scan_id,),
+        )
+
+
 def recover_scan_results(db: Any, connection: Any, args: Any) -> dict[str, Any]:
     scan_id = db.require_uuid(args.scan_id, "scan-id")
     with db.scan_completion_lock(scan_id):
@@ -1301,41 +1540,43 @@ def recover_scan_results(db: Any, connection: Any, args: Any) -> dict[str, Any]:
             include_parent_with_recovery=include_parent,
         ):
             raise SystemExit("No saved stopped-scan results were available to recover.")
-        db.deep_scan.clear_deep_scan_publication_failure(connection, scan_id)
+        clear_legacy_publication_error(connection, scan_id)
     return db.scan_context(connection, scan_id)
 
 
 def preserve_scan_results(db: Any, connection: Any, args: Any) -> dict[str, Any]:
     scan_id = db.require_uuid(args.scan_id, "scan-id")
+    cost_json = db.parse_scan_cost(args.cost_json)
     with db.scan_completion_lock(scan_id):
         scan = db.require_scan(connection, scan_id)
-        if scan["status"] != "failed":
-            raise SystemExit("Only a stopped scan can preserve terminal results.")
+        if scan["status"] == "complete":
+            raise SystemExit("A completed scan cannot preserve new results.")
         workspace = db.require_workspace(connection, scan["workspace_id"])
         owner = (
-            scan["continuation_thread_id"]
-            or scan["deep_scan_owner_thread_id"]
+            scan["deep_scan_owner_thread_id"]
+            or scan["continuation_thread_id"]
             or workspace["thread_id"]
         )
         if args.thread_id is not None and args.thread_id != owner:
             raise SystemExit("Saved results can only be published from the owning Codex thread.")
-        if args.coordinator_generation is not None:
-            if args.thread_id is None:
-                raise SystemExit("A coordinator result refresh requires its owning thread.")
-            db.deep_scan.require_current_coordinator(
-                db.deep_scan.require_deep_scan_run(connection, scan_id), args
-            )
-        else:
-            db.handoff.require_current_continuation(
-                scan,
-                args.claim_token,
-                error_message="Saved results are owned by another continuation.",
-            )
+        db.handoff.require_current_continuation(
+            scan, args.claim_token, error_message="Saved results are owned by another continuation."
+        )
+        if cost_json is not None:
+            stored = stored_scan_cost_fields(scan["cost_json"])
+            if "usage" in stored:
+                cost_json = json.dumps({**stored, "cost": json.loads(cost_json)})
+            with connection:
+                connection.execute(
+                    "UPDATE scans SET cost_json = ? WHERE id = ?", (cost_json, scan_id)
+                )
+        if scan["status"] == "running":
+            return db.scan_context(connection, scan_id)
         published = preserve_scan_results_locked(db, connection, scan_id)
         if not published and scan["canceled_at"] is not None:
             raise SystemExit("Saved scan results could not be published or verified.")
         if published:
-            db.deep_scan.clear_deep_scan_publication_failure(connection, scan_id)
+            clear_legacy_publication_error(connection, scan_id)
     return db.scan_context(connection, scan_id)
 
 
@@ -1523,14 +1764,13 @@ def fail_scan_locked(db: Any, connection: Any, args: Any) -> dict[str, Any]:
             """
             UPDATE scans
             SET status = 'failed', failure_message = ?, completed_at = ?, updated_at = ?,
-                cost_json = ?
+                cost_json = COALESCE(?, cost_json)
             WHERE id = ? AND status = 'running'
             """,
             (message, timestamp, timestamp, cost_json, scan["id"]),
         )
         if updated.rowcount != 1:
             raise SystemExit("Only a running scan can be marked failed.")
-        db.deep_scan.fail_from_parent_scan(connection, scan["id"], message, timestamp)
         progress_updated = connection.execute(
             "UPDATE scan_progress SET updated_at = ? WHERE scan_id = ?",
             (timestamp, scan["id"]),
@@ -1558,7 +1798,11 @@ def cancel_scan_locked(db: Any, connection: Any, args: Any) -> dict[str, Any]:
         timestamp = db.now()
         scan = db.require_scan(connection, scan_id)
         workspace = db.require_workspace(connection, scan["workspace_id"])
-        owning_thread_id = scan["continuation_thread_id"] or workspace["thread_id"]
+        owning_thread_id = (
+            scan["deep_scan_owner_thread_id"]
+            or scan["continuation_thread_id"]
+            or workspace["thread_id"]
+        )
         if thread_id is not None and owning_thread_id != thread_id:
             raise SystemExit("A scan can only be canceled from its owning Codex thread.")
         if scan["canceled_at"] is not None:
@@ -1576,7 +1820,6 @@ def cancel_scan_locked(db: Any, connection: Any, args: Any) -> dict[str, Any]:
         )
         if updated.rowcount != 1:
             raise SystemExit("Only a running scan can be canceled.")
-        db.deep_scan.cancel_from_parent_scan(connection, scan["id"], timestamp)
         progress_updated = connection.execute(
             "UPDATE scan_progress SET updated_at = ? WHERE scan_id = ?",
             (timestamp, scan["id"]),
@@ -1593,7 +1836,8 @@ def cancel_scan_locked(db: Any, connection: Any, args: Any) -> dict[str, Any]:
 
 def preserve_stopped_results_after_transition(db: Any, connection: Any, scan_id: str) -> None:
     try:
-        published = preserve_scan_results_locked(db, connection, scan_id)
+        if preserve_scan_results_locked(db, connection, scan_id):
+            clear_legacy_publication_error(connection, scan_id)
     except (ContractError, OSError, SystemExit, ValueError) as exc:
         scan = db.require_scan(connection, scan_id)
         warnings = json.loads(scan["completion_warnings_json"])
@@ -1604,8 +1848,6 @@ def preserve_stopped_results_after_transition(db: Any, connection: Any, scan_id:
                 (json.dumps(list(dict.fromkeys([*warnings, warning]))), scan_id),
             )
         return
-    if published:
-        db.deep_scan.clear_deep_scan_publication_failure(connection, scan_id)
 
 
 if __name__ == "__main__":

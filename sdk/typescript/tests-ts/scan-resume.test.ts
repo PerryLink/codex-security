@@ -10,30 +10,56 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { join } from "node:path";
+import { tmpdir } from "node:os";
+import { parse as parseToml } from "smol-toml";
+import { fileURLToPath } from "node:url";
 import { afterEach, expect, test } from "bun:test";
 import { main } from "../src/cli.js";
 import type { ScanOptions } from "../src/api.js";
+import type { JsonObject } from "../src/config.js";
+import { estimateScanCost, type ScanCost } from "../src/cost.js";
+import {
+  DEEP_SCAN_CHECKPOINT,
+  type DeepScanCheckpoint,
+} from "../src/deep-scan.js";
+import {
+  prepareSemanticScanDraft,
+  type SemanticScan,
+} from "../src/scan-semantics.js";
 import { runWorkbench } from "../src/runtime.js";
 import { capture, dependencies } from "./cli-fixtures.js";
-import { PLUGIN_ROOT } from "./plugin-root.js";
 import { TestClient } from "./support/api-client.js";
 import {
   completedEvents,
   createApiTestFixtures,
-  preparedRuntime,
+  preparedRuntime as fixtureRuntime,
 } from "./support/api-events.js";
+
+const PLUGIN_ROOT = fileURLToPath(
+  new URL("../../../plugins/codex-security/", import.meta.url),
+);
 
 const { temporaryDirectory, cleanup } = createApiTestFixtures();
 afterEach(cleanup);
+
+function preparedRuntime(codexHome: string) {
+  const runtime = fixtureRuntime(codexHome);
+  runtime.plugin.pluginRoot = PLUGIN_ROOT;
+  runtime.plugin.installedRoot = PLUGIN_ROOT;
+  runtime.plugin.marketplaceRoot = PLUGIN_ROOT;
+  return runtime;
+}
 
 async function interruptedScan(
   mode: "deep" | "standard" = "deep",
   bulk = false,
   settings: Pick<
     ScanOptions,
-    "safetyIdentifier" | "postScanPrompt" | "auth"
+    "safetyIdentifier" | "postScanPrompt" | "auth" | "inheritedPermissions"
   > = {},
   resolvedDeep = false,
+  startedMerge = true,
+  childCost?: ScanCost,
 ) {
   const root = await temporaryDirectory();
   const repository = bulk
@@ -43,7 +69,7 @@ async function interruptedScan(
     ? join(root, "artifacts", "repo", "attempt-1")
     : join(root, "scan");
   const codexHome = join(root, "state", "codex-home");
-  await mkdir(repository, { recursive: true });
+  await mkdir(repository, { recursive: true, mode: 0o700 });
   await mkdir(scanDir, { recursive: true, mode: 0o700 });
   await mkdir(join(codexHome, "sessions"), { recursive: true });
   await writeFile(join(repository, "source.py"), "# synthetic source\n");
@@ -148,53 +174,96 @@ async function interruptedScan(
   );
   const scanId = registration["scanId"] as string;
   const threadId = randomUUID();
-  await command([
-    "set-scan-thread",
-    "--scan-id",
-    scanId,
-    "--thread-id",
-    threadId,
-  ]);
+  if (startedMerge)
+    await command([
+      "set-scan-thread",
+      "--scan-id",
+      scanId,
+      "--thread-id",
+      threadId,
+    ]);
   const sessionPath = join(codexHome, "sessions", `rollout-${threadId}.jsonl`);
   await writeFile(
     sessionPath,
     JSON.stringify({
       type: "session_meta",
-      payload: { id: threadId, cwd: scanDir },
+      payload: {
+        id: threadId,
+        cwd:
+          mode === "deep"
+            ? join(scanDir, "artifacts/deep-scan/merge")
+            : scanDir,
+      },
     }) + "\n",
   );
+  let childId: string | undefined;
+  let childDir: string | undefined;
   if (mode === "deep") {
-    await command([
-      "begin-deep-scan",
-      "--scan-id",
+    childDir = join(scanDir, "artifacts/deep-scan/passes/pass-1");
+    await mkdir(childDir, { recursive: true, mode: 0o700 });
+    const child = await command(
+      [
+        "register-cli-scan",
+        "--repository",
+        repository,
+        "--scan-dir",
+        childDir,
+        "--parent-scan-id",
+        scanId,
+        "--registration-json-stdin",
+      ],
+      JSON.stringify({
+        recipe: {
+          repository,
+          target: recipe.target,
+          mode: "standard",
+          config: recipe.config,
+        },
+      }),
+    );
+    childId = child["scanId"] as string;
+    const aggregate: SemanticScan = {
       scanId,
-      "--thread-id",
-      threadId,
-      "--available-parallelism",
-      "4",
-      "--workflow-version",
-      "deep-scan-mcp/v1",
+      findings: [],
+      coverage: {
+        completeness: "partial",
+        surfaces: [],
+        explicitExclusions: [],
+        deferred: [{ id: "time-cap", reason: "Synthetic time cap" }],
+      },
+    };
+    await writeDraft(command, child, "standard", {
+      ...aggregate,
+      scanId: childId,
+    });
+    await command(["prepare-scan-completion", "--scan-id", childId]);
+    await command([
+      "complete-scan",
+      "--scan-id",
+      childId,
+      ...(childCost ? ["--cost-json", JSON.stringify(childCost)] : []),
     ]);
-    const workerId = randomUUID();
-    const prompt = join(scanDir, "setup-prompt.md");
-    await writeFile(prompt, "Saved setup prompt.\n");
-    for (const status of ["running", "succeeded"]) {
-      await command([
-        "upsert-deep-scan-worker",
+    const state: DeepScanCheckpoint = {
+      version: 2,
+      startedAt: "2000-01-01T00:00:00Z",
+      passes: [
+        { directory: "artifacts/deep-scan/passes/pass-1", scanId: childId },
+      ],
+      mergedScanIds: startedMerge ? [childId] : [],
+      aggregate: startedMerge ? aggregate : null,
+      noNewStreak: startedMerge ? 1 : 0,
+      consecutiveErrors: 0,
+    };
+    await command(
+      [
+        "save-scan-artifact",
         "--scan-id",
         scanId,
-        "--worker-id",
-        workerId,
-        "--kind",
-        "setup",
-        "--status",
-        status,
-        "--prompt-path",
-        prompt,
-        "--artifact-dir",
-        scanDir,
-      ]);
-    }
+        "--artifact-path",
+        DEEP_SCAN_CHECKPOINT,
+      ],
+      JSON.stringify(state),
+    );
   }
   const checkpoint = join(scanDir, "checkpoint.json");
   await writeFile(checkpoint, '{"completed":"setup"}\n');
@@ -213,18 +282,51 @@ async function interruptedScan(
     sessionPath,
     checkpoint,
     input,
+    childId,
+    childDir,
   };
 }
 
-test("resume resolves an interrupted scan without changing its ID, recipe, or completed workers", async () => {
-  const f = await interruptedScan();
-  const before = await f.command([
-    "get-deep-scan",
+async function writeDraft(
+  command: (args: readonly string[], input?: string) => Promise<JsonObject>,
+  registration: JsonObject,
+  mode: "deep" | "standard",
+  draft: SemanticScan,
+) {
+  const directory = registration["scanDir"] as string;
+  const documents = prepareSemanticScanDraft(
+    {
+      targetContract: registration["contract"] as JsonObject,
+      mode,
+      targetRevision: registration["targetRevision"] as string,
+    },
+    draft,
+  );
+  const draftPath = join(directory, "drafts", randomUUID() + ".json");
+  const checkpointPath = join(
+    directory,
+    "drafts",
+    randomUUID() + ".checkpoint.json",
+  );
+  await mkdir(join(directory, "drafts"), { recursive: true, mode: 0o700 });
+  await writeFile(draftPath, JSON.stringify(documents));
+  await writeFile(checkpointPath, JSON.stringify(draft));
+  await command([
+    "write-scan-draft",
     "--scan-id",
-    f.scanId,
-    "--thread-id",
-    f.threadId,
+    registration["scanId"] as string,
+    "--draft-path",
+    draftPath,
+    "--checkpoint-path",
+    checkpointPath,
   ]);
+}
+
+test("resume preserves its identity, launch recipe, accepted child and checkpoint", async () => {
+  const f = await interruptedScan();
+  const before = await readFile(join(f.scanDir, DEEP_SCAN_CHECKPOINT));
+  const child = await f.command(["get-scan", "--scan-id", f.childId!]);
+  const artifacts = await readFile(join(f.childDir!, "findings.json"));
   const resumed = await f.command([
     "get-cli-scan-resume",
     "--scan-id",
@@ -235,31 +337,15 @@ test("resume resolves an interrupted scan without changing its ID, recipe, or co
     recipe: f.recipe,
     threadId: f.threadId,
   });
-  expect(
-    await f.command([
-      "get-deep-scan",
-      "--scan-id",
-      f.scanId,
-      "--thread-id",
-      f.threadId,
-    ]),
-  ).toEqual(before);
-  expect(await readFile(f.checkpoint, "utf8")).toBe('{"completed":"setup"}\n');
+  expect(await readFile(join(f.scanDir, DEEP_SCAN_CHECKPOINT))).toEqual(before);
+  expect(await f.command(["get-scan", "--scan-id", f.childId!])).toEqual(child);
+  expect(await readFile(join(f.childDir!, "findings.json"))).toEqual(artifacts);
 });
 
-test.each([
-  "failed",
-  "canceled",
-  "standard",
-  "changed",
-  "replaced",
-  "wrong-owner",
-])(
+test.each(["failed", "canceled", "changed", "replaced", "wrong-owner"])(
   "resume refuses %s scans without altering their saved state",
   async (scenario) => {
-    const f = await interruptedScan(
-      scenario === "standard" ? "standard" : "deep",
-    );
+    const f = await interruptedScan();
     if (scenario === "failed")
       await f.command([
         "fail-scan",
@@ -277,14 +363,8 @@ test.each([
       await mkdir(f.repository);
       await writeFile(join(f.repository, "source.py"), "# synthetic source\n");
     }
-    if (scenario === "wrong-owner")
-      await f.command([
-        "set-scan-thread",
-        "--scan-id",
-        f.scanId,
-        "--thread-id",
-        randomUUID(),
-      ]);
+    const ownerArgs =
+      scenario === "wrong-owner" ? ["--claim-token", randomUUID()] : [];
     const before = await f.command(["get-scan", "--scan-id", f.scanId]);
     expect(
       await f.command([
@@ -292,10 +372,11 @@ test.each([
         "--scan-id",
         f.scanId,
         "--allow-unavailable",
+        ...ownerArgs,
       ]),
     ).toMatchObject({ unavailable: expect.any(String) });
     await expect(
-      f.command(["get-cli-scan-resume", "--scan-id", f.scanId]),
+      f.command(["get-cli-scan-resume", "--scan-id", f.scanId, ...ownerArgs]),
     ).rejects.toThrow(
       scenario === "changed"
         ? "revision or contents changed"
@@ -303,9 +384,7 @@ test.each([
           ? "checkout is missing or was replaced"
           : scenario === "wrong-owner"
             ? "original owning CLI session"
-            : scenario === "standard"
-              ? "Deep Scan with a saved CLI launch recipe"
-              : "running scan; completed, failed, and canceled",
+            : "running scan; completed, failed, and canceled",
     );
     expect(await f.command(["get-scan", "--scan-id", f.scanId])).toEqual(
       before,
@@ -316,85 +395,65 @@ test.each([
   },
 );
 
-test("CLI resumes the owning Codex thread and preserves running state on a transport failure", async () => {
+test("CLI merge failure retains accepted ordinary scans and the original thread", async () => {
   const f = await interruptedScan();
-  const before = await f.command([
-    "get-deep-scan",
-    "--scan-id",
-    f.scanId,
-    "--thread-id",
-    f.threadId,
-  ]);
+  const checkpoint = JSON.parse(
+    await readFile(join(f.scanDir, DEEP_SCAN_CHECKPOINT), "utf8"),
+  ) as DeepScanCheckpoint;
+  checkpoint.mergedScanIds = [];
+  checkpoint.aggregate = null;
+  await f.command(
+    [
+      "save-scan-artifact",
+      "--scan-id",
+      f.scanId,
+      "--artifact-path",
+      DEEP_SCAN_CHECKPOINT,
+    ],
+    JSON.stringify(checkpoint),
+  );
+  const childBefore = await readFile(join(f.childDir!, "findings.json"));
   let resumedThread: string | undefined;
-  const stdout = capture();
   const stderr = capture();
   const code = await main(
     ["scans", "resume", f.scanId, "--json"],
-    stdout.stream,
+    capture().stream,
     stderr.stream,
     {
       ...dependencies({ environment: f.environment, currentDirectory: f.root }),
       runWorkbench: f.command,
-      createSecurity: (config) =>
-        new TestClient(config, {
-          environment: f.environment,
-          prepareRuntime: async () => preparedRuntime(f.codexHome),
-          resolvePluginPython: async () => f.python,
-          runWorkbench,
-          createCodex: (options) => ({
-            startThread() {
-              throw new Error("Resume must not create a new thread.");
+      createSecurity: resumeClient(f, (options) => ({
+        startThread() {
+          throw new Error("Resume must not create a new thread.");
+        },
+        resumeThread(threadId, threadOptions) {
+          resumedThread = threadId;
+          expect(threadOptions.workingDirectory).toBe(
+            join(f.scanDir, "artifacts/deep-scan/merge"),
+          );
+          expect(options.env).toMatchObject({
+            CODEX_SECURITY_SCAN_ID: f.scanId,
+            CODEX_SECURITY_SCAN_DIR: f.scanDir,
+          });
+          return {
+            id: threadId,
+            async runStreamed() {
+              throw new Error("Synthetic transport disconnected");
             },
-            resumeThread(threadId, threadOptions) {
-              resumedThread = threadId;
-              expect(threadOptions.workingDirectory).toBe(f.scanDir);
-              expect(options.env).toMatchObject({
-                CODEX_SECURITY_SCAN_ID: f.scanId,
-                CODEX_SECURITY_SCAN_DIR: f.scanDir,
-              });
-              return {
-                id: threadId,
-                async runStreamed(prompt) {
-                  expect(prompt).toContain(f.scanId);
-                  expect(prompt).toContain(
-                    "Keep the original scan instructions.",
-                  );
-                  const joined = await f.command([
-                    "begin-deep-scan",
-                    "--scan-id",
-                    f.scanId,
-                    "--thread-id",
-                    threadId,
-                    "--available-parallelism",
-                    "4",
-                  ]);
-                  expect(joined["deepScan"]).toMatchObject({
-                    scanId: f.scanId,
-                  });
-                  throw new Error("Synthetic transport disconnected");
-                },
-              };
-            },
-          }),
-        }),
+          };
+        },
+      })),
     },
   );
   expect(stderr.text()).toContain("Synthetic transport disconnected");
   expect(code).not.toBe(0);
   expect(resumedThread).toBe(f.threadId);
   expect(
-    await f.command([
-      "get-deep-scan",
-      "--scan-id",
-      f.scanId,
-      "--thread-id",
-      f.threadId,
-    ]),
-  ).toEqual(before);
-  expect(
     (await f.command(["get-scan", "--scan-id", f.scanId]))["scan"],
-  ).toMatchObject({ progress: { status: "running" } });
-  expect(await readFile(f.checkpoint, "utf8")).toBe('{"completed":"setup"}\n');
+  ).toMatchObject({ progress: { status: "failed" } });
+  expect(await readFile(join(f.childDir!, "findings.json"))).toEqual(
+    childBefore,
+  );
 });
 
 function resumeClient(
@@ -423,55 +482,21 @@ function resumeClient(
 }
 
 async function finishDiscovery(f: Awaited<ReturnType<typeof interruptedScan>>) {
-  // Advance the persisted clock to exercise a coordinator reaching its time cap.
-  const expired = Bun.spawnSync(
+  const checkpoint = JSON.parse(
+    await readFile(join(f.scanDir, DEEP_SCAN_CHECKPOINT), "utf8"),
+  ) as DeepScanCheckpoint;
+  checkpoint.terminalReason = "capped";
+  await f.command(
     [
-      f.python,
-      "-I",
-      "-B",
-      "-c",
-      "import sqlite3, sys; c = sqlite3.connect(sys.argv[1]); c.execute(\"UPDATE deep_scan_runs SET created_at = '2000-01-01T00:00:00+00:00' WHERE scan_id = ?\", (sys.argv[2],)); c.commit()",
-      join(f.environment.CODEX_SECURITY_STATE_DIR, "workbench.sqlite3"),
+      "save-scan-artifact",
+      "--scan-id",
       f.scanId,
+      "--artifact-path",
+      DEEP_SCAN_CHECKPOINT,
     ],
-    { stdout: "pipe", stderr: "pipe" },
+    JSON.stringify(checkpoint),
   );
-  expect(expired.exitCode, new TextDecoder().decode(expired.stderr)).toBe(0);
-  await cp(join(PLUGIN_ROOT, "examples", "completed-scan"), f.scanDir, {
-    recursive: true,
-  });
-  for (const name of ["scan-manifest.json", "findings.json", "coverage.json"]) {
-    const path = join(f.scanDir, name);
-    const doc = JSON.parse(await readFile(path, "utf8"));
-    if (name === "scan-manifest.json") {
-      doc.scan.id = f.scanId;
-      const contract = f.registration["contract"] as {
-        target: { allowedKinds: string[] };
-      };
-      doc.scan.target = { kind: contract.target.allowedKinds[0] };
-      delete doc.scan.sealedAt;
-      delete doc.scan.artifacts;
-    } else {
-      doc.scanId = f.scanId;
-      if (name === "findings.json") doc.findings = [];
-      else {
-        doc.mode = "deep_repository";
-        doc.completeness = "partial";
-        doc.surfaces = [];
-        doc.deferred = [{ id: "time_cap", reason: "Synthetic time cap" }];
-      }
-    }
-    await writeFile(path, JSON.stringify(doc) + "\n");
-  }
-  await f.command([
-    "finish-deep-scan",
-    "--scan-id",
-    f.scanId,
-    "--terminal-reason",
-    "capped",
-    "--manifest-path",
-    join(f.scanDir, "scan-manifest.json"),
-  ]);
+  await writeDraft(f.command, f.registration, "deep", checkpoint.aggregate!);
 }
 
 test.each([
@@ -480,7 +505,7 @@ test.each([
   [false, true],
   [true, true],
 ])(
-  "resumed CLI seals the original scan (coordinator finished: %p, bulk: %p)",
+  "resumed CLI seals the original scan (aggregate finished: %p, bulk: %p)",
   async (alreadyFinished, bulk) => {
     const f = await interruptedScan("deep", bulk);
     if (alreadyFinished) await finishDiscovery(f);
@@ -519,8 +544,9 @@ test.each([
             return {
               id: threadId,
               async runStreamed() {
-                if (!alreadyFinished) await finishDiscovery(f);
-                return { events: completedEvents(threadId) };
+                throw new Error(
+                  "Accepted capped aggregate needs no additional model turn",
+                );
               },
             };
           },
@@ -613,6 +639,69 @@ test.each([
   },
 );
 
+test("bulk recovery merges a sealed child when the parent stopped before its first merge thread", async () => {
+  const f = await interruptedScan("deep", true, {}, false, false);
+  const before = await readFile(join(f.childDir!, "findings.json"));
+  const stderr = capture();
+  const stdout = capture();
+  let merges = 0;
+  const code = await main(
+    ["bulk-scan", f.input, "--output-dir", f.root, "--recover", "--json"],
+    stdout.stream,
+    stderr.stream,
+    {
+      ...dependencies({ environment: f.environment, currentDirectory: f.root }),
+      runWorkbench: f.command,
+      createSecurity: resumeClient(f, () => ({
+        resumeThread() {
+          throw new Error("Parent has no saved merge thread yet.");
+        },
+        startThread(threadOptions) {
+          expect(threadOptions.workingDirectory).toBe(
+            join(f.scanDir, "artifacts/deep-scan/merge"),
+          );
+          return {
+            id: f.threadId,
+            async runStreamed() {
+              merges++;
+              async function* events() {
+                for await (const event of completedEvents(f.threadId)) {
+                  if (
+                    event.type === "item.completed" &&
+                    event.item.type === "agent_message"
+                  )
+                    yield {
+                      ...event,
+                      item: {
+                        ...event.item,
+                        text: JSON.stringify({
+                          scanId: f.scanId,
+                          findings: [],
+                        }),
+                      },
+                    };
+                  else yield event;
+                }
+              }
+              return { events: events() };
+            },
+          };
+        },
+      })),
+    },
+  );
+  expect(code, stderr.text()).toBe(2);
+  expect(JSON.parse(stdout.text()), stderr.text()).toMatchObject({
+    incomplete: 1,
+    failed: 0,
+  });
+  expect(merges).toBe(1);
+  expect(await readFile(join(f.childDir!, "findings.json"))).toEqual(before);
+  expect(
+    (await f.command(["get-scan", "--scan-id", f.scanId]))["scan"],
+  ).toMatchObject({ progress: { status: "complete" } });
+});
+
 test.each([
   "single",
   "bulk",
@@ -622,7 +711,31 @@ test.each([
 ])(
   "resume preserves sealed artifacts across a plugin upgrade (%s)",
   async (scenario) => {
-    const f = await interruptedScan("deep", scenario === "bulk");
+    const postScanPrompt = "Finish the original sealed scan follow-up.";
+    const childCost = estimateScanCost("gpt-5.6-sol", {
+      input_tokens: 20000,
+      output_tokens: 4000,
+    })!;
+    const f = await interruptedScan(
+      "deep",
+      scenario === "bulk",
+      { postScanPrompt },
+      false,
+      true,
+      childCost,
+    );
+    await appendFile(
+      f.sessionPath,
+      JSON.stringify({
+        type: "event_msg",
+        payload: {
+          type: "token_count",
+          info: {
+            total_token_usage: { input_tokens: 10000, output_tokens: 2000 },
+          },
+        },
+      }) + "\n",
+    );
     await finishDiscovery(f);
     const oldPlugin = join(f.root, "old-plugin");
     for (const path of ["scripts", "schemas", ".codex-plugin"]) {
@@ -662,6 +775,7 @@ test.each([
     const before = await f.command(["get-scan", "--scan-id", f.scanId]);
     const rejected = !["single", "bulk"].includes(scenario);
     let turns = 0;
+    const followUps: string[] = [];
     const stdout = capture();
     const stderr = capture();
     const code = await main(
@@ -677,8 +791,15 @@ test.each([
         }),
         runWorkbench: f.command,
         createSecurity: resumeClient(f, () => ({
-          startThread() {
-            throw new Error("Unexpected new session");
+          startThread(options) {
+            expect(options?.workingDirectory).toBe(f.scanDir);
+            return {
+              id: "saved-post-scan",
+              async runStreamed(prompt) {
+                followUps.push(prompt as string);
+                return { events: completedEvents("saved-post-scan") };
+              },
+            };
           },
           resumeThread(threadId) {
             expect(threadId).toBe(f.threadId);
@@ -686,7 +807,7 @@ test.each([
               id: threadId,
               async runStreamed() {
                 turns++;
-                return { events: completedEvents(threadId) };
+                throw new Error("Sealed scan needs no model turn");
               },
             };
           },
@@ -703,12 +824,20 @@ test.each([
     if (rejected) {
       expect(stderr.text()).toContain("Cannot resume sealed scan");
       expect(turns).toBe(0);
+      expect(followUps).toEqual([]);
       expect(after).toEqual(before);
     } else {
       expect(after["scan"], stderr.text()).toMatchObject({
         progress: { status: "complete" },
         continuationThreadId: f.threadId,
+        cost: { inputTokens: 30000, outputTokens: 6000 },
       });
+      expect(turns).toBe(0);
+      expect(followUps).toEqual([postScanPrompt]);
+      if (scenario === "single")
+        expect(JSON.parse(stdout.text())).toMatchObject({
+          cost: { inputTokens: 30000, outputTokens: 6000 },
+        });
       if (scenario === "bulk") {
         expect(JSON.parse(stdout.text())).toMatchObject({
           incomplete: 1,
@@ -837,6 +966,13 @@ test.each([
       safetyIdentifier:
         auth === "chatgpt" ? undefined : "synthetic-original-user",
       postScanPrompt: "Run these exact saved post-scan instructions.\n",
+      inheritedPermissions: {
+        filesystem: {
+          [join(tmpdir(), "synthetic-private")]: "deny",
+          glob_scan_max_depth: 4,
+        },
+        network: { enabled: false },
+      },
     };
     const f = await interruptedScan("deep", bulk, settings, true);
     f.environment.OPENAI_API_KEY = "synthetic-resume-key";
@@ -865,6 +1001,13 @@ test.each([
         }),
         runWorkbench: f.command,
         createSecurity: resumeClient(f, (options) => {
+          const permission = options.configOverrides?.find((value) =>
+            value.startsWith("permissions.codex_security_scan="),
+          );
+          expect(permission).toBeDefined();
+          expect(parseToml(permission!)).toMatchObject({
+            permissions: { codex_security_scan: settings.inheritedPermissions },
+          });
           expect(options.env?.["CODEX_SAFETY_IDENTIFIER"]).toBe(
             settings.safetyIdentifier,
           );
@@ -875,28 +1018,20 @@ test.each([
           expect(options.env?.["CODEX_API_KEY"]).toBeUndefined();
           return {
             startThread() {
-              throw new Error("Resume must use the original session.");
+              return {
+                id: f.threadId,
+                async runStreamed(prompt) {
+                  prompts.push(prompt as string);
+                  return { events: completedEvents(f.threadId) };
+                },
+              };
             },
             resumeThread(threadId) {
               expect(threadId).toBe(f.threadId);
               return {
                 id: threadId,
-                async runStreamed(prompt) {
-                  prompts.push(prompt as string);
-                  if (prompts.length === 1) {
-                    expect(prompt).toContain(
-                      "Keep the original scan instructions.",
-                    );
-                    const deep = await readFile(
-                      join(f.codexHome, "codex-security", "config.toml"),
-                      "utf8",
-                    );
-                    expect(deep).toContain("subagents = 0");
-                    expect(deep).toContain("stop_after_consecutive_errors = 2");
-                    expect(deep).toContain("max_time_hours = 1.5");
-                    await finishDiscovery(f);
-                  }
-                  return { events: completedEvents(threadId) };
+                async runStreamed() {
+                  throw new Error("Completed inputs need no model turn.");
                 },
               };
             },
@@ -905,8 +1040,17 @@ test.each([
       },
     );
     expect(code, stderr.text()).toBe(2);
-    expect(prompts, stderr.text()).toHaveLength(2);
-    expect(prompts[1]).toBe(settings.postScanPrompt);
+    expect(prompts, stderr.text()).toEqual([settings.postScanPrompt]);
+    expect(
+      (await f.command(["get-scan-recipe", "--scan-id", f.scanId]))["recipe"],
+    ).toMatchObject({
+      ...JSON.parse(JSON.stringify(settings)),
+      deepScan: {
+        subagents: 0,
+        stopAfterConsecutiveErrors: 2,
+        maxTimeHours: 1.5,
+      },
+    });
     expect(f.environment.OPENAI_API_KEY).toBe("synthetic-resume-key");
     expect(
       (await f.command(["get-scan", "--scan-id", f.scanId]))["scan"],
@@ -1015,6 +1159,30 @@ test.each(["failed", "missing-checkout", "missing-session", "standard"])(
     );
   },
 );
+
+test("the public resume command remains limited to Deep scans", async () => {
+  const f = await interruptedScan("standard");
+  const before = await f.command(["get-scan", "--scan-id", f.scanId]);
+  let runs = 0;
+  const code = await main(
+    ["scans", "resume", f.scanId, "--json"],
+    capture().stream,
+    capture().stream,
+    {
+      ...dependencies({
+        environment: f.environment,
+        currentDirectory: f.root,
+        onRun() {
+          runs++;
+        },
+      }),
+      runWorkbench: f.command,
+    },
+  );
+  expect(code).toBe(2);
+  expect(runs).toBe(0);
+  expect(await f.command(["get-scan", "--scan-id", f.scanId])).toEqual(before);
+});
 
 test("resume requires an explicit scan ID", async () => {
   const stdout = capture();
