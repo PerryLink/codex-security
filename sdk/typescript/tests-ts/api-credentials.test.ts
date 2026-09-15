@@ -231,8 +231,10 @@ describe("CodexSecurity orchestration", () => {
                 "utf8",
               );
               expect(options.env?.["CODEX_SECURITY_SURFACE"]).toBe("sdk");
-              expect(codexConfig).not.toContain("model_reasoning_summary");
-              expect(codexConfig).not.toContain("show_raw_agent_reasoning");
+              expect(parseToml(codexConfig)).toMatchObject({
+                model_reasoning_summary: "detailed",
+                show_raw_agent_reasoning: true,
+              });
               expect(options.config).not.toHaveProperty("projects");
               expect(options.config).not.toHaveProperty("permissions");
               expect(options.config).toMatchObject({
@@ -388,6 +390,77 @@ describe("CodexSecurity orchestration", () => {
     expect(runtimeHomes).toEqual([credentialHome, credentialHome]);
   });
 
+  test.each(["error", "empty", "cancel"])(
+    "releases native startup ownership before the first event on %s",
+    async (failure) => {
+      const root = await temporaryDirectory();
+      const repository = join(root, "repository");
+      const ambientHome = join(root, "ambient-codex-home");
+      const stateDirectory = join(root, "state");
+      const credentialHome = join(stateDirectory, "codex-home");
+      const lock = join(credentialHome, ".codex-security-scan.lock");
+      await mkdir(repository);
+      await mkdir(ambientHome);
+      await writeFile(join(ambientHome, "auth.json"), "{}\n");
+      let startups = 0;
+      for (const index of [0, 1]) {
+        const controller = new AbortController();
+        const startupError = new Error("synthetic startup failure");
+        const client = new TestClient(
+          { pluginPath: PLUGIN_ROOT },
+          {
+            environment: {
+              CODEX_HOME: ambientHome,
+              CODEX_SECURITY_STATE_DIR: stateDirectory,
+            },
+            resolvePluginPython: async () => "/managed/python",
+            prepareOutputDir: async () => {
+              const directory = join(root, `scan-${index}`);
+              await mkdir(directory, { mode: 0o700 });
+              return directory;
+            },
+            repositoryRevision: async () => "deadbeef",
+            createCodex: () => ({
+              startThread: () => ({
+                id: null,
+                async runStreamed() {
+                  expect(existsSync(lock)).toBe(true);
+                  startups += 1;
+                  if (index === 0 && failure === "error") throw startupError;
+                  return {
+                    events: (async function* () {
+                      await Promise.resolve();
+                      if (index === 1)
+                        throw new Error("next native startup reached");
+                      if (failure === "empty") return;
+                      controller.abort(startupError);
+                      throw startupError;
+                    })(),
+                  };
+                },
+              }),
+            }),
+          },
+        );
+        try {
+          const run = client.run(repository, { signal: controller.signal });
+          if (index === 1)
+            await expect(run).rejects.toThrow("next native startup reached");
+          else if (failure === "error")
+            await expect(run).rejects.toBe(startupError);
+          else if (failure === "cancel") {
+            const error = await run.catch((error: unknown) => error);
+            expect(error).toMatchObject({ cause: startupError });
+          } else await expect(run).rejects.toThrow();
+          expect(existsSync(lock)).toBe(false);
+        } finally {
+          await client.close();
+        }
+      }
+      expect(startups).toBe(2);
+    },
+  );
+
   test("runs parallel ChatGPT scans with isolated ordinary child settings", async () => {
     const root = await temporaryDirectory();
     const repository = join(root, "repository");
@@ -461,22 +534,30 @@ describe("CodexSecurity orchestration", () => {
                   const credentialLockExists = existsSync(
                     join(credentialHome, ".codex-security-scan.lock"),
                   );
-                  if (++scansStarted === 2) releaseScans();
-                  await concurrentScans;
-                  launches.push({
-                    index,
-                    home: options.env?.["CODEX_HOME"],
-                    directory: options.env?.["CODEX_SECURITY_SCAN_DIR"],
-                    before,
-                    after: structuredClone(options.config),
-                    sharedConfig,
-                    credentialLockExists,
-                  });
-                  const interrupted = new Error(
-                    "parallel managed scan reached",
-                  );
-                  controllers[index]!.abort(interrupted);
-                  throw interrupted;
+                  return {
+                    events: (async function* () {
+                      yield {
+                        type: "thread.started",
+                        thread_id: `parallel-${index}`,
+                      };
+                      if (++scansStarted === 2) releaseScans();
+                      await concurrentScans;
+                      launches.push({
+                        index,
+                        home: options.env?.["CODEX_HOME"],
+                        directory: options.env?.["CODEX_SECURITY_SCAN_DIR"],
+                        before,
+                        after: structuredClone(options.config),
+                        sharedConfig,
+                        credentialLockExists,
+                      });
+                      const interrupted = new Error(
+                        "parallel managed scan reached",
+                      );
+                      controllers[index]!.abort(interrupted);
+                      throw interrupted;
+                    })(),
+                  };
                 },
               }),
             }),
@@ -522,8 +603,16 @@ describe("CodexSecurity orchestration", () => {
           },
         });
         expect(launch.after).toEqual(launch.before);
-        expect(launch.sharedConfig).not.toHaveProperty("model");
-        expect(launch.credentialLockExists).toBe(false);
+        expect(launch.sharedConfig).toMatchObject({
+          model: launch.index === 0 ? "gpt-5.6-sol" : "gpt-5.6-terra",
+          default_permissions: "codex_security_scan",
+          features: {
+            multi_agent_v2: {
+              max_concurrent_threads_per_session: launch.index + 1,
+            },
+          },
+        });
+        expect(launch.credentialLockExists).toBe(true);
         expect(
           recipes.filter(({ index }) => index === launch.index),
         ).toMatchObject([
@@ -535,6 +624,9 @@ describe("CodexSecurity orchestration", () => {
         ]);
       }
       expect(existsSync(credentialHome)).toBe(true);
+      expect(
+        existsSync(join(credentialHome, ".codex-security-scan.lock")),
+      ).toBe(false);
     } finally {
       releaseScans();
       controllers.forEach((controller) => controller.abort());

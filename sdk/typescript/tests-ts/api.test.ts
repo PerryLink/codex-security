@@ -5239,7 +5239,7 @@ describe("CodexSecurity orchestration", () => {
       );
       expect(persistentConfigText).not.toContain("synthetic-transient-key");
       const persistentConfig = parseToml(persistentConfigText);
-      expect(persistentConfig["model"]).toBeUndefined();
+      expect(persistentConfig["model"]).toBe(model);
       if (provider !== undefined) {
         expect(persistentConfig).toMatchObject({
           model_provider: provider,
@@ -5310,9 +5310,17 @@ describe("CodexSecurity orchestration", () => {
                 startThread: () => ({
                   id: null,
                   async runStreamed() {
-                    if (++scansStarted === 2) releaseScans();
-                    await concurrentScans;
-                    throw new Error("parallel API-key scan reached");
+                    return {
+                      events: (async function* () {
+                        yield {
+                          type: "thread.started",
+                          thread_id: `parallel-api-key-${index}`,
+                        };
+                        if (++scansStarted === 2) releaseScans();
+                        await concurrentScans;
+                        throw new Error("parallel API-key scan reached");
+                      })(),
+                    };
                   },
                 }),
               };

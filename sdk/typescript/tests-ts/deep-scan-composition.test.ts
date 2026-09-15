@@ -301,46 +301,70 @@ describe("ordinary scan composition", () => {
     ]);
   });
 
-  test("loads a sealed child after interruption and merges it without rerunning discovery", async () => {
-    const h = await harness({ stopAfterNoNew: 1, maxDiscoveryRuns: 1 });
-    const childDirectory = "artifacts/deep-scan/passes/pass-1";
-    const scanDir = join(h.input.scanDir, childDirectory);
-    await mkdir(dirname(scanDir), { recursive: true, mode: 0o700 });
-    await cp(example, scanDir, { recursive: true });
-    if (process.platform !== "win32") await chmod(scanDir, 0o700);
-    const scanId = exampleManifest.scan.id;
-    h.records.set(scanId, {
-      scanId,
-      scanDir,
-      parentScanId: h.input.scanId,
-      targetPath: h.input.repository,
-      progress: { status: "complete" },
-    });
-    const bytes = await readFile(join(scanDir, "findings.json"));
-    await h.seed({
-      version: 2,
-      startedAt: h.input.startedAt,
-      passes: [{ directory: childDirectory }],
-      mergedScanIds: [],
-      aggregate: null,
-      noNewStreak: 0,
-      consecutiveErrors: 0,
-    });
-    await runDeepScans(h.input);
-    const state = await h.checkpoint();
-    expect(h.calls).toEqual([]);
-    expect(h.mergeInputs).toEqual([1]);
-    expect(state.mergedScanIds).toEqual([scanId]);
-    expect(state.terminalReason).toBe("capped");
-    expect(h.published.at(-1)!.findings).toHaveLength(1);
-    expect(await readFile(join(scanDir, "findings.json"))).toEqual(bytes);
-    await runDeepScans(h.input);
-    expect(h.calls).toEqual([]);
-    expect(h.mergeInputs).toEqual([1]);
-    expect((await h.checkpoint()).mergedScanIds).toEqual([scanId]);
-    expect((await h.checkpoint()).noNewStreak).toBe(state.noNewStreak);
-    expect(await readFile(join(scanDir, "findings.json"))).toEqual(bytes);
-  });
+  test.each([0, 1, 3])(
+    "resumes a sealed child with %i independent merge failures",
+    async (failures) => {
+      const h = await harness({ stopAfterNoNew: 1, maxDiscoveryRuns: 1 });
+      const childDirectory = "artifacts/deep-scan/passes/pass-1";
+      const scanDir = join(h.input.scanDir, childDirectory);
+      await mkdir(dirname(scanDir), { recursive: true, mode: 0o700 });
+      await cp(example, scanDir, { recursive: true });
+      if (process.platform !== "win32") await chmod(scanDir, 0o700);
+      const scanId = exampleManifest.scan.id;
+      h.records.set(scanId, {
+        scanId,
+        scanDir,
+        parentScanId: h.input.scanId,
+        targetPath: h.input.repository,
+        progress: { status: "complete" },
+      });
+      const bytes = await readFile(join(scanDir, "findings.json"));
+      await h.seed({
+        version: 2,
+        startedAt: h.input.startedAt,
+        passes: [{ directory: childDirectory }],
+        mergedScanIds: [],
+        aggregate: null,
+        noNewStreak: 0,
+        consecutiveErrors: 2,
+      });
+      const merge = h.input.merge;
+      let attempts = 0;
+      h.input.merge = async (...args) => {
+        if (++attempts <= failures) throw new Error("Merge failed.");
+        return merge(...args);
+      };
+      if (failures === 3) {
+        await expect(runDeepScans(h.input)).rejects.toThrow("Merge failed.");
+        expect(attempts).toBe(3);
+        expect(h.calls).toEqual([]);
+        expect(await h.checkpoint()).toMatchObject({
+          consecutiveErrors: 2,
+          noNewStreak: 0,
+          mergedScanIds: [],
+          terminalReason: "failed",
+        });
+        expect(await readFile(join(scanDir, "findings.json"))).toEqual(bytes);
+        return;
+      }
+      await runDeepScans(h.input);
+      const state = await h.checkpoint();
+      expect(h.calls).toEqual([]);
+      expect(h.mergeInputs).toEqual([1]);
+      expect(state.mergedScanIds).toEqual([scanId]);
+      expect(state.consecutiveErrors).toBe(2);
+      expect(attempts).toBe(failures + 1);
+      expect(state.terminalReason).toBe("capped");
+      expect(h.published.at(-1)!.findings).toHaveLength(1);
+      expect(await readFile(join(scanDir, "findings.json"))).toEqual(bytes);
+      await runDeepScans(h.input);
+      expect(h.calls).toEqual([]);
+      expect(h.mergeInputs).toEqual([1]);
+      expect((await h.checkpoint()).mergedScanIds).toEqual([scanId]);
+      expect((await h.checkpoint()).noNewStreak).toBe(state.noNewStreak);
+      expect(await readFile(join(scanDir, "findings.json"))).toEqual(bytes);
+    },
+  );
 
   test("continues the already reserved final pass before applying the run cap", async () => {
     const h = await harness({ maxDiscoveryRuns: 1 });
@@ -490,15 +514,42 @@ describe("ordinary scan composition", () => {
     h.setRun(async () => {
       throw new Error("Discovery failed.");
     });
-    await runDeepScans(h.input);
+    await expect(runDeepScans(h.input)).rejects.toThrow(
+      "every discovery run failed",
+    );
     const state = await h.checkpoint();
     expect(h.calls).toHaveLength(4);
     expect(state.passes).toHaveLength(1);
     expect(state.mergedScanIds).toEqual([]);
     expect(state.noNewStreak).toBe(0);
-    expect(state.terminalReason).toBe("capped");
-    expect(h.published.at(-1)!.coverage["completeness"]).toBe("partial");
-    expect(h.published.at(-1)!.coverage["deferred"]).toHaveLength(1);
+    expect(state.terminalReason).toBe("failed");
+    expect(state.consecutiveErrors).toBe(1);
+    expect(h.mergeInputs).toEqual([]);
+    expect(h.published).toEqual([]);
+  });
+
+  test("reports the original deadline when the final merge reaches saturation late", async () => {
+    const h = await harness({ stopAfterNoNew: 1 });
+    const merge = h.input.merge;
+    const clock = spyOn(Date, "now");
+    h.input.merge = async (...args) => {
+      const merged = await merge(...args);
+      clock.mockReturnValue(Date.parse(h.input.startedAt) + 3_600_001);
+      return merged;
+    };
+    try {
+      await runDeepScans(h.input);
+      expect(await h.checkpoint()).toMatchObject({
+        startedAt: h.input.startedAt,
+        noNewStreak: 1,
+        terminalReason: "capped",
+      });
+      expect(h.calls).toHaveLength(1);
+      expect(h.mergeInputs).toEqual([1]);
+      expect(h.published.at(-1)!.findings).toEqual([]);
+    } finally {
+      clock.mockRestore();
+    }
   });
 
   test("cancellation preserves accepted progress and closes owned clients", async () => {

@@ -97,6 +97,78 @@ describe("semantic scan comparison", () => {
     expect(calls.threadOptions?.threadSource).toBe("security_scan_comparison");
   });
 
+  test("uses prepared scan execution with the matcher restrictions", async () => {
+    const home = await mkdtemp(join(tmpdir(), "prepared-matcher-"));
+    temporaryDirectories.push(home);
+    await writeFile(join(home, "config.toml"), "invalid competing config = [");
+    const { codex, calls } = fakeCodex({ matches: [], uncertain: [] });
+    let prepared: CodexOptions | undefined;
+    await matchScanFindingsInternal(
+      { before: [finding("before")], after: [finding("after")] },
+      {
+        config: {
+          codexOverrides: {
+            model: "gpt-6-astra",
+            model_reasoning_effort: "ultra",
+            model_provider: "synthetic",
+            model_providers: {
+              synthetic: { name: "Synthetic", env_key: "SYNTHETIC_KEY" },
+            },
+            mcp_servers: { selected: { command: "synthetic-mcp" } },
+            features: { plugins: true },
+            plugins: { "codex-security@synthetic": { enabled: true } },
+          },
+        },
+        environment: { CODEX_HOME: home, CODEX_CLI_PATH: join(home, "absent") },
+        inheritedPermissions: {
+          filesystem: { "/private": "deny" },
+          network: { enabled: true },
+        },
+        createCodex(options) {
+          prepared = options;
+          return codex;
+        },
+      },
+      { surface: "sdk" },
+    );
+    expect(prepared?.config?.["model_provider"]).toBe("synthetic");
+    expect(prepared?.config?.["model_providers"]).toEqual({
+      synthetic: { name: "Synthetic", env_key: "SYNTHETIC_KEY" },
+    });
+    expect(prepared?.config?.["mcp_servers"]).toEqual({
+      selected: { command: "synthetic-mcp", enabled: false },
+    });
+    expect(prepared?.config?.["features"]).toMatchObject({
+      plugins: false,
+      shell_tool: false,
+      multi_agent_v2: false,
+    });
+    expect(prepared?.config?.["default_permissions"]).toBe(
+      "codex_security_comparison",
+    );
+    const permissionOverride = prepared?.configOverrides?.find((value) =>
+      value.startsWith("permissions.codex_security_comparison="),
+    );
+    expect(permissionOverride).toBeDefined();
+    expect(parse(permissionOverride!)).toMatchObject({
+      permissions: {
+        codex_security_comparison: {
+          filesystem: { "/private": "deny" },
+          network: { enabled: false },
+        },
+      },
+    });
+    expect(calls.threadOptions).toMatchObject({
+      model: "gpt-6-astra",
+      modelReasoningEffort: "ultra",
+      networkAccessEnabled: false,
+      approvalPolicy: "never",
+    });
+    expect(await readFile(join(home, "config.toml"), "utf8")).toBe(
+      "invalid competing config = [",
+    );
+  });
+
   test("preserves inherited denies at the read-only matcher process boundary", async () => {
     const home = await mkdtemp(
       join(tmpdir(), "codex-security-matcher-permissions-"),
@@ -622,9 +694,20 @@ process.exit(0);
   test("disables explicit and inherited MCP servers for read-only helper turns", async () => {
     const home = await mkdtemp(join(tmpdir(), "codex-security-comparison-"));
     temporaryDirectories.push(home);
+    const repositoryPath = join(home, "repository");
+    await mkdir(join(repositoryPath, ".git"), { recursive: true });
+    const repository = await realpath(repositoryPath);
+    await mkdir(join(repository, ".codex"));
+    await writeFile(
+      join(repository, ".codex", "config.toml"),
+      stringify({ mcp_servers: { project: { command: "synthetic-project" } } }),
+    );
     await writeFile(
       join(home, "config.toml"),
-      '[mcp_servers.inherited]\ncommand = "synthetic-inherited"\n',
+      stringify({
+        mcp_servers: { inherited: { command: "synthetic-inherited" } },
+        projects: { [repository]: { trust_level: "trusted" } },
+      }),
     );
     const executable = join(
       home,
@@ -660,7 +743,7 @@ process.exit(0);
         { before: [finding("before")], after: [finding("after")] },
         {
           environment,
-          workingDirectory: home,
+          workingDirectory: repository,
           config: {
             codexOverrides: {
               mcp_servers: {
@@ -673,6 +756,7 @@ process.exit(0);
       expect(config?.["mcp_servers"]).toEqual({
         synthetic: { command: "synthetic-integration", enabled: false },
         inherited: { enabled: false },
+        project: { enabled: false },
       });
       expect(codexPath).toBe(
         process.platform === "win32"
@@ -684,7 +768,7 @@ process.exit(0);
         resolveCodexCommand(environment),
         [
           "-C",
-          home,
+          repository,
           "-c",
           'mcp_servers.synthetic.command="synthetic-integration"',
           ...Object.keys(config!["mcp_servers"]!).flatMap((name) => [
@@ -696,6 +780,9 @@ process.exit(0);
           "--json",
         ],
         environment,
+        undefined,
+        undefined,
+        repository,
       );
       expect(effective.success).toBe(true);
       expect(
@@ -707,6 +794,7 @@ process.exit(0);
         ),
       ).toEqual([
         { name: "inherited", enabled: false },
+        { name: "project", enabled: false },
         { name: "synthetic", enabled: false },
       ]);
     } finally {

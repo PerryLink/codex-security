@@ -38,6 +38,7 @@ import {
   NO_CREDENTIALS_MESSAGE,
   accountStatus,
   configuredCodexHome,
+  readCodexHomeConfig,
   CodexLoginHandle,
   loginApiKey as persistApiKey,
   logout as codexLogout,
@@ -51,6 +52,7 @@ import {
 import {
   DEFAULT_CODEX_CONFIG,
   EXTERNAL_CODEX_PROVIDERS,
+  deepMerge,
   inlineToml,
   isExternalModelProvider,
   hasCommandAuth,
@@ -157,6 +159,7 @@ import {
 import { writeMockScanDraft } from "./mock-scan.js";
 import { scanActivitiesFromEvent, type ScanActivity } from "./scan-activity.js";
 import {
+  disabledMcpServers,
   matchCompletedScan,
   matchScanFindingsInternal,
 } from "./scan-comparison.js";
@@ -259,6 +262,7 @@ interface PreparedSession {
   effectiveConfig: JsonObject;
   preflightConfig: JsonObject;
   sessionConfig: JsonObject;
+  runtimeConfig?: JsonObject;
   modelProvider: unknown;
   externalProvider:
     | (typeof EXTERNAL_CODEX_PROVIDERS)[keyof typeof EXTERNAL_CODEX_PROVIDERS]
@@ -2631,16 +2635,53 @@ export class CodexSecurity {
                   },
                 ),
               environment,
-              config:
-                mode === "deep"
-                  ? {
-                      ...this.config,
-                      codexOverrides: scanCompositionOverrides(
-                        effectiveConfig,
-                        deepScanConfiguration!.settings.subagents,
-                      ),
-                    }
-                  : undefined,
+              config: {
+                ...this.config,
+                codexOverrides: deepMerge(
+                  { ...session.runtimeConfig },
+                  effectiveConfig,
+                ),
+              },
+              createCodex: async ({ config, configOverrides }) => {
+                const matcherConfig = config as JsonObject;
+                const release = await this.#lockSessionConfiguration(
+                  session,
+                  session.sessionConfig,
+                  signal,
+                );
+                try {
+                  matcherConfig["mcp_servers"] = await disabledMcpServers(
+                    this.#codexCommand(),
+                    matcherConfig,
+                    definedEnvironment(environment),
+                    { signal, workingDirectory: repo },
+                  );
+                } finally {
+                  await release?.();
+                }
+                const { codex } = this.#createSessionCodex(
+                  session,
+                  runtimePaths,
+                  options.auth,
+                  matcherConfig,
+                  configOverrides,
+                );
+                return {
+                  startThread(threadOptions) {
+                    const thread = codex.startThread(threadOptions);
+                    return {
+                      async run(input, turnOptions) {
+                        const turn = await readCodexTurn({
+                          thread,
+                          events: (await thread.runStreamed(input, turnOptions))
+                            .events,
+                        });
+                        return { finalResponse: turn.finalResponse };
+                      },
+                    };
+                  },
+                };
+              },
               model,
               signal,
               inheritedPermissions: session.inheritedPermissions,
@@ -3048,6 +3089,28 @@ export class CodexSecurity {
     }
   }
 
+  async #lockSessionConfiguration(
+    session: PreparedSession,
+    config: JsonObject,
+    signal?: AbortSignal,
+  ): Promise<(() => Promise<void>) | undefined> {
+    if (session.runtimeConfig === undefined) return undefined;
+    const release = await acquireCodexSecurityCredentialHomeLock(
+      session.runtime.codexHome,
+      signal,
+    );
+    try {
+      await writeCodexConfig(
+        join(session.runtime.codexHome, "config.toml"),
+        deepMerge({ ...session.runtimeConfig }, config),
+      );
+      return release;
+    } catch (error) {
+      await release();
+      throw error;
+    }
+  }
+
   #createSessionCodex(
     session: PreparedSession,
     runtimePaths: Record<string, string>,
@@ -3151,7 +3214,45 @@ export class CodexSecurity {
         },
       },
     });
-    return { codex, environment };
+    if (session.runtimeConfig === undefined) return { codex, environment };
+    const lockConfiguration = (signal?: AbortSignal) =>
+      this.#lockSessionConfiguration(session, config ?? sessionConfig, signal);
+    const wrapThread = (thread: CodexThreadLike): CodexThreadLike => ({
+      get id() {
+        return thread.id;
+      },
+      async runStreamed(input, options) {
+        return {
+          events: (async function* () {
+            let release: (() => Promise<void>) | undefined =
+              await lockConfiguration(options.signal);
+            try {
+              const { events } = await thread.runStreamed(input, options);
+              for await (const event of events) {
+                // Native startup has loaded its config before emitting SDK events.
+                await release?.();
+                release = undefined;
+                yield event;
+              }
+            } finally {
+              await release?.();
+            }
+          })(),
+        };
+      },
+    });
+    return {
+      codex: {
+        startThread: (options) => wrapThread(codex.startThread(options)),
+        ...(codex.resumeThread === undefined
+          ? {}
+          : {
+              resumeThread: (id: string, options: ThreadOptions) =>
+                wrapThread(codex.resumeThread!(id, options)),
+            }),
+      },
+      environment,
+    };
   }
 
   async #prepareSession(
@@ -3291,10 +3392,6 @@ export class CodexSecurity {
           ? "stored_credentials"
           : null;
       }
-      if (!keepCredentialLock || runtime.configPath !== undefined) {
-        await releaseCredentialHome?.();
-        releaseCredentialHome = null;
-      }
       if (externalProvider === null && apiKey !== null) {
         this.#runtimeCredentialSource = "api_key";
       }
@@ -3356,8 +3453,20 @@ export class CodexSecurity {
         signal,
       });
       checkOpen();
+      const runtimeConfig =
+        runtime.configPath === undefined
+          ? undefined
+          : await readCodexHomeConfig(
+              { ...runtime.environment, CODEX_HOME: runtime.codexHome },
+              signal,
+            );
+      if (!keepCredentialLock || runtime.configPath !== undefined) {
+        await releaseCredentialHome?.();
+        releaseCredentialHome = null;
+      }
       return {
         runtime,
+        runtimeConfig,
         safetyIdentifier: options.safetyIdentifier,
         runtimeHome,
         effectiveConfig,

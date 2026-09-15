@@ -246,6 +246,7 @@ export async function runDeepScans(
     });
     if (!pending.length && (!allowEmpty || state.aggregate !== null)) return;
     let merged: ReturnType<typeof validateMerge>;
+    let mergeFailures = 0;
     for (;;) {
       executionSignal.throwIfAborted();
       try {
@@ -260,10 +261,7 @@ export async function runDeepScans(
         break;
       } catch (error) {
         if (executionSignal.aborted) throw error;
-        state.consecutiveErrors += 1;
-        await save();
-        if (state.consecutiveErrors >= settings.stopAfterConsecutiveErrors)
-          throw error;
+        if (++mergeFailures >= settings.stopAfterConsecutiveErrors) throw error;
       }
     }
     executionSignal.throwIfAborted();
@@ -279,7 +277,6 @@ export async function runDeepScans(
     state.mergedScanIds.push(...pending.map((result) => result.scanId));
     state.noNewStreak =
       merged.newFindings > 0 ? 0 : state.noNewStreak + pending.length;
-    state.consecutiveErrors = 0;
     await save();
     await input.publish(state.aggregate);
   };
@@ -369,7 +366,12 @@ export async function runDeepScans(
     while (state.terminalReason === undefined) {
       executionSignal.throwIfAborted();
       await mergePending();
-      if (state.noNewStreak >= settings.stopAfterNoNew) {
+      const discoveryDeadlineReached =
+        deadlineController.signal.aborted || Date.now() >= deadline;
+      if (
+        !discoveryDeadlineReached &&
+        state.noNewStreak >= settings.stopAfterNoNew
+      ) {
         state.terminalReason = "saturated";
         break;
       }
@@ -382,10 +384,18 @@ export async function runDeepScans(
           saved.get(pass.scanId)?.progress.status === "running",
       );
       if (
-        deadlineController.signal.aborted ||
+        discoveryDeadlineReached ||
         (unfinished.length === 0 &&
           previousRuns + state.passes.length >= settings.maxDiscoveryRuns)
       ) {
+        if (
+          !discoveryDeadlineReached &&
+          state.aggregate === null &&
+          state.consecutiveErrors > 0
+        )
+          throw new Error(
+            "Deep Scan stopped because every discovery run failed.",
+          );
         state.terminalReason = "capped";
         break;
       }
