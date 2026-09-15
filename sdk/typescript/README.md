@@ -1990,16 +1990,15 @@ associations in the service before `deduplicationStatus` becomes `completed`.
 
 ### Deduplicate records with an external host
 
-`deduplicateRecords` accepts a complete batch of SDK `Finding` records or
-lossless imported evidence, plus candidate relationships, with host-owned review execution, source access and
-checkpoint storage.
-It reuses scan deduplication's screening and grouping without loading scan
-artifacts, starting a model process or publishing duplicate groups.
+`deduplicateRecords` accepts preloaded observations, candidates and their relationships.
+Each record preserves its complete original evidence, including records that lack
+fields required by the SDK Finding schema. One host review callback runs the
+SDK's screening and independent pair reviews; the SDK validates responses and
+returns duplicate groups without publishing them.
 
 See the [record deduplication integration guide](https://github.com/openai/codex-security/blob/main/docs/record-deduplication.md)
-for an SDK example, finding identities, result-tool registration, immutable
-source bindings, durable checkpoints and prior decisions. The host owns source
-authorization and any subsequent publication; deduplication does not validate
+for the SDK API and `dedupe --records` protocol. The host owns source access,
+review persistence and subsequent publication. Deduplication does not validate
 vulnerabilities.
 
 ### Stored duplicate groups

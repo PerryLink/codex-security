@@ -180,3 +180,24 @@ test("Retry-After accepts an HTTP date", async () => {
   await client.potentialDuplicates("synthetic", scope);
   expect(delay).toBeGreaterThan(24 * 60 * 60 * 1000);
 });
+
+test.each(["http://synthetic.test/prefix", "http://synthetic.test/prefix/"])(
+  "preserves findings URL prefix for lookup and both writes: %s",
+  async (base) => {
+    const paths: string[] = [];
+    const client = new FindingsClient(base, undefined, async (url, init) => {
+      paths.push(url.pathname);
+      if (init.method !== "POST") return Response.json(neighborhood);
+      if (url.pathname.endsWith("bulk/findings")) return Response.json([]);
+      return Response.json({});
+    });
+    await client.potentialDuplicates("a/b", scope);
+    await client.publish([], scope.repositoryId);
+    await client.storeDedupeGroups([["a", "b"]]);
+    expect(paths).toEqual([
+      "/prefix/v1/finding/a%2Fb/potential-duplicates",
+      "/prefix/v1/bulk/findings",
+      "/prefix/v1/dedupe-groups",
+    ]);
+  },
+);

@@ -21,7 +21,6 @@ const evidenceRecordSchema = z.strictObject({
   findingId: identity,
   severity,
   evidence: z.record(z.string(), z.json()),
-  provenance: z.record(z.string(), z.json()),
 });
 
 /** Original producer evidence is preserved without filling missing Finding fields. */

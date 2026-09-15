@@ -131,14 +131,10 @@ export type {
 } from "./deduplication/record-evidence.js";
 export { deduplicateRecords } from "./deduplication/records.js";
 export type {
-  BoundDeduplicationPairOutcome,
   DeduplicateRecordsOptions,
-  DeduplicateEvidenceRecordsOptions,
   DeduplicateRecordsResult,
-  DeduplicationCheckpointStore,
   DeduplicationReviewRequest,
   DeduplicationReviewRunner,
-  DeduplicationSourceTool,
   PriorDeduplicationDecision,
 } from "./deduplication/records.js";
 export type {

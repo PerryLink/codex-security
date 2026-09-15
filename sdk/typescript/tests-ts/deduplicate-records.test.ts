@@ -2,35 +2,15 @@ import { expect, test } from "bun:test";
 import {
   deduplicateRecords,
   type DeduplicateRecordsOptions,
-  type DeduplicationCheckpointStore,
   type DeduplicationReviewRequest,
-  type Finding,
 } from "../src/index.js";
 import {
   assigned,
-  finding,
+  record,
   submission,
 } from "./record-deduplication-fixtures.js";
 
-class Checkpoints implements DeduplicationCheckpointStore {
-  readonly values = new Map<string, unknown>();
-  readonly bindings = new Map<string, object>();
-  async getReview(key: string): Promise<unknown | null> {
-    return this.values.get(key) ?? null;
-  }
-  async saveReview(
-    key: string,
-    binding: object,
-    result: unknown,
-  ): Promise<void> {
-    this.values.set(key, structuredClone(result));
-    this.bindings.set(key, structuredClone(binding));
-  }
-}
-
-function options(
-  findings = [finding(1), finding(2)],
-): DeduplicateRecordsOptions {
+function options(findings = [record(1), record(2)]): DeduplicateRecordsOptions {
   return {
     observations: findings,
     candidates: findings,
@@ -40,41 +20,22 @@ function options(
         .filter((candidate) => candidate.findingId !== anchor.findingId)
         .map((candidate) => candidate.findingId),
     })),
-    reviewRunner: {
-      async run(request) {
-        return submission(request);
-      },
-    },
-    sourceManifest: {
-      repositories: [
-        { id: "synthetic-repository", revisions: ["a".repeat(40)] },
-      ],
-    },
-    async verifySource() {},
-    scopeKey: "synthetic-scope",
+    reviewRunner: { run: async (request) => submission(request) },
     concurrency: 1,
   };
 }
-
-test("public record API reviews complete records without artifacts or a findings service", async () => {
+test("preloaded records use screening and independent pair review and return only groups", async () => {
   const input = options();
   const requests: DeduplicationReviewRequest[] = [];
-  input.reviewRunner = {
-    async run(request) {
-      requests.push(request);
-      return submission(request);
-    },
+  input.reviewRunner.run = async (request) => {
+    requests.push(request);
+    return submission(request);
   };
-  const result = await deduplicateRecords(input);
-  expect(result.deduplicationStatus).toBe("completed");
-  expect(result.uniqueFindingIds).toEqual([input.observations[0]!.findingId]);
-  expect(result.duplicateGroups).toHaveLength(1);
-  expect(result.pairOutcomes).toHaveLength(1);
-  expect(result.pairOutcomes[0]!.origin).toBe("pair-review");
-  expect(result.pairOutcomes[0]!.review?.decision).toBe("SAME");
-  expect(result.pairOutcomes[0]!.screenings).toHaveLength(2);
-  expect(result.pairOutcomes[0]!.bindingDigest).toMatch(/^[a-f0-9]{64}$/);
-  expect(result.sameComponents).toHaveLength(1);
+  expect(await deduplicateRecords(input)).toEqual({
+    uniqueFindingIds: [input.observations[0]!.findingId],
+    duplicateGroups: [input.observations.map((f) => f.findingId)],
+    deduplicationStatus: "completed",
+  });
   expect(
     requests.map(({ stage, model, effort }) => [stage, model, effort]),
   ).toEqual([
@@ -82,663 +43,263 @@ test("public record API reviews complete records without artifacts or a findings
     ["screening", "gpt-5.6-luna", "xhigh"],
     ["pair-review", "gpt-5.6-sol", "high"],
   ]);
-  expect(assigned(requests[2]!)[0]!.extensions).toEqual(
-    input.observations[1]!.extensions,
+  expect(assigned(requests[2]!)[0]).toEqual(input.observations[1]!);
+  expect(Object.keys(requests[0]!).sort()).toEqual(
+    [
+      "findingIds",
+      "stage",
+      "model",
+      "effort",
+      "prompt",
+      "schema",
+      "resultToolNamespace",
+      "instructions",
+    ].sort(),
   );
-  expect(result.checkpointKeys).toEqual([]);
 });
-
-test("snapshots the complete batch before source callbacks and ignores repeated or self nominations", async () => {
-  const input = options();
-  const expected = await deduplicateRecords(input);
+test("snapshots complete inputs before callbacks and ignores self or repeated nominations", async () => {
+  const input = options(),
+    expected = await deduplicateRecords(input);
   input.candidateRelationships = input.candidateRelationships.map(
     ({ observationId, candidateIds }) => ({
       observationId,
       candidateIds: [observationId, ...candidateIds, ...candidateIds],
     }),
   );
-  input.verifySource = async () => {
-    input.candidates[0]!.title = "Changed after the batch was accepted";
-    input.candidates = [];
-    input.candidateRelationships = [];
-    input.verifySource = async () => {};
+  let first = true;
+  input.reviewRunner.run = async (request) => {
+    if (first) {
+      first = false;
+      input.candidates[0]!.evidence = { changed: true };
+      input.candidateRelationships = [];
+      input.candidates = [];
+    }
+    return submission(request);
   };
   expect(await deduplicateRecords(input)).toEqual(expected);
 });
-
-test("empty or isolated records do not invoke a reviewer", async () => {
-  for (const observations of [[], [finding(1)]]) {
-    const input = options(observations);
-    input.reviewRunner = {
-      async run() {
-        throw new Error("No review should run");
-      },
+test("empty and isolated observations do not review unrelated candidates", async () => {
+  for (const records of [[], [record(1)]]) {
+    const input = options(records);
+    input.candidates = [...records, record(3)];
+    input.reviewRunner.run = async () => {
+      throw new Error("Unexpected review");
     };
     expect((await deduplicateRecords(input)).uniqueFindingIds).toEqual(
-      observations.map((value) => value.findingId),
+      records.map((r) => r.findingId),
     );
   }
 });
-
-test("raw model output and checkpoint hits are validated by the SDK", async () => {
-  const store = new Checkpoints();
-  const input = { ...options(), checkpointStore: store };
-  input.reviewRunner = {
-    async run() {
-      return { decisions: {} };
-    },
+test("fresh and host-replayed responses receive the same SDK semantic validation", async () => {
+  const input = options(),
+    cache = new Map<string, unknown>();
+  let executions = 0;
+  input.reviewRunner.run = async (request) => {
+    const key = JSON.stringify(request);
+    if (cache.has(key)) return cache.get(key);
+    executions++;
+    const result = submission(request);
+    cache.set(key, result);
+    return result;
   };
-  await expect(deduplicateRecords(input)).rejects.toThrow(
-    "assigned screening pair slots",
-  );
-  expect(store.values.size).toBe(0);
-  input.reviewRunner = {
-    async run(request) {
-      return submission(request);
-    },
-  };
-  await deduplicateRecords(input);
-  const screeningKey = [...store.bindings].find(
-    ([, binding]) =>
-      (binding as { request: DeduplicationReviewRequest }).request.stage ===
-      "screening",
-  )![0];
-  store.values.set(screeningKey, { decisions: {} });
-  input.reviewRunner = {
-    async run() {
-      throw new Error("Cached result should be checked");
-    },
-  };
-  await expect(deduplicateRecords(input)).rejects.toThrow(
-    "assigned screening pair slots",
-  );
+  const first = await deduplicateRecords(input);
+  const count = executions;
+  expect(await deduplicateRecords(input)).toEqual(first);
+  expect(executions).toBe(count);
+  const pair = [...cache.keys()].find(
+    (key) => JSON.parse(key).stage === "pair-review",
+  )!;
+  cache.set(pair, {
+    ...(cache.get(pair) as object),
+    canonicalFindingId: "foreign",
+  });
+  await expect(deduplicateRecords(input)).rejects.toThrow("canonical identity");
+  expect(executions).toBe(count);
 });
-
-test("a screening veto remains DISTINCT and preserves its evidence without pair review", async () => {
+test("a screening veto prevents pair review even if the other screening says SAME", async () => {
   const input = options();
-  input.reviewRunner = {
-    async run(request) {
-      expect(request.stage).toBe("screening");
-      return submission(
-        request,
-        assigned(request)[0]!.findingId === input.observations[0]!.findingId,
-      );
-    },
+  input.reviewRunner.run = async (request) => {
+    expect(request.stage).toBe("screening");
+    return submission(
+      request,
+      request.findingIds[0] === input.observations[0]!.findingId,
+    );
+  };
+  expect((await deduplicateRecords(input)).duplicateGroups).toEqual([]);
+});
+test("un-nominated prior DISTINCT constrains a new positive bridge without added reviews", async () => {
+  const [a, b, c] = [record(1), record(2), record(3)];
+  const input = options([a!, b!, c!]);
+  input.candidateRelationships = [
+    { observationId: a!.findingId, candidateIds: [b!.findingId, c!.findingId] },
+    { observationId: b!.findingId, candidateIds: [] },
+    { observationId: c!.findingId, candidateIds: [] },
+  ];
+  input.priorDecisions = [
+    { findingIds: [b!.findingId, c!.findingId], decision: "DISTINCT" },
+  ];
+  const reviews: DeduplicationReviewRequest[] = [];
+  input.reviewRunner.run = async (request) => {
+    reviews.push(request);
+    return submission(request);
   };
   const result = await deduplicateRecords(input);
-  expect(result.duplicateGroups).toEqual([]);
-  expect(result.pairOutcomes[0]!.decision).toBe("DISTINCT");
-  expect(result.pairOutcomes[0]!.origin).toBe("screening");
+  expect(reviews.filter((r) => r.stage === "pair-review")).toHaveLength(2);
+  expect(result.duplicateGroups).toEqual([[a!.findingId, b!.findingId]]);
+  expect(result.uniqueFindingIds).toEqual([a!.findingId, c!.findingId]);
+  // The host retains both positive edges, including the one excluded by subgrouping.
   expect(
-    result.pairOutcomes[0]!.screenings.map((value) => value.result.decision),
-  ).toEqual(["SAME", "DISTINCT"]);
-});
-
-test("prior DISTINCT survives missing nominations and exposes the raw SAME bridge", async () => {
-  const left = finding(1);
-  const middle = finding(2);
-  const right = finding(3);
-  const previous = options([left, right]);
-  previous.reviewRunner = {
-    async run(request) {
-      return submission(request, false);
-    },
-  };
-  const prior = await deduplicateRecords(previous);
-  const current = options([middle]);
-  current.candidates = [left, right];
-  current.candidateRelationships = [
-    {
-      observationId: middle.findingId,
-      candidateIds: [left.findingId, right.findingId],
-    },
-  ];
-  current.priorDecisions = prior.pairOutcomes;
-  const result = await deduplicateRecords(current);
-  expect(
-    result.pairOutcomes.find(({ origin }) => origin === "prior")?.decision,
-  ).toBe("DISTINCT");
-  expect(result.sameComponents.map((group) => [...group].sort())).toEqual([
-    [left.findingId, middle.findingId, right.findingId].sort(),
+    reviews.filter((r) => r.stage === "pair-review").map((r) => r.findingIds),
+  ).toEqual([
+    [a!.findingId, b!.findingId],
+    [a!.findingId, c!.findingId],
   ]);
-  expect(
-    result.duplicateGroups.some(
-      (group) =>
-        group.includes(left.findingId) && group.includes(right.findingId),
-    ),
-  ).toBe(false);
 });
-
-test("matching prior decisions skip repeated reviews while stale source bindings fail", async () => {
-  const input = options();
-  const previous = await deduplicateRecords(input);
-  input.priorDecisions = previous.pairOutcomes;
-  input.reviewRunner = {
-    async run() {
-      throw new Error("Prior decisions avoid repeated review");
-    },
-  };
-  const replay = await deduplicateRecords(input);
-  expect(replay.pairOutcomes[0]!.origin).toBe("prior");
-  expect(replay.duplicateGroups).toEqual(previous.duplicateGroups);
-  input.sourceManifest = {
-    repositories: [{ id: "synthetic-repository", revisions: ["b".repeat(40)] }],
-  };
-  await expect(deduplicateRecords(input)).rejects.toThrow(
-    "current record/source binding",
-  );
-});
-
-test("stable source policy preserves prior pairs across batch growth while record revisions stay bound", async () => {
-  const withRevision = (index: number, revision: string): Finding => ({
-    ...finding(index),
-    extensions: {
-      source: { repository: "synthetic-repository", revision },
-    },
-  });
-  const left = withRevision(1, "a".repeat(40));
-  const right = withRevision(2, "b".repeat(40));
-  const unrelated = withRevision(3, "c".repeat(40));
-  // The policy is corpus-wide; each complete record carries its own revision.
-  const sourceManifest = {
-    repository: "synthetic-repository",
-    providerVersion: "synthetic-git-v1",
-  };
-  const previous = options([left, right]);
-  previous.sourceManifest = sourceManifest;
-  previous.reviewRunner = {
-    async run(request) {
-      return submission(request, false);
-    },
-  };
-  const prior = await deduplicateRecords(previous);
-  const reviewedPairs: string[][] = [];
-  const current = options([left, right, unrelated]);
-  current.sourceManifest = sourceManifest;
-  current.priorDecisions = prior.pairOutcomes;
-  current.reviewRunner = {
-    async run(request) {
-      expect(request.stage).toBe("screening");
-      const [anchor, ...neighbors] = assigned(request);
-      for (const neighbor of neighbors)
-        reviewedPairs.push([anchor!.findingId, neighbor.findingId].sort());
-      return submission(request, false);
-    },
-  };
-  const result = await deduplicateRecords(current);
-  const reused = result.pairOutcomes.filter(({ origin }) => origin === "prior");
-  expect(reused).toHaveLength(1);
-  expect(reused[0]!.bindingDigest).toBe(prior.pairOutcomes[0]!.bindingDigest);
-  expect(reused[0]!.decision).toBe("DISTINCT");
-  expect(reviewedPairs.length).toBeGreaterThan(0);
-  expect(
-    reviewedPairs.every((pair) => pair.includes(unrelated.findingId)),
-  ).toBe(true);
-  expect(result.pairOutcomes).toHaveLength(3);
-
-  for (const changedIndex of [1, 2]) {
-    const changed = options([
-      changedIndex === 1 ? withRevision(1, "d".repeat(40)) : left,
-      changedIndex === 2 ? withRevision(2, "d".repeat(40)) : right,
-      unrelated,
-    ]);
-    changed.sourceManifest = sourceManifest;
-    changed.priorDecisions = prior.pairOutcomes;
-    changed.reviewRunner = {
-      async run() {
-        throw new Error("Reject stale source binding before review");
+test.each(["SAME", "DISTINCT"] as const)(
+  "prior %s can refer to preloaded endpoints absent from nominations",
+  async (decision) => {
+    const input = options([record(1)]);
+    const candidate = record(2),
+      unrelated = record(3);
+    input.candidates = [candidate, unrelated];
+    input.priorDecisions = [
+      {
+        findingIds: [input.observations[0]!.findingId, candidate.findingId],
+        decision,
       },
+    ];
+    input.reviewRunner.run = async () => {
+      throw new Error("Unexpected review");
     };
-    await expect(deduplicateRecords(changed)).rejects.toThrow(
-      "current record/source binding",
+    const result = await deduplicateRecords(input);
+    expect(result.duplicateGroups).toEqual(
+      decision === "SAME"
+        ? [[input.observations[0]!.findingId, candidate.findingId]]
+        : [],
     );
-  }
-});
-
-test("checkpoint persistence is acknowledged before scheduling the next review", async () => {
-  const saving = Promise.withResolvers<void>();
-  const release = Promise.withResolvers<void>();
-  const store = new Checkpoints();
-  let writes = 0;
-  const originalSave = store.saveReview.bind(store);
-  store.saveReview = async (key, binding, result) => {
-    if (++writes === 1) {
-      saving.resolve();
-      await release.promise;
-    }
-    await originalSave(key, binding, result);
-  };
-  let calls = 0;
-  const input = { ...options(), checkpointStore: store };
-  input.reviewRunner = {
-    async run(request) {
+    expect(result.uniqueFindingIds).not.toContain(unrelated.findingId);
+  },
+);
+test.each([
+  { candidates: [] },
+  { candidateRelationships: [] },
+  { candidateRelationships: [{ observationId: "foreign", candidateIds: [] }] },
+  { candidates: [{ ...record(1), evidence: { changed: true } }] },
+  {
+    priorDecisions: [
+      { findingIds: [record(1).findingId, "foreign"], decision: "SAME" },
+    ],
+  },
+  {
+    priorDecisions: [
+      {
+        findingIds: [record(1).findingId, record(1).findingId],
+        decision: "SAME",
+      },
+    ],
+  },
+  {
+    priorDecisions: [
+      {
+        findingIds: [record(1).findingId, record(2).findingId],
+        decision: "SAME",
+      },
+      {
+        findingIds: [record(2).findingId, record(1).findingId],
+        decision: "DISTINCT",
+      },
+    ],
+  },
+])(
+  "rejects invalid graph or conflicting prior before review: %j",
+  async (change) => {
+    const input = { ...options(), ...change } as DeduplicateRecordsOptions;
+    let calls = 0;
+    input.reviewRunner.run = async () => {
       calls++;
-      return submission(request);
-    },
-  };
-  const pending = deduplicateRecords(input);
-  await saving.promise;
-  expect(calls).toBe(1);
-  expect(store.values.size).toBe(0);
-  release.resolve();
-  expect((await pending).deduplicationStatus).toBe("completed");
-  expect(store.values.size).toBe(3);
+      throw new Error("Unexpected callback");
+    };
+    await expect(deduplicateRecords(input)).rejects.toThrow();
+    expect(calls).toBe(0);
+  },
+);
+test.each([
+  {},
+  { decisions: {} },
+  { decisions: { "pair-1": { decision: "SAME", rationale: " " } } },
+])("invalid or incomplete results fail without groups: %j", async (result) => {
+  const input = options();
+  input.reviewRunner.run = async () => result;
+  await expect(deduplicateRecords(input)).rejects.toThrow();
 });
-
-test("failed reviews resume from durable screening checkpoints", async () => {
-  const store = new Checkpoints();
-  const input = { ...options(), checkpointStore: store };
-  input.reviewRunner = {
-    async run(request) {
-      if (request.stage === "pair-review")
-        throw new Error("Required revision unavailable");
-      return submission(request);
-    },
+test("namespace consistently identifies result tools without source registration", async () => {
+  const input = options();
+  input.resultToolNamespace = "mcp__synthetic_result";
+  input.reviewRunner.run = async (request) => {
+    expect(request.resultToolNamespace).toBe(input.resultToolNamespace!);
+    expect(request.prompt).not.toContain("review_validator.");
+    expect(request.instructions.submission).toContain(
+      "mcp__synthetic_result.submit_decisions",
+    );
+    expect(request.instructions.submission).toContain(
+      "mcp__synthetic_result.submit_error",
+    );
+    expect(request.instructions.source).toContain("supplied by the host");
+    expect(Object.isFrozen(request)).toBe(true);
+    expect(Object.isFrozen(request.findingIds)).toBe(true);
+    return submission(request);
+  };
+  await deduplicateRecords(input);
+  input.resultToolNamespace = "a.b";
+  await expect(deduplicateRecords(input)).rejects.toThrow("single identifier");
+});
+test("host persistence failure blocks completion and caller can retry from saved replies", async () => {
+  const input = options(),
+    saved = new Map<string, unknown>();
+  let fail = true,
+    calls = 0;
+  input.reviewRunner.run = async (request) => {
+    calls++;
+    const key = JSON.stringify(request);
+    const result = saved.get(key) ?? submission(request);
+    saved.set(key, result);
+    if (fail) {
+      fail = false;
+      throw new Error("Lost durable acknowledgement");
+    }
+    return result;
   };
   await expect(deduplicateRecords(input)).rejects.toThrow(
-    "Required revision unavailable",
+    "Lost durable acknowledgement",
   );
-  expect(store.values.size).toBe(2);
-  const resumed: string[] = [];
-  input.reviewRunner = {
-    async run(request) {
-      resumed.push(request.stage);
-      return submission(request);
-    },
-  };
   expect((await deduplicateRecords(input)).deduplicationStatus).toBe(
     "completed",
   );
-  expect(resumed).toEqual(["pair-review"]);
+  expect(saved.size).toBe(3);
+  expect(calls).toBe(4);
 });
-
-test.each(["source", "tools", "settings", "scope"])(
-  "changed %s binding invalidates cached reviews",
-  async (changed) => {
-    const store = new Checkpoints();
-    const input = { ...options(), checkpointStore: store };
-    let calls = 0;
-    input.reviewRunner = {
-      async run(request) {
-        calls++;
-        return submission(request);
-      },
-    };
-    await deduplicateRecords(input);
-    await deduplicateRecords(input);
-    expect(calls).toBe(3);
-    if (changed === "source") input.sourceManifest = { revision: "changed" };
-    if (changed === "tools")
-      input.sourceTools = [
-        {
-          namespace: "repository_source",
-          name: "read",
-          description: "Read approved source",
-          inputSchema: { type: "object" },
-          version: "2",
-        },
-      ];
-    if (changed === "settings") input.settingsDigest = "changed";
-    if (changed === "scope") input.scopeKey = "another-scope";
-    await deduplicateRecords(input);
-    expect(calls).toBe(6);
-  },
-);
-
-test("injected runner receives frozen source tools and complete submission contracts", async () => {
+test("cancellation drains an active host callback before rejecting without scheduling pair review", async () => {
+  const controller = new AbortController(),
+    entered = Promise.withResolvers<void>(),
+    release = Promise.withResolvers<void>();
   const input = options();
-  input.sourceTools = [
-    {
-      namespace: "repository_source",
-      name: "read",
-      description: "Read a file at an approved immutable revision",
-      inputSchema: {
-        type: "object",
-        properties: { revision: { type: "string" } },
-      },
-      version: "1",
-    },
-  ];
-  const checkedManifests: unknown[] = [];
-  input.verifySource = async (manifest) => {
-    checkedManifests.push(manifest);
+  input.signal = controller.signal;
+  let settled = false,
+    calls = 0;
+  input.reviewRunner.run = async (request) => {
+    calls++;
+    entered.resolve();
+    await release.promise;
+    return submission(request);
   };
-  input.reviewRunner = {
-    async run(request) {
-      expect(request.sourceTools).toEqual(input.sourceTools!);
-      expect(Object.isFrozen(request)).toBe(true);
-      expect(Object.isFrozen(request.sourceTools[0]!.inputSchema)).toBe(true);
-      expect(request.instructions.source).toContain("revision-scoped");
-      expect(request.instructions.submission).toContain(
-        "review_validator.submit_decisions",
-      );
-      expect(request.instructions.error).toContain("blocker");
-      expect(checkedManifests.at(-1)).toEqual(request.sourceManifest);
-      return submission(request);
-    },
-  };
-  await deduplicateRecords(input);
-  input.verifySource = async () => {
-    throw new Error("Approved source is unavailable");
-  };
-  await expect(deduplicateRecords(input)).rejects.toThrow(
-    "Approved source is unavailable",
-  );
-});
-
-test("cancellation and source changes never save an incomplete verdict", async () => {
-  const controller = new AbortController();
-  const store = new Checkpoints();
-  const input = {
-    ...options(),
-    checkpointStore: store,
-    signal: controller.signal,
-  };
-  input.reviewRunner = {
-    async run(request) {
-      controller.abort("cancelled");
-      return submission(request);
-    },
-  };
-  await expect(deduplicateRecords(input)).rejects.toBe("cancelled");
-  expect(store.values.size).toBe(0);
-});
-
-test("source drift after model execution prevents acknowledging the review", async () => {
-  const store = new Checkpoints();
-  let changed = false;
-  const input = { ...options(), checkpointStore: store };
-  input.verifySource = async () => {
-    if (changed) throw new Error("Source changed during the review");
-  };
-  input.reviewRunner = {
-    async run(request) {
-      changed = true;
-      return submission(request);
-    },
-  };
-  await expect(deduplicateRecords(input)).rejects.toThrow("Source changed");
-  expect(store.values.size).toBe(0);
-});
-
-test("checkpoint write failures do not acknowledge completion and can be retried", async () => {
-  const store = new Checkpoints();
-  const save = store.saveReview.bind(store);
-  store.saveReview = async () => {
-    throw new Error("Checkpoint store unavailable");
-  };
-  const input = { ...options(), checkpointStore: store };
-  await expect(deduplicateRecords(input)).rejects.toThrow(
-    "Checkpoint store unavailable",
-  );
-  expect(store.values.size).toBe(0);
-  store.saveReview = save;
-  const result = await deduplicateRecords(input);
-  expect(result.checkpointKeys).toHaveLength(3);
-  expect(store.values.size).toBe(3);
-});
-
-test("raw SAME submissions must include a valid merged original finding", async () => {
-  const input = options();
-  input.reviewRunner = {
-    async run(request) {
-      return request.stage === "screening"
-        ? submission(request)
-        : {
-            decision: "SAME",
-            rationale: "One shared correction",
-            canonicalFindingId: input.observations[0]!.findingId,
-            mergedFinding: {},
-          };
-    },
-  };
-  await expect(deduplicateRecords(input)).rejects.toThrow(
-    "generated mergedFinding",
-  );
-});
-
-test("conflicting persisted pair constraints cannot silently overwrite each other", async () => {
-  const input = options();
-  const previous = await deduplicateRecords(input);
-  input.priorDecisions = [
-    ...previous.pairOutcomes,
-    { ...previous.pairOutcomes[0]!, decision: "DISTINCT" },
-  ];
-  await expect(deduplicateRecords(input)).rejects.toThrow(
-    "Conflicting prior decisions",
-  );
-});
-
-test("detailed outcomes preserve input order when screening completion order changes", async () => {
-  async function run(order: [number, number]) {
-    const input = options();
-    input.concurrency = 2;
-    const started = [
-      Promise.withResolvers<void>(),
-      Promise.withResolvers<void>(),
-    ];
-    const released = [
-      Promise.withResolvers<void>(),
-      Promise.withResolvers<void>(),
-    ];
-    const completed: number[] = [];
-    input.reviewRunner = {
-      async run(request) {
-        if (request.stage === "screening") {
-          const index = input.observations.findIndex(
-            (value) => value.findingId === assigned(request)[0]!.findingId,
-          );
-          started[index]!.resolve();
-          await released[index]!.promise;
-          completed.push(index);
-        }
-        return submission(request);
-      },
-    };
-    const pending = deduplicateRecords(input);
-    await Promise.all(started.map((gate) => gate.promise));
-    released[order[0]]!.resolve();
-    released[order[1]]!.resolve();
-    const result = await pending;
-    expect(completed).toEqual(order);
-    return result;
-  }
-  expect(await run([1, 0])).toEqual(await run([0, 1]));
-});
-
-test("injected result namespaces render SDK instructions without changing finding evidence", async () => {
-  const records = [finding(1), finding(2)];
-  records[0]!.extensions = {
-    originalEvidence: {
-      literal: "review_validator.submit_error is source evidence",
-    },
-  };
-  const input = options(records);
-  input.resultToolNamespace = "mcp__review_validator";
-  input.checkpointStore = new Checkpoints();
-  const requests: DeduplicationReviewRequest[] = [];
-  input.reviewRunner = {
-    async run(request) {
-      requests.push(request);
-      expect(request.resultToolNamespace).toBe("mcp__review_validator");
-      expect(request.instructions.submission).toContain(
-        "mcp__review_validator.submit_decisions",
-      );
-      expect(request.instructions.submission).toContain(
-        "mcp__review_validator.submit_error",
-      );
-      const authored = request.prompt.slice(
-        0,
-        request.prompt.lastIndexOf("\n\n"),
-      );
-      expect(authored).toContain("mcp__review_validator.submit_error");
-      expect(authored).not.toMatch(/\breview_validator\./);
-      for (const value of assigned(request))
-        expect(value).toEqual(
-          records.find((record) => record.findingId === value.findingId)!,
-        );
-      return submission(request);
-    },
-  };
-  const first = await deduplicateRecords(input);
-  expect(first.uniqueFindingIds).toHaveLength(1);
-  expect(requests).toHaveLength(3);
-  expect(await deduplicateRecords(input)).toEqual(first);
-  expect(requests).toHaveLength(3);
-});
-
-test("result namespace changes invalidate checkpoints and prior pair bindings", async () => {
-  const input = options();
-  input.checkpointStore = new Checkpoints();
-  let reviews = 0;
-  input.reviewRunner = {
-    async run(request) {
-      reviews++;
-      return submission(request);
-    },
-  };
-  const first = await deduplicateRecords(input);
-  expect(reviews).toBe(3);
-  input.resultToolNamespace = "review_validator";
-  expect(await deduplicateRecords(input)).toEqual(first);
-  expect(reviews).toBe(3);
-  input.resultToolNamespace = "mcp__review_validator";
-  input.priorDecisions = first.pairOutcomes.map((outcome) => ({
-    findingIds: outcome.findingIds,
-    decision: "SAME",
-    bindingDigest: outcome.bindingDigest,
-  }));
-  await expect(deduplicateRecords(input)).rejects.toThrow(
-    "current record/source binding",
-  );
-  expect(reviews).toBe(3);
-  input.priorDecisions = [];
-  const changed = await deduplicateRecords(input);
-  expect(reviews).toBe(6);
-  expect(changed.checkpointKeys).not.toEqual(first.checkpointKeys);
-  expect(changed.pairOutcomes[0]!.bindingDigest).not.toBe(
-    first.pairOutcomes[0]!.bindingDigest,
-  );
-});
-
-test("invalid or colliding result namespaces fail before source access", async () => {
-  for (const namespace of [
-    "",
-    "review.validator",
-    " leading",
-    "review\nvalidator",
-  ]) {
-    const input = options();
-    input.resultToolNamespace = namespace;
-    input.verifySource = async () => {
-      throw new Error("Source must not be accessed");
-    };
-    await expect(deduplicateRecords(input)).rejects.toThrow(
-      "single identifier",
-    );
-  }
-  for (const namespace of ["review_validator", "mcp__review_validator"]) {
-    for (const name of ["submit_decisions", "submit_error"]) {
-      const input = options();
-      input.resultToolNamespace = "mcp__review_validator";
-      input.sourceTools = [
-        {
-          namespace,
-          name,
-          description: "Synthetic source operation",
-          inputSchema: { type: "object" },
-          version: "1",
-        },
-      ];
-      input.verifySource = async () => {
-        throw new Error("Source must not be accessed");
-      };
-      await expect(deduplicateRecords(input)).rejects.toThrow(
-        "reserved result tools",
-      );
-    }
-  }
-});
-
-test.each([true, false])(
-  "pair checkpoints retain exact SDK assignments across cache reuse (SAME=%s)",
-  async (same) => {
-    const store = new Checkpoints();
-    const input = {
-      ...options([finding(1), finding(2), finding(3)]),
-      checkpointStore: store,
-    };
-    input.reviewRunner = {
-      async run(request) {
-        expect(request.findingIds).toEqual(
-          assigned(request).map((value) => value.findingId),
-        );
-        return submission(request, same);
-      },
-    };
-    const fresh = await deduplicateRecords(input);
-    for (const outcome of fresh.pairOutcomes) {
-      expect(outcome.checkpointKeys).toHaveLength(same ? 3 : 2);
-      for (const key of outcome.checkpointKeys) {
-        expect(fresh.checkpointKeys).toContain(key);
-        const binding = store.bindings.get(key) as {
-          version: number;
-          request: DeduplicationReviewRequest;
-        };
-        expect(binding.version).toBe(3);
-        expect(binding.request.findingIds).toContain(outcome.findingIds[0]);
-        expect(binding.request.findingIds).toContain(outcome.findingIds[1]);
-        if (binding.request.stage === "screening")
-          expect(outcome.findingIds).toContain(binding.request.findingIds[0]!);
-      }
-    }
-    input.reviewRunner = {
-      async run() {
-        throw new Error("Review should be restored from the host checkpoint");
-      },
-    };
-    const resumed = await deduplicateRecords(input);
-    expect(resumed.pairOutcomes).toEqual(fresh.pairOutcomes);
-    const prior = await deduplicateRecords({
-      ...input,
-      priorDecisions: fresh.pairOutcomes,
-    });
-    expect(
-      prior.pairOutcomes.every(
-        (outcome) =>
-          outcome.origin === "prior" && outcome.checkpointKeys.length === 0,
-      ),
-    ).toBe(true);
-  },
-);
-
-test("source tools can share the result namespace with distinct names", async () => {
-  const input = options();
-  input.resultToolNamespace = "mcp__review_validator";
-  input.sourceTools = [
-    {
-      namespace: input.resultToolNamespace,
-      name: "read_source",
-      description: "Synthetic source operation",
-      inputSchema: { type: "object" },
-      version: "1",
-    },
-  ];
-  const namespaces: string[] = [];
-  input.reviewRunner = {
-    async run(request) {
-      expect(request.sourceTools).toEqual(input.sourceTools!);
-      namespaces.push(request.resultToolNamespace);
-      return submission(request);
-    },
-  };
-  const result = await deduplicateRecords(input);
-  expect(result.pairOutcomes[0]!.decision).toBe("SAME");
-  expect(namespaces.length).toBeGreaterThan(0);
-  expect(new Set(namespaces)).toEqual(new Set([input.resultToolNamespace]));
-  input.sourceTools = [...input.sourceTools, ...input.sourceTools];
-  input.verifySource = async () => {
-    throw new Error("Source must not be accessed");
-  };
-  await expect(deduplicateRecords(input)).rejects.toThrow("distinct names");
+  const pending = deduplicateRecords(input).finally(() => {
+    settled = true;
+  });
+  await entered.promise;
+  controller.abort("cancelled");
+  await Promise.resolve();
+  expect(settled).toBe(false);
+  release.resolve();
+  await expect(pending).rejects.toBe("cancelled");
+  expect(calls).toBe(1);
 });

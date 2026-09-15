@@ -1,29 +1,25 @@
-import type { EvidenceRecord } from "../src/deduplication/record-evidence.js";
 import { createInterface } from "node:readline";
 import { PassThrough, Writable } from "node:stream";
-import { expect, mock, test } from "bun:test";
+import { expect, test } from "bun:test";
 import {
   deduplicateRecords,
   type DeduplicationReviewRequest,
-  type DeduplicateRecordsOptions,
 } from "../src/deduplication/records.js";
 import {
   runRecordDedupeCli,
   runRecordDedupeProtocol,
 } from "../src/deduplication/records-cli.js";
-import { finding, submission } from "./record-deduplication-fixtures.js";
+import { record, submission } from "./record-deduplication-fixtures.js";
 
-const first = finding(1),
-  second = finding(2);
+const first = record(1),
+  second = record(2);
 const params = {
-  protocolVersion: 1,
+  protocolVersion: 2,
   observations: [first],
   candidates: [second],
   candidateRelationships: [
     { observationId: first.findingId, candidateIds: [second.findingId] },
   ],
-  scopeKey: "synthetic-scope",
-  sourceManifest: { revision: "synthetic-revision" },
   concurrency: 2,
 };
 type Message = {
@@ -71,224 +67,154 @@ function session() {
   };
 }
 async function drive(
-  checkpoints: Map<string, unknown>,
-  options: {
-    malformedReview?: boolean;
-    runParams?: Record<string, unknown>;
-    review?: (request: DeduplicationReviewRequest) => unknown;
-    onPut?: () => Promise<void>;
-    priorDecisions?: unknown[];
-    loseCheckpointAck?: boolean;
-  } = {},
+  options: Record<string, unknown> = params,
+  review = submission,
 ) {
   using s = session();
   const methods: string[] = [];
-  s.run({
-    ...(options.runParams ?? params),
-    checkpoints: true,
-    ...(options.priorDecisions
-      ? { priorDecisions: options.priorDecisions }
-      : {}),
-  });
+  s.run(options);
   for (;;) {
     const message = await s.next();
     if (!message.method) return { message, exit: await s.done, methods };
     methods.push(message.method);
-    switch (message.method) {
-      case "source.verify":
-        s.reply(message, null);
-        break;
-      case "checkpoint.get":
-        s.reply(
-          message,
-          checkpoints.get(String(message.params["key"])) ?? null,
-        );
-        break;
-      case "checkpoint.put":
-        await options.onPut?.();
-        checkpoints.set(
-          String(message.params["key"]),
-          message.params["result"],
-        );
-        expect(message.params["binding"]).toBeObject();
-        if (options.loseCheckpointAck) s.input.end();
-        else s.reply(message, null);
-        break;
-      case "review.run":
-        s.reply(
-          message,
-          options.malformedReview
-            ? {}
-            : (options.review ?? submission)(
-                message.params["request"] as DeduplicationReviewRequest,
-              ),
-        );
-        break;
-      default:
-        throw new Error(`Unexpected callback: ${message.method}`);
-    }
+    expect(message.method).toBe("review.run");
+    expect(Object.keys(message.params)).toEqual(["request"]);
+    s.reply(
+      message,
+      review(message.params["request"] as DeduplicationReviewRequest),
+    );
   }
 }
-
-test("CLI and SDK produce identical results, reuse checkpoints, and accept prior outcomes", async () => {
-  const directCheckpoints = new Map<string, unknown>();
+test("protocol v2 and SDK return identical groups using only review.run", async () => {
   const direct = await deduplicateRecords({
     ...params,
     reviewRunner: { run: async (request) => submission(request) },
-    verifySource: async () => {},
-    checkpointStore: {
-      getReview: async (key) => directCheckpoints.get(key) ?? null,
-      saveReview: async (key, _binding, result) => {
-        directCheckpoints.set(key, result);
-      },
-    },
   });
-  const checkpoints = new Map<string, unknown>(),
-    fresh = await drive(checkpoints, {
-      runParams: {
-        ...params,
-        candidates: [
-          Object.fromEntries(Object.entries(first).reverse()),
-          second,
-        ],
-      },
-    });
-  expect(fresh.exit).toBe(0);
-  expect(fresh.message.error).toBeUndefined();
-  expect(fresh.message.result).toMatchObject({
-    deduplicationStatus: "completed",
-    pairOutcomes: [{ decision: "SAME" }],
-  });
-  expect(checkpoints.size).toBeGreaterThan(0);
-  expect(fresh.message.result).toEqual(direct);
-  expect(checkpoints).toEqual(directCheckpoints);
-  for (const store of [checkpoints, directCheckpoints]) {
-    const resumed = await drive(store);
-    expect(resumed.exit).toBe(0);
-    expect(resumed.message.result).toEqual(direct);
-    expect(resumed.methods).not.toContain("review.run");
-    expect(resumed.methods).toContain("source.verify");
-  }
-  const prior = await drive(new Map(), {
-    priorDecisions: (fresh.message.result as { pairOutcomes: unknown[] })
-      .pairOutcomes,
-  });
-  expect(prior.exit).toBe(0);
-  expect(prior.methods).not.toContain("review.run");
-  expect(prior.message.result).toMatchObject({
-    pairOutcomes: [{ origin: "prior", checkpointKeys: [] }],
-  });
+  const result = await drive();
+  expect(result.exit).toBe(0);
+  expect(result.message.result).toEqual(direct);
+  expect(result.methods).toEqual(["review.run", "review.run"]);
+  expect(Object.keys(result.message.result as object).sort()).toEqual([
+    "deduplicationStatus",
+    "duplicateGroups",
+    "uniqueFindingIds",
+  ]);
 });
-test("recovers a persisted review when the checkpoint acknowledgement is lost", async () => {
-  const checkpoints = new Map<string, unknown>();
-  const interrupted = await drive(checkpoints, { loseCheckpointAck: true });
-  expect(interrupted.exit).toBe(2);
-  expect(checkpoints.size).toBe(1);
-  const recovered = await drive(checkpoints);
-  const fresh = await drive(new Map());
-  expect(recovered.message.result).toEqual(fresh.message.result);
-  expect(
-    recovered.methods.filter((method) => method === "review.run"),
-  ).toHaveLength(1);
-  expect(
-    fresh.methods.filter((method) => method === "review.run"),
-  ).toHaveLength(2);
-});
-test.each([
-  [{ candidates: [] }, "missing candidate record"],
-  [{ candidateRelationships: [] }, "name each observation once"],
-  [
-    {
-      candidateRelationships: [
-        params.candidateRelationships[0],
-        params.candidateRelationships[0],
-      ],
-    },
-    "name each observation once",
-  ],
-  [
-    {
-      candidateRelationships: [
-        { observationId: second.findingId, candidateIds: [] },
-      ],
-    },
-    "name each observation once",
-  ],
-  [
-    { candidates: [{ ...first, title: "Conflicting content" }] },
-    "Conflicting finding content",
-  ],
-  [{ candidates: [{}] }, "Finding"],
-])(
-  "CLI and SDK reject invalid comparison batches before callbacks: %j",
-  async (change, error) => {
+test("host can replay saved raw responses after a lost review reply", async () => {
+  const saved = new Map<string, unknown>();
+  {
     using s = session();
-    s.run({ ...params, ...change });
-    const response = await s.next();
-    expect(response.id).toBe("run");
-    expect(response.method).toBeUndefined();
-    expect(response.error?.message).toContain(error);
+    s.run();
+    const request = await s.next();
+    const assignment = request.params["request"] as DeduplicationReviewRequest;
+    saved.set(JSON.stringify(assignment), submission(assignment));
+    s.input.end();
     expect(await s.done).toBe(2);
-    const callback = mock(async () => {
-      throw new Error("No callbacks expected");
-    });
-    await expect(
-      deduplicateRecords({
-        ...params,
-        ...change,
-        reviewRunner: { run: callback },
-        verifySource: callback,
-      } as DeduplicateRecordsOptions),
-    ).rejects.toThrow(error);
-    expect(callback).not.toHaveBeenCalled();
-  },
-);
-test("an explicit empty neighborhood does not compare unrelated preloaded candidates", async () => {
-  using s = session();
-  s.run({
-    ...params,
-    candidateRelationships: [
-      { observationId: first.findingId, candidateIds: [] },
-    ],
-  });
-  for (;;) {
-    const response = await s.next();
-    if (response.id === "run") {
-      expect(response.result).toMatchObject({
-        uniqueFindingIds: [first.findingId],
-        pairOutcomes: [],
-      });
-      break;
-    }
-    expect(response.method).toBe("source.verify");
-    s.reply(response, null);
   }
-  expect(await s.done).toBe(0);
-});
-test("malformed model output fails instead of producing DISTINCT", async () => {
-  const result = await drive(new Map(), { malformedReview: true });
-  expect(result.exit).toBe(2);
-  expect(result.message.error).toBeDefined();
-  expect(result.message.result).toBeUndefined();
-  expect(result.methods).not.toContain("checkpoint.put");
-});
-test("checkpoint completion waits for the host acknowledgement", async () => {
-  const barrier = Promise.withResolvers<void>();
-  const reached = Promise.withResolvers<void>();
-  let completed = false;
-  const result = drive(new Map(), {
-    onPut: async () => {
-      reached.resolve();
-      await barrier.promise;
-    },
-  }).then((value) => {
-    completed = true;
+  let executions = 0;
+  const replay = await drive(params, (request) => {
+    const key = JSON.stringify(request);
+    if (saved.has(key)) return saved.get(key);
+    executions++;
+    const value = submission(request);
+    saved.set(key, value);
     return value;
   });
-  await reached.promise;
-  expect(completed).toBe(false);
-  barrier.resolve();
-  expect((await result).exit).toBe(0);
+  expect(replay.exit).toBe(0);
+  expect(executions).toBe(1);
+  expect(replay.message.result).toEqual((await drive()).message.result);
+  const key = [...saved.keys()].find(
+    (key) => JSON.parse(key).stage === "pair-review",
+  )!;
+  saved.set(key, {
+    ...(saved.get(key) as object),
+    canonicalFindingId: "foreign",
+  });
+  const invalid = await drive(params, (request) =>
+    saved.get(JSON.stringify(request)),
+  );
+  expect(invalid.exit).toBe(2);
+  expect(invalid.message.result).toBeUndefined();
+});
+test.each(["SAME", "DISTINCT"] as const)(
+  "prior %s survives missing nominations with no callback",
+  async (decision) => {
+    const result = await drive({
+      ...params,
+      candidateRelationships: [
+        { observationId: first.findingId, candidateIds: [] },
+      ],
+      priorDecisions: [
+        { findingIds: [first.findingId, second.findingId], decision },
+      ],
+    });
+    expect(result.exit).toBe(0);
+    expect(result.methods).toEqual([]);
+    expect(result.message.result).toMatchObject({
+      duplicateGroups:
+        decision === "SAME" ? [[first.findingId, second.findingId]] : [],
+    });
+  },
+);
+test.each([
+  { candidates: [] },
+  { candidateRelationships: [] },
+  { candidates: [{ ...first, evidence: { changed: true } }] },
+  { candidates: [{}] },
+  { observations: [{ findingId: "legacy", title: "Not an envelope" }] },
+  { protocolVersion: 1 },
+  { recordFormat: "evidence-v1" },
+  { checkpoints: true },
+  { scopeKey: "removed" },
+  { sourceManifest: {} },
+  { sourceTools: [] },
+  { settingsDigest: "removed" },
+  {
+    priorDecisions: [
+      {
+        findingIds: [first.findingId, second.findingId],
+        decision: "SAME",
+        bindingDigest: "removed",
+      },
+    ],
+  },
+])(
+  "invalid or removed protocol inputs fail before review: %j",
+  async (change) => {
+    const result = await drive({ ...params, ...change });
+    expect(result.exit).toBe(2);
+    expect(result.methods).toEqual([]);
+    expect(result.message.result).toBeUndefined();
+  },
+);
+test("incomplete model output fails without producing DISTINCT", async () => {
+  const result = await drive(params, () => ({}));
+  expect(result.exit).toBe(2);
+  expect(result.message.result).toBeUndefined();
+});
+test("completion waits for the host review response", async () => {
+  using s = session();
+  let settled = false;
+  s.done.then(() => {
+    settled = true;
+  });
+  s.run();
+  const screening = await s.next();
+  await Promise.resolve();
+  expect(settled).toBe(false);
+  s.reply(
+    screening,
+    submission(screening.params["request"] as DeduplicationReviewRequest),
+  );
+  const pair = await s.next();
+  await Promise.resolve();
+  expect(settled).toBe(false);
+  s.reply(
+    pair,
+    submission(pair.params["request"] as DeduplicationReviewRequest),
+  );
+  expect((await s.next()).result).toBeDefined();
+  expect(await s.done).toBe(0);
 });
 test.each(["orphan", "malformed", "duplicate"])(
   "rejects %s callback replies",
@@ -296,46 +222,47 @@ test.each(["orphan", "malformed", "duplicate"])(
     using s = session();
     s.run();
     const callback = await s.next();
-    expect(callback.method).toBe("source.verify");
+    expect(callback.method).toBe("review.run");
     if (kind === "duplicate") {
-      s.reply(callback, null);
-      s.reply(callback, null);
+      s.reply(
+        callback,
+        submission(callback.params["request"] as DeduplicationReviewRequest),
+      );
+      s.reply(callback, {});
     } else if (kind === "orphan")
-      s.send({ jsonrpc: "2.0", id: "unknown", result: null });
+      s.send({ jsonrpc: "2.0", id: "unknown", result: {} });
     else
       s.send({
         jsonrpc: "2.0",
         id: callback.id,
-        result: null,
+        result: {},
         error: { code: 1, message: "both" },
       });
     expect(await s.done).toBe(2);
     expect((await s.next()).error).toBeDefined();
   },
 );
-test.each(["cancel", "eof", "host-error", "bad-ack"])(
-  "%s rejects pending source verification",
+test.each(["cancel", "eof", "host-error"])(
+  "%s rejects the pending review without a verdict",
   async (kind) => {
     using s = session();
     s.run();
     const callback = await s.next();
     if (kind === "cancel") s.send({ jsonrpc: "2.0", method: "cancel" });
     else if (kind === "eof") s.input.end();
-    else if (kind === "bad-ack") s.reply(callback, {});
     else
       s.send({
         jsonrpc: "2.0",
         id: callback.id,
-        error: { code: -32001, message: "Synthetic source unavailable." },
+        error: { code: -32001, message: "Source unavailable" },
       });
     expect(await s.done).toBe(kind === "cancel" ? 130 : 2);
     const result = await s.next();
-    expect(result.id).toBe("run");
     expect(result.error).toBeDefined();
     expect(result.result).toBeUndefined();
   },
 );
-test("correlates concurrent callbacks independently of reply order", async () => {
+test("correlates concurrent reviews independently of response order", async () => {
   using s = session();
   s.run({
     ...params,
@@ -346,37 +273,24 @@ test("correlates concurrent callbacks independently of reply order", async () =>
       { observationId: second.findingId, candidateIds: [first.findingId] },
     ],
   });
-  s.reply(await s.next(), null);
   const a = await s.next(),
     b = await s.next();
-  expect(a.method).toBe("source.verify");
-  expect(b.method).toBe("source.verify");
   expect(a.id).not.toBe(b.id);
-  s.reply(b, null);
-  s.reply(a, null);
-  for (;;) {
-    const message = await s.next();
-    if (message.id === "run") {
-      expect(message.error).toBeUndefined();
-      break;
-    }
-    if (message.method === "review.run")
-      s.reply(
-        message,
-        submission(message.params["request"] as DeduplicationReviewRequest),
-      );
-    else {
-      expect(message.method).toBe("source.verify");
-      s.reply(message, null);
-    }
-  }
+  for (const message of [b, a])
+    s.reply(
+      message,
+      submission(message.params["request"] as DeduplicationReviewRequest),
+    );
+  const pair = await s.next();
+  expect((pair.params["request"] as DeduplicationReviewRequest).stage).toBe(
+    "pair-review",
+  );
+  s.reply(
+    pair,
+    submission(pair.params["request"] as DeduplicationReviewRequest),
+  );
+  expect((await s.next()).result).toBeDefined();
   expect(await s.done).toBe(0);
-});
-test("rejects undeclared run options", async () => {
-  using s = session();
-  s.run({ ...params, repositoryPath: "/synthetic/repository" });
-  expect(await s.done).toBe(2);
-  expect((await s.next()).error).toBeDefined();
 });
 test("rejects execution flags before reading stdin", async () => {
   let error = "";
@@ -399,25 +313,10 @@ test("rejects execution flags before reading stdin", async () => {
   expect(error).toContain("run request");
 });
 
-test("unsupported protocol version fails before callback dispatch", async () => {
-  using s = session();
-  s.send({
-    jsonrpc: "2.0",
-    id: "run",
-    method: "run",
-    params: { ...params, protocolVersion: 2 },
-  });
-  expect(await s.done).toBe(2);
-  const error = await s.next();
-  expect(error.id).toBe("run");
-  expect(error.error?.code).toBe(-32600);
-  expect(error.result).toBeUndefined();
-});
-
 test("input stream errors fail the active run through readline", async () => {
   using s = session();
   s.run();
-  expect((await s.next()).method).toBe("source.verify");
+  expect((await s.next()).method).toBe("review.run");
   s.input.destroy(new Error("Synthetic input failure"));
   expect(await s.done).toBe(2);
   const response = await s.next();
@@ -452,8 +351,14 @@ test.each(["success", "cancel"])(
         if (mode === "cancel") {
           send({ jsonrpc: "2.0", method: "cancel" });
         } else {
-          expect(message.method).toBe("source.verify");
-          send({ jsonrpc: "2.0", id: message.id, result: null });
+          expect(message.method).toBe("review.run");
+          send({
+            jsonrpc: "2.0",
+            id: message.id,
+            result: submission(
+              message.params["request"] as DeduplicationReviewRequest,
+            ),
+          });
         }
       },
     });
@@ -469,9 +374,9 @@ test.each(["success", "cancel"])(
         method: "run",
         params: {
           ...params,
-          observations: [],
-          candidates: [],
-          candidateRelationships: [],
+          ...(mode === "success"
+            ? { observations: [], candidates: [], candidateRelationships: [] }
+            : {}),
         },
       });
       await finalWrite.promise;
@@ -529,195 +434,3 @@ test("unidentifiable input errors use null", async () => {
   expect(error.error?.code).toBe(-32600);
   expect(error.result).toBeUndefined();
 });
-
-const evidenceFirst: EvidenceRecord = {
-  findingId: "synthetic-import-1",
-  severity: { level: "high" },
-  evidence: { description: "Original path one", relevant_lines: null },
-  provenance: { revision: "a".repeat(40) },
-};
-const evidenceSecond: EvidenceRecord = {
-  findingId: "synthetic-import-2",
-  severity: { level: "medium" },
-  evidence: {
-    description: "Original path two",
-    custom: { labels: ["original"] },
-  },
-  provenance: { revision: "b".repeat(40) },
-};
-const evidenceParams = {
-  ...params,
-  recordFormat: "evidence-v1" as const,
-  observations: [evidenceFirst],
-  candidates: [evidenceSecond],
-  candidateRelationships: [
-    {
-      observationId: evidenceFirst.findingId,
-      candidateIds: [evidenceSecond.findingId],
-    },
-  ],
-};
-function evidenceReview(request: DeduplicationReviewRequest): unknown {
-  if (request.stage === "screening") return submission(request);
-  return {
-    decision: "SAME",
-    rationale: "One correction closes both original paths.",
-    canonicalFindingId: evidenceFirst.findingId,
-    mergedFinding: {
-      findingId: evidenceFirst.findingId,
-      severity: evidenceFirst.severity,
-      summary: "Both original paths share the same correction.",
-      originalFindingIds: [evidenceFirst.findingId, evidenceSecond.findingId],
-    },
-  };
-}
-
-test("evidence preloaded CLI and SDK preserve identical bindings and recover lost checkpoint ACKs", async () => {
-  const directCheckpoints = new Map<string, unknown>();
-  const direct = await deduplicateRecords({
-    ...evidenceParams,
-    reviewRunner: { run: async (request) => evidenceReview(request) },
-    verifySource: async () => {},
-    checkpointStore: {
-      getReview: async (key) => directCheckpoints.get(key) ?? null,
-      saveReview: async (key, _binding, result) => {
-        directCheckpoints.set(key, result);
-      },
-    },
-  });
-  const state = new Map<string, unknown>();
-  const options = { runParams: evidenceParams, review: evidenceReview };
-  const fresh = await drive(state, options);
-  expect(fresh.exit).toBe(0);
-  expect(fresh.message.result).toEqual(direct);
-  expect(state).toEqual(directCheckpoints);
-  expect(fresh.methods).not.toContain("candidates.get");
-  const cached = await drive(state, options);
-  expect(cached.message.result).toEqual(direct);
-  expect(cached.methods).not.toContain("review.run");
-  const interruptedState = new Map<string, unknown>();
-  const interrupted = await drive(interruptedState, {
-    ...options,
-    loseCheckpointAck: true,
-  });
-  expect(interrupted.exit).toBe(2);
-  expect(interruptedState.size).toBe(1);
-  const recovered = await drive(interruptedState, options);
-  expect(recovered.message.result).toEqual(direct);
-  expect(
-    recovered.methods.filter((method) => method === "review.run"),
-  ).toHaveLength(1);
-  expect(interruptedState).toEqual(directCheckpoints);
-});
-
-test.each([
-  { recordFormat: "future-evidence" },
-  { observations: [first] },
-  { candidates: [second] },
-  { candidates: [{ ...evidenceSecond, severity: { level: "unknown" } }] },
-  { candidateRelationships: [] },
-  {
-    candidateRelationships: [
-      { observationId: evidenceFirst.findingId, candidateIds: ["missing"] },
-    ],
-  },
-  { candidates: [{ ...evidenceFirst, evidence: { changed: true } }] },
-])(
-  "evidence batch validation fails before any source/model/checkpoint callback: %j",
-  async (change) => {
-    const result = await drive(new Map(), {
-      runParams: { ...evidenceParams, ...change },
-      review: evidenceReview,
-    });
-    expect(result.exit).toBe(2);
-    expect(result.methods).toEqual([]);
-  },
-);
-
-test.each(["finding-v1", "evidence-v1"] as const)(
-  "%s reuses prior endpoints absent from nominations without screening unrelated candidates",
-  async (recordFormat) => {
-    const evidence = recordFormat === "evidence-v1";
-    const runParams = evidence ? evidenceParams : params;
-    const review = evidence ? evidenceReview : submission;
-    const fresh = await drive(new Map(), { runParams, review });
-    expect(fresh.exit).toBe(0);
-    const { pairOutcomes } = fresh.message.result as {
-      pairOutcomes: {
-        findingIds: string[];
-        decision: string;
-        bindingDigest: string;
-      }[];
-    };
-    const [observation] = runParams.observations;
-    const [candidate] = runParams.candidates;
-    const unrelated = {
-      ...candidate!,
-      findingId: evidence ? "unrelated-import" : finding(3).findingId,
-    };
-    for (const decision of ["SAME", "DISTINCT"]) {
-      const replay = await drive(new Map(), {
-        runParams: {
-          ...runParams,
-          candidates: [candidate, unrelated],
-          candidateRelationships: [
-            { observationId: observation!.findingId, candidateIds: [] },
-          ],
-          priorDecisions: pairOutcomes.map((outcome) => ({
-            ...outcome,
-            decision,
-          })),
-        },
-        review,
-      });
-      expect(replay.exit).toBe(0);
-      expect(replay.methods).not.toContain("review.run");
-      expect(replay.message.result).toMatchObject({
-        pairOutcomes: [
-          {
-            findingIds: pairOutcomes[0]!.findingIds,
-            decision,
-            origin: "prior",
-            checkpointKeys: [],
-          },
-        ],
-      });
-      const result = replay.message.result as {
-        uniqueFindingIds: string[];
-        duplicateGroups: string[][];
-      };
-      expect(result.uniqueFindingIds).not.toContain(unrelated.findingId);
-      if (decision === "DISTINCT") {
-        expect(result.uniqueFindingIds).toEqual([observation!.findingId]);
-        expect(result.duplicateGroups).toEqual([]);
-      } else {
-        expect(result.uniqueFindingIds).toHaveLength(1);
-        expect(result.duplicateGroups).toHaveLength(1);
-        expect(result.duplicateGroups[0]!.toSorted()).toEqual(
-          [observation!.findingId, candidate!.findingId].toSorted(),
-        );
-      }
-    }
-    const changed = await drive(new Map(), {
-      runParams: {
-        ...runParams,
-        candidates: [
-          {
-            ...candidate,
-            severity: { ...candidate!.severity, level: "critical" },
-          },
-        ],
-        candidateRelationships: [
-          { observationId: observation!.findingId, candidateIds: [] },
-        ],
-        priorDecisions: pairOutcomes,
-      },
-      review,
-    });
-    expect(changed.exit).toBe(2);
-    expect(changed.methods).not.toContain("review.run");
-    expect(changed.message.error?.message).toContain(
-      "current record/source binding",
-    );
-  },
-);

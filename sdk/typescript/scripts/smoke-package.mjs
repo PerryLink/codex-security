@@ -440,9 +440,6 @@ try {
       }       const assert = await import("node:assert/strict");
        const deduped = await sdk.deduplicateRecords({
          observations: [],
-         sourceManifest: { repository: "synthetic" },
-         scopeKey: "package-smoke",
-         verifySource: async () => {},
          candidates: [], candidateRelationships: [],
          reviewRunner: { run: async () => { throw new Error("Unexpected review"); } },
        });
@@ -840,8 +837,10 @@ for (const mode of ["success", "cancel", "blocked-diagnostics"]) {
   }
   const send = message => child.stdin.write(JSON.stringify(message) + "\\n");
   send({jsonrpc:"2.0", id:"run", method:"run", params:{
-    protocolVersion:1, observations:[], candidates:[], candidateRelationships:[],
-    scopeKey:"synthetic-scope", sourceManifest:{}
+    protocolVersion:2,
+    observations:[{findingId:"a",severity:{level:"high"},evidence:{description:"First original"}}],
+    candidates:[{findingId:"b",severity:{level:"medium"},evidence:{description:"Second original"}}],
+    candidateRelationships:[{observationId:"a",candidateIds:["b"]}]
   }});
   try {
     for await (const line of createInterface({input:child.stdout})) {
@@ -854,8 +853,9 @@ for (const mode of ["success", "cancel", "blocked-diagnostics"]) {
         // Exceed the unread stderr pipe buffer with a synthetic host failure.
         send({jsonrpc:"2.0", id:message.id, error:{code:-32001, message:"x".repeat(1024 * 1024)}});
       } else {
-        assert.equal(message.method, "source.verify");
-        send({jsonrpc:"2.0", id:message.id, result:null});
+        assert.equal(message.method, "review.run");
+        assert.equal(message.params.request.stage, "screening");
+        send({jsonrpc:"2.0", id:message.id, result:{decisions:{"pair-1":{decision:"DISTINCT",rationale:"Independent corrections are required."}}}});
       }
     }
     // Keep host stdin open: the isolated attempt must stop its own input socket.
@@ -864,7 +864,7 @@ for (const mode of ["success", "cancel", "blocked-diagnostics"]) {
     assert.ok(response);
     if (mode === "cancel") assert.equal(response.error.code, -32800);
     else if (mode === "blocked-diagnostics") assert.equal(response.error.code, -32000);
-    else assert.deepEqual(response.result.pairOutcomes, []);
+    else assert.deepEqual(response.result, {uniqueFindingIds:["a"],duplicateGroups:[],deduplicationStatus:"completed"});
   } finally {
     clearTimeout(timeout);
     if (child.exitCode === null) child.kill("SIGKILL");

@@ -1,17 +1,12 @@
 import { createInterface } from "node:readline";
 import type { Readable, Writable } from "node:stream";
 import { z } from "zod";
-import type { JsonObject } from "../config.js";
-import type { Finding } from "../models.js";
 import type { EvidenceRecord } from "./record-evidence.js";
 import type { DeduplicationReviewRequest } from "./records.js";
 import { deduplicateRecords } from "./records.js";
 
-const object = z.record(z.string(), z.json());
 const runParams = z.strictObject({
-  protocolVersion: z.literal(1),
-  recordFormat: z.enum(["finding-v1", "evidence-v1"]).optional(),
-  checkpoints: z.boolean().default(false),
+  protocolVersion: z.literal(2),
   observations: z.array(z.unknown()),
   candidates: z.array(z.unknown()),
   candidateRelationships: z.array(
@@ -20,28 +15,12 @@ const runParams = z.strictObject({
       candidateIds: z.array(z.string()),
     }),
   ),
-  scopeKey: z.string(),
-  sourceManifest: object,
-  settingsDigest: z.string().optional(),
   resultToolNamespace: z.string().optional(),
-  sourceTools: z
-    .array(
-      z.strictObject({
-        namespace: z.string(),
-        name: z.string(),
-        description: z.string(),
-        inputSchema: object,
-        version: z.string(),
-      }),
-    )
-    .optional(),
   priorDecisions: z
     .array(
-      // Like the SDK, accept a previous full outcome and retain only its constraint.
-      z.object({
+      z.strictObject({
         findingIds: z.tuple([z.string(), z.string()]),
         decision: z.enum(["SAME", "DISTINCT"]),
-        bindingDigest: z.string(),
       }),
     )
     .optional(),
@@ -172,10 +151,6 @@ export async function runRecordDedupeProtocol(
       }
     });
   }
-  async function acknowledge(method: string, params: unknown): Promise<void> {
-    if ((await call(method, params)) !== null)
-      throw new Error(`${method} requires a null acknowledgement.`);
-  }
   function handle(line: string): void {
     if (finished) return;
     requestId = null;
@@ -218,41 +193,19 @@ export async function runRecordDedupeProtocol(
       throw new Error("Expected one run request.");
     runId = message.id;
     const params = runParams.parse(message.params);
-    const { recordFormat, ...settings } = params;
-    const options = {
-      ...settings,
-      sourceManifest: params.sourceManifest as JsonObject,
+    const execution = deduplicateRecords({
+      observations: params.observations as EvidenceRecord[],
+      candidates: params.candidates as EvidenceRecord[],
+      candidateRelationships: params.candidateRelationships,
+      concurrency: params.concurrency,
+      resultToolNamespace: params.resultToolNamespace,
+      priorDecisions: params.priorDecisions,
       reviewRunner: {
         run: (review: DeduplicationReviewRequest) =>
           call("review.run", { request: review }),
       },
-      verifySource: (manifest: JsonObject) =>
-        acknowledge("source.verify", { manifest }),
-      ...(params.checkpoints
-        ? {
-            checkpointStore: {
-              getReview: (key: string) => call("checkpoint.get", { key }),
-              saveReview: (key: string, binding: object, result: unknown) =>
-                acknowledge("checkpoint.put", { key, binding, result }),
-            },
-          }
-        : {}),
       signal: controller.signal,
-    };
-    const execution =
-      recordFormat === "evidence-v1"
-        ? deduplicateRecords({
-            ...options,
-            recordFormat,
-            observations: params.observations as EvidenceRecord[],
-            candidates: params.candidates as EvidenceRecord[],
-          })
-        : deduplicateRecords({
-            ...options,
-            recordFormat,
-            observations: params.observations as Finding[],
-            candidates: params.candidates as Finding[],
-          });
+    });
     void execution.then(
       (result) => {
         if (finished) return;

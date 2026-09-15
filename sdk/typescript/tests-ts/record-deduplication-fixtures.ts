@@ -4,6 +4,7 @@ import type {
   DeduplicationReviewRequest,
   Finding,
   FindingsDocument,
+  EvidenceRecord,
 } from "../src/index.js";
 import { PLUGIN_ROOT } from "./plugin-root.js";
 
@@ -26,7 +27,18 @@ export function finding(index: number): Finding {
   };
 }
 
-export function assigned(request: DeduplicationReviewRequest): Finding[] {
+export function record(index: number): EvidenceRecord {
+  const original = finding(index);
+  return {
+    findingId: original.findingId,
+    severity: { level: original.severity.level },
+    evidence: JSON.parse(JSON.stringify(original)),
+  };
+}
+
+export function assigned(
+  request: DeduplicationReviewRequest,
+): EvidenceRecord[] {
   return JSON.parse(
     request.prompt.slice(request.prompt.lastIndexOf("\n\n") + 2),
   ).findings;
@@ -57,9 +69,10 @@ export function submission(
         rationale: "The inspected shared control closes both complete paths.",
         canonicalFindingId: findings[0]!.findingId,
         mergedFinding: {
-          ...findings[0],
-          title: findings.map((value) => value.title).join("; "),
-          extensions: { originalFindings: findings },
+          findingId: findings[0]!.findingId,
+          severity: findings[0]!.severity,
+          summary: "The shared control closes both original paths.",
+          originalFindingIds: findings.map((value) => value.findingId),
         },
       }
     : {
