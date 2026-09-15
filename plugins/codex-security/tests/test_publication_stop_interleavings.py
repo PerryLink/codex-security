@@ -56,45 +56,6 @@ def published_bytes(scan):
     }
 
 
-_CRASH_STOPPED_PUBLICATION = """
-import os, runpy, sqlite3, sys
-from argparse import Namespace
-
-api = runpy.run_path(sys.argv[1], run_name="stopped_publication_crash_test")
-scan_id, cause, boundary = sys.argv[3:]
-
-class CrashConnection(sqlite3.Connection):
-    def __exit__(self, *args):
-        sealing = self.execute(
-            "SELECT seal_manifest_digest FROM scans WHERE id = ?", (scan_id,)
-        ).fetchone()[0] is not None
-        if sealing and boundary == "sqlite-before":
-            os._exit(72)
-        result = super().__exit__(*args)
-        if sealing and boundary == "sqlite-after":
-            os._exit(73)
-        return result
-
-connection = sqlite3.connect(sys.argv[2], factory=CrashConnection)
-connection.row_factory = sqlite3.Row
-connection.execute("PRAGMA foreign_keys = ON")
-import finalize_scan_contract as contract
-original_write = contract.write_scan_local_bytes
-def crash_after_write(root, relative, contents, **kwargs):
-    original_write(root, relative, contents, **kwargs)
-    if relative == boundary:
-        os._exit(71)
-contract.write_scan_local_bytes = crash_after_write
-if cause == "cancel":
-    api["cancel_scan"](connection, Namespace(scan_id=scan_id, thread_id=None))
-else:
-    api["fail_scan"](connection, Namespace(
-        scan_id=scan_id, claim_token=None, cost_json=None,
-        message="Scan stopped after reaching the configured cost limit."
-    ))
-raise AssertionError("stop never reached the requested publication boundary")
-"""
-
 _CRASH_SELECTION_RECOVERY = """
 import os, runpy, sqlite3, sys
 from argparse import Namespace
