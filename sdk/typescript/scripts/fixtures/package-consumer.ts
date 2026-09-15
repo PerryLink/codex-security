@@ -112,11 +112,10 @@ export async function dedupeRecords(
   options: DeduplicateRecordsOptions,
 ): Promise<DeduplicateRecordsResult> {
   const result = await deduplicateRecords(options);
-  for (const outcome of result.pairOutcomes) {
-    const decision: "SAME" | "DISTINCT" = outcome.decision;
-    const binding: string = outcome.bindingDigest;
-    void [decision, binding];
-  }
+  const uniqueIds: string[] = result.uniqueFindingIds;
+  const groups: string[][] = result.duplicateGroups;
+  const status: "completed" = result.deduplicationStatus;
+  void [uniqueIds, groups, status];
   return result;
 }
 
