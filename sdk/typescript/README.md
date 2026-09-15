@@ -1052,8 +1052,9 @@ completed results, including partial coverage, and repositories never started.
 For each failed or interrupted repository, it checks the latest attempt:
 
 - A sealed scan is recorded in `results.jsonl` without scanning again.
-- An eligible running Deep Scan resumes its original session, keeping its scan
-  ID, completed workers, artifacts, saved settings, and accumulated cost.
+- An eligible running Deep Scan resumes saved work in its original output
+  directory, keeping its scan ID, completed workers, artifacts, saved settings,
+  and accumulated cost.
 - A failed, canceled, or otherwise unavailable scan starts a new attempt at the
   CSV's pinned revision. Attempt numbers account for both receipts and existing
   directories. Old artifacts and checkouts are preserved; new attempts use
@@ -1465,7 +1466,7 @@ Replacement files resolve from the invocation directory. Custom validation keeps
 | `scans list [REPOSITORY]`                             | List scans. Filter by artifact root with `--scan-root DIR`.                                                 |
 | `scans show [SCAN_ID]`                                | Show a scan; defaults to the latest completed one. `--show-linked-findings` includes earlier finding links. |
 | `scans logs [SCAN_ID]`                                | Show session events; defaults to the latest scan, including active scans.                                   |
-| `scans resume SCAN_ID`                                | Resume an interrupted Deep Scan in its original session and output directory.                               |
+| `scans resume SCAN_ID`                                | Resume saved Deep Scan work in its original output directory.                               |
 | `scans rerun [SCAN_ID]`                               | Repeat a scan on the current checkout; defaults to the latest completed scan.                               |
 | `scans match BEFORE AFTER`                            | Link findings with the same root cause.                                                                     |
 | `scans match --all`                                   | Match completed scans across the repository's worktrees and clones.                                         |
@@ -1483,7 +1484,7 @@ npx @openai/codex-security scans resume SCAN_ID
 ```
 
 The scan must still be `running`, with its original checkout, output directory,
-and owning Codex session available in the same Codex Security state directory.
+and Codex Security state directory available.
 The checkout's identity, revision, and contents must match the saved target.
 Completed, failed, and canceled scans cannot resume; `scans rerun` starts a new scan.
 
@@ -1496,7 +1497,6 @@ Older records that did not save these values cannot reconstruct them. Bulk
 recovery still requires matching campaign inputs and options; it uses the supplied
 post-scan prompt when the scan has no saved prompt.
 It keeps the scan ID, completed workers, artifacts, and accumulated session cost.
-The existing coordinator recovers interrupted workers after its lease expires.
 If discovery finished before the interruption, resume completes and seals the
 same scan. No archiving or new attempt directory is needed. A failed connection
 leaves the existing scan available for another resume attempt.
