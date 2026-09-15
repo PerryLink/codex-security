@@ -3093,6 +3093,7 @@ async function testResumedManifestPreservesCompletedReducer(includeUnstartedRedu
       }))
     ))
   };
+  await rm(store.workers.get(store.dedupClaims[0].id).promptPath);
   const replacement = new DeepScanCoordinator({
     run: store.run,
     store,
@@ -3103,7 +3104,7 @@ async function testResumedManifestPreservesCompletedReducer(includeUnstartedRedu
   replacement.start();
 
   const terminal = await replacement.wait(undefined, 5_000);
-  assert.equal(terminal?.status, "succeeded");
+  assert.equal(terminal?.status, "succeeded", terminal?.error);
   const manifest = JSON.parse(await readFile(terminal.manifestPath, "utf8"));
   assert.equal(manifest.scan.scanId, fixture.run.scanId);
   assert.equal(store.dedupCommits.length, 1);
