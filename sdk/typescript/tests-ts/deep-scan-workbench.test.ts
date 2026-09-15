@@ -643,6 +643,14 @@ describe("deep scan workbench ownership", () => {
       ]);
       const scanId = registration["scanId"] as string;
       const targetId = registration["targetId"] as string;
+      const snapshotDigest = (
+        registration["contract"] as {
+          target: { requiredSnapshotDigest: string };
+        }
+      ).target.requiredSnapshotDigest;
+      expect(snapshotDigest).toMatch(
+        /^codex-security-snapshot\/v1:sha256:[0-9a-f]{64}$/,
+      );
       command([
         "begin-deep-scan",
         "--scan-id",
@@ -754,6 +762,7 @@ describe("deep scan workbench ownership", () => {
                   kind: "directory_snapshot",
                   targetId,
                   displayName: "repository",
+                  snapshotDigest,
                 },
                 scope: { limitations: [], validationMode: "incomplete" },
               },
@@ -813,6 +822,10 @@ describe("deep scan workbench ownership", () => {
       };
       expect(scan.progress.status).toBe("complete");
       expect(scan.warnings).toContain(warning);
+      const manifest = JSON.parse(
+        await readFile(join(scanDir, "scan-manifest.json"), "utf8"),
+      ) as { scan: { target: { snapshotDigest: string } } };
+      expect(manifest.scan.target.snapshotDigest).toBe(snapshotDigest);
       const findings = JSON.parse(
         await readFile(join(scanDir, "findings.json"), "utf8"),
       ) as { findings: unknown[] };
