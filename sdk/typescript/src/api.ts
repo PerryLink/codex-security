@@ -251,6 +251,7 @@ interface PreparedRuntime {
 type ScanPermissions = { filesystem: JsonObject; network: JsonObject };
 
 interface PreparedSession {
+  preserveProviderEnvironment?: boolean;
   inheritedPermissions?: ScanPermissions;
   safetyIdentifier?: string;
   runtime: PreparedRuntime;
@@ -282,6 +283,8 @@ export interface ScanOptions extends ScanSettings {
   };
   /** @internal Preserve native permissions when a saved scan changes hosts. */
   inheritedPermissions?: ScanPermissions;
+  /** @internal Keep the configured native provider's authentication environment. */
+  preserveProviderEnvironment?: boolean;
   /** @internal A complete ordinary pass owned by a Deep Scan. */
   deepScanPass?: boolean;
   /** @internal Persist composition membership after normal registration. */
@@ -1616,8 +1619,24 @@ export class CodexSecurity {
         deepScan: deepScanConfiguration?.settings,
         auth: options.auth,
       });
+      if (
+        session.inheritedPermissions !== undefined ||
+        session.preserveProviderEnvironment
+      ) {
+        const nativeConfig = sharedCredentialCodexConfig(
+          effectiveConfig,
+          runtimeHome,
+        );
+        const savedConfig = recipe["config"] as JsonObject;
+        for (const key of ["model_providers", ...CODEX_AUTH_CONFIG_KEYS]) {
+          if (nativeConfig[key] !== undefined)
+            savedConfig[key] = nativeConfig[key]!;
+        }
+      }
       if (session.inheritedPermissions !== undefined)
         recipe["inheritedPermissions"] = session.inheritedPermissions;
+      if (session.preserveProviderEnvironment)
+        recipe["preserveProviderEnvironment"] = true;
       if (options.scanPrompt?.trim()) recipe["requiresScanPrompt"] = true;
       if (options.safetyIdentifier !== undefined)
         recipe["safetyIdentifier"] = options.safetyIdentifier;
@@ -2255,6 +2274,8 @@ export class CodexSecurity {
                   target: options.target,
                   auth: options.auth,
                   inheritedPermissions: session.inheritedPermissions,
+                  preserveProviderEnvironment:
+                    session.preserveProviderEnvironment,
                   knowledgeBasePaths: knowledgeBase?.sources,
                   scanPrompt: effectiveScanPrompt,
                   safetyIdentifier: options.safetyIdentifier,
@@ -2610,9 +2631,20 @@ export class CodexSecurity {
                   },
                 ),
               environment,
+              config:
+                mode === "deep"
+                  ? {
+                      ...this.config,
+                      codexOverrides: scanCompositionOverrides(
+                        effectiveConfig,
+                        deepScanConfiguration!.settings.subagents,
+                      ),
+                    }
+                  : undefined,
               model,
               signal,
               inheritedPermissions: session.inheritedPermissions,
+              preserveProviderEnvironment: session.preserveProviderEnvironment,
             });
             result.repositoryFindings = (await listRepositoryFindings(
               runWorkbench,
@@ -3036,13 +3068,15 @@ export class CodexSecurity {
       ...pluginExecutionEnvironment(
         python,
         withoutCodexHome(
-          selectedScanEnvironment(
-            commandAuth
-              ? withoutOpenAiApiKeys(runtime.environment)
-              : runtime.environment,
-            auth,
-            modelProvider,
-          ),
+          session.preserveProviderEnvironment
+            ? runtime.environment
+            : selectedScanEnvironment(
+                commandAuth
+                  ? withoutOpenAiApiKeys(runtime.environment)
+                  : runtime.environment,
+                auth,
+                modelProvider,
+              ),
         ),
       ),
       ...(externalProvider === null
@@ -3081,7 +3115,11 @@ export class CodexSecurity {
       undefined
         ? undefined
         : this.#codexCommand().command;
-    let sdkEnvironment = definedEnvironment(withoutOpenAiApiKeys(environment));
+    let sdkEnvironment = definedEnvironment(
+      session.preserveProviderEnvironment
+        ? environment
+        : withoutOpenAiApiKeys(environment),
+    );
     if (process.platform === "win32" && codexPathOverride === undefined) {
       codexPathOverride = environment["CODEX_CLI_PATH"]!;
       sdkEnvironment = bundledCodexSdkEnvironment(
@@ -3130,6 +3168,7 @@ export class CodexSecurity {
       | "safetyIdentifier"
       | "expectedPluginVersion"
       | "inheritedPermissions"
+      | "preserveProviderEnvironment"
       | "onAuthentication"
       | "onWarning"
       | "onObserverError"
@@ -3151,7 +3190,9 @@ export class CodexSecurity {
       const commandAuth = hasCommandAuth(requestedConfig);
       const modelProvider = scanModelProvider(requestedConfig);
       const externalProvider =
-        !commandAuth && isExternalModelProvider(modelProvider)
+        !options.preserveProviderEnvironment &&
+        !commandAuth &&
+        isExternalModelProvider(modelProvider)
           ? EXTERNAL_CODEX_PROVIDERS[modelProvider]
           : null;
       let authentication = scanAuthentication(
@@ -3161,6 +3202,7 @@ export class CodexSecurity {
         commandAuth,
       );
       const apiKey =
+        !options.preserveProviderEnvironment &&
         authentication.method === "api_key"
           ? environmentApiKey(this.#dependencies.environment, modelProvider)
           : null;
@@ -3169,13 +3211,15 @@ export class CodexSecurity {
           `Set ${externalProvider.env_key} to run a scan through ${externalProvider.name}.`,
         );
       }
-      const scanEnvironment = selectedScanEnvironment(
-        commandAuth
-          ? withoutOpenAiApiKeys(this.#dependencies.environment)
-          : this.#dependencies.environment,
-        options.auth,
-        modelProvider,
-      );
+      const scanEnvironment = options.preserveProviderEnvironment
+        ? this.#dependencies.environment
+        : selectedScanEnvironment(
+            commandAuth
+              ? withoutOpenAiApiKeys(this.#dependencies.environment)
+              : this.#dependencies.environment,
+            options.auth,
+            modelProvider,
+          );
       if (this.#dependencies.prepareRuntime === undefined) {
         const credentialHome = await prepareCodexSecurityCredentialHome(
           scanEnvironment,
@@ -3190,11 +3234,11 @@ export class CodexSecurity {
       const previousRuntime = this.#runtime;
       const runtime = await this.#ensureRuntime(
         signal,
+        scanEnvironment,
+        requestedConfig,
         temporaryRoot,
         (path) =>
           requireOutputOutsideRepositories(protectedRoots, path, "runtime"),
-        options.auth,
-        requestedConfig,
       );
       if (
         runtime === previousRuntime &&
@@ -3232,6 +3276,7 @@ export class CodexSecurity {
       }
       checkOpen();
       if (
+        !options.preserveProviderEnvironment &&
         authentication.method === "stored_credentials" &&
         this.#runtimeCredentialSource === "api_key"
       ) {
@@ -3254,6 +3299,7 @@ export class CodexSecurity {
         this.#runtimeCredentialSource = "api_key";
       }
       if (
+        !options.preserveProviderEnvironment &&
         !runtime.credentialsAvailable &&
         authentication.method === "stored_credentials"
       ) {
@@ -3268,6 +3314,7 @@ export class CodexSecurity {
           : null;
       }
       if (
+        !options.preserveProviderEnvironment &&
         !runtime.credentialsAvailable &&
         apiKey === null &&
         !commandAuth &&
@@ -3317,6 +3364,7 @@ export class CodexSecurity {
         preflightConfig,
         sessionConfig,
         inheritedPermissions,
+        preserveProviderEnvironment: options.preserveProviderEnvironment,
         modelProvider,
         externalProvider,
         apiKey,
@@ -3337,21 +3385,21 @@ export class CodexSecurity {
   }
 
   async #ensureRuntime(
-    signal?: AbortSignal,
+    signal: AbortSignal,
+    scanEnvironment: ProcessEnvironment,
+    requestedConfig: JsonObject,
     temporaryRoot?: string,
     validateLocation?: (path: string) => void,
-    auth: ScanAuthMode = "auto",
-    requestedConfig?: JsonObject,
   ): Promise<PreparedRuntime> {
     this.#requireOpen();
     if (this.#runtime !== null) return this.#runtime;
     if (this.#runtimePromise === null) {
       const runtimePromise = this.#prepareRuntime(
-        signal ?? this.#abortController.signal,
+        signal,
+        scanEnvironment,
+        requestedConfig,
         temporaryRoot,
         validateLocation,
-        auth,
-        requestedConfig,
       );
       this.#runtimePromise = runtimePromise;
       void runtimePromise.catch(() => {
@@ -3824,25 +3872,15 @@ export class CodexSecurity {
 
   async #prepareRuntime(
     signal: AbortSignal,
+    processEnvironment: ProcessEnvironment,
+    requestedConfig: JsonObject,
     temporaryRoot?: string,
     validateLocation?: (path: string) => void,
-    auth: ScanAuthMode = "auto",
-    requestedConfig?: JsonObject,
   ): Promise<PreparedRuntime> {
     if (this.#dependencies.prepareRuntime !== undefined) {
       return await this.#dependencies.prepareRuntime(this.config, signal);
     }
-    const modelProvider =
-      requestedConfig === undefined
-        ? undefined
-        : scanModelProvider(requestedConfig);
-    const processEnvironment = selectedScanEnvironment(
-      requestedConfig !== undefined && hasCommandAuth(requestedConfig)
-        ? withoutOpenAiApiKeys(this.#dependencies.environment)
-        : this.#dependencies.environment,
-      auth,
-      modelProvider,
-    );
+    const modelProvider = scanModelProvider(requestedConfig);
     const codexHome =
       validateLocation === undefined
         ? await prepareCodexSecurityCredentialHome(processEnvironment)
@@ -3865,8 +3903,7 @@ export class CodexSecurity {
         "CODEX_HOME",
       );
       const ambientHome = configuredAmbientHome ?? nodeAmbientHome;
-      const mergedConfig =
-        requestedConfig ?? (await mergedCodexConfig(this.config));
+      const mergedConfig = requestedConfig;
       const codexConfig = await preserveCodexSecurityPluginRegistration(
         codexHome,
         sharedCredentialCodexConfig(mergedConfig, codexHome),

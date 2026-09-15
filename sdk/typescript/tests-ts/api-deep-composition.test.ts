@@ -23,12 +23,18 @@ afterEach(async () => {
 });
 
 test.each([
-  { workers: 1, budget: false },
-  { workers: 2, budget: false },
-  { workers: 1, budget: true },
-])(
+  { workers: 1, budget: false, provider: undefined },
+  { workers: 2, budget: false, provider: undefined },
+  { workers: 1, budget: true, provider: undefined },
+  { workers: 1, budget: false, provider: { env_key: "OPENAI_API_KEY" } },
+  {
+    workers: 1,
+    budget: false,
+    provider: { auth: { type: "command", command: "synthetic-auth-provider" } },
+  },
+] as { workers: number; budget: boolean; provider?: JsonObject }[])(
   "Deep composes sealed ordinary scans and preserves a budgeted parent: %j",
-  async ({ workers, budget }) => {
+  async ({ workers, budget, provider }) => {
     const root = await mkdtemp(join(tmpdir(), "ordinary-composition-"));
     roots.push(root);
     const repo = join(root, "repo");
@@ -47,6 +53,12 @@ test.each([
       CODEX_SECURITY_STATE_DIR: join(root, "state"),
       CODEX_CLI_PATH: process.execPath,
       SYNTHETIC_SCAN_SETTING: "inherited",
+      ...(provider === undefined
+        ? {}
+        : {
+            OPENAI_API_KEY: "synthetic-provider-key",
+            CODEX_API_KEY: "synthetic-native-key",
+          }),
     };
     const registrations = new Map<string, JsonObject>();
     let childTurns = 0;
@@ -68,6 +80,13 @@ test.each([
         codexOverrides: {
           model: "gpt-6-astra",
           model_reasoning_effort: "ultra",
+          ...(provider === undefined
+            ? {}
+            : {
+                model_provider: "custom",
+                cli_auth_credentials_store: "file",
+                model_providers: { custom: provider },
+              }),
         },
       },
       {
@@ -102,12 +121,20 @@ test.each([
             registrations.set(scanId, {
               ...result,
               mode: JSON.parse(input!).recipe.mode,
+              recipe: JSON.parse(input!).recipe,
             });
             workbenches.set(scanId, options);
           }
           return result;
         },
         createCodex: (options) => {
+          if (provider !== undefined) {
+            expect(options.apiKey).toBeUndefined();
+            expect(options.env?.["OPENAI_API_KEY"]).toBe(
+              "synthetic-provider-key",
+            );
+            expect(options.env?.["CODEX_API_KEY"]).toBe("synthetic-native-key");
+          }
           const env = options.env!;
           const id = env["CODEX_SECURITY_SCAN_ID"]!;
           return {
@@ -214,6 +241,7 @@ test.each([
     try {
       const result = await client.run(repo, {
         mode: "deep",
+        preserveProviderEnvironment: provider !== undefined,
         workers,
         subagents: 3,
         stopAfterNoNew: 2,
@@ -238,6 +266,20 @@ test.each([
       expect(checkpoint.passes).toHaveLength(2);
       expect(checkpoint.mergedScanIds).toHaveLength(budget ? 1 : 2);
       expect(registrations.size).toBe(3);
+      if (provider !== undefined) {
+        for (const registration of registrations.values()) {
+          const saved = registration["recipe"] as JsonObject;
+          expect(saved["preserveProviderEnvironment"]).toBe(true);
+          expect(
+            (saved["config"] as JsonObject)["model_providers"],
+          ).toMatchObject({ custom: provider });
+          expect(
+            (saved["config"] as JsonObject)["cli_auth_credentials_store"],
+          ).toBe("file");
+        }
+        expect(environment.OPENAI_API_KEY).toBe("synthetic-provider-key");
+        expect(environment.CODEX_API_KEY).toBe("synthetic-native-key");
+      }
       for (const turn of turns) {
         const permission = turn.overrides?.find((value) =>
           value.startsWith("permissions.codex_security_scan="),

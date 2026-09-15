@@ -1083,13 +1083,7 @@ async function startClient(bundle, environment) {
   });
   const transport = new StdioClientTransport({
     command: process.execPath,
-    args: [
-      bundle,
-      ...(environment.CODEX_SECURITY_ARTIFACT_LAYOUT
-        ? ["--artifact-writer"]
-        : []),
-      "--stdio"
-    ],
+    args: [bundle, "--stdio"],
     cwd: applicationRoot,
     env: {
       ...process.env,

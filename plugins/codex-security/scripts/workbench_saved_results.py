@@ -1325,7 +1325,9 @@ def _stopped_child_draft(db: Any, child: Any, scan_dir: Path) -> dict[str, Any] 
         # No semantic merge has accepted these independent observations yet.
         identity = finding["identity"]
         identity["instance"] = f"{child['id']}-{identity.get('instance', 'saved')}"
-        finding.setdefault("provenance", {}).update(
+        provenance = finding.setdefault("provenance", {})
+        provenance.pop("preservedIdentity", None)
+        provenance.update(
             sourceFindingIds=[source_id],
             sourceFindings=[{"id": source_id, "finding": original}],
         )
@@ -1371,7 +1373,7 @@ def _stopped_child_draft(db: Any, child: Any, scan_dir: Path) -> dict[str, Any] 
 
 
 def save_composed_checkpoint(db: Any, connection: Any, scan: Any, scan_dir: Path) -> None:
-    """Retain accepted progress, or ordinary child observations before the first merge."""
+    """Retain accepted progress and unmerged ordinary child observations."""
     checkpoint = read_composition_checkpoint(scan)
     if checkpoint is None:
         return
@@ -1379,16 +1381,31 @@ def save_composed_checkpoint(db: Any, connection: Any, scan: Any, scan_dir: Path
     aggregate = copy.deepcopy(checkpoint["aggregate"])
     if not isinstance(aggregate, dict):
         aggregate = {"findings": [], "coverage": {}}
-        for child in children.values():
-            try:
-                draft = _stopped_child_draft(db, child, scan_dir)
-            except (ContractError, OSError, SystemExit, ValueError):
-                continue
-            if draft is None:
-                continue
-            aggregate["findings"].extend(draft["findings"])
-            for field in ("surfaces", "explicitExclusions", "deferred", "openQuestions"):
-                aggregate["coverage"].setdefault(field, []).extend(draft["coverage"].get(field, []))
+    represented = set()
+    for finding in aggregate["findings"]:
+        for retained in _retained_findings(finding):
+            provenance = retained.get("provenance", {})
+            represented.update(provenance.get("sourceFindingIds", []))
+            represented.update(source["id"] for source in provenance.get("sourceFindings", []))
+    for child in children.values():
+        if child["id"] in checkpoint["mergedScanIds"]:
+            continue
+        try:
+            draft = _stopped_child_draft(db, child, scan_dir)
+        except (ContractError, OSError, SystemExit, ValueError):
+            continue
+        if draft is None:
+            continue
+        aggregate["findings"].extend(
+            finding
+            for finding in draft["findings"]
+            if not represented.intersection(finding["provenance"]["sourceFindingIds"])
+        )
+        for field in ("surfaces", "explicitExclusions", "deferred", "openQuestions"):
+            rows = aggregate.setdefault("coverage", {}).setdefault(field, [])
+            for row in draft["coverage"].get(field, []):
+                if row not in rows:
+                    rows.append(row)
     aggregate["scanId"] = scan["id"]
     aggregate["complete"] = False
     coverage = aggregate.setdefault("coverage", {})

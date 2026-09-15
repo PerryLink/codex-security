@@ -159,10 +159,21 @@ test(
         executable,
         `#!${process.execPath}
 const fs = require("node:fs");
+if (process.argv.includes("login")) {
+  fs.writeFileSync(${JSON.stringify(join(root, "login.json"))}, JSON.stringify({
+    codex: process.env.CODEX_API_KEY,
+    openai: process.env.OPENAI_API_KEY,
+    argv: process.argv.slice(2),
+  }));
+  const authenticated = fs.existsSync(${JSON.stringify(join(root, "account-present"))});
+  console.error(authenticated ? "Logged in using ChatGPT" : "Not logged in");
+  process.exit(authenticated ? 0 : 1);
+}
 fs.writeFileSync(process.env.NATIVE_AUTH_CAPTURE, JSON.stringify({
   codex: process.env.CODEX_API_KEY,
   openai: process.env.OPENAI_API_KEY,
   executable: process.execPath,
+  argv: process.argv.slice(2),
 }));
 console.log(JSON.stringify({ type: "thread.started", thread_id: "synthetic-auth-thread" }));
 console.log(JSON.stringify({ type: "turn.completed", usage: { input_tokens: 0, cached_input_tokens: 0, output_tokens: 0 } }));
@@ -177,28 +188,178 @@ console.log(JSON.stringify({ type: "turn.completed", usage: { input_tokens: 0, c
       });
       delete process.env.CODEX_SECURITY_CONFIG_PATH;
       delete process.env.CODEX_SECURITY_DEEP_SCAN_CONFIG_PATH;
+      for (const [provider, modelProvider] of [
+        [undefined, undefined],
+        [{ env_key: "OPENAI_API_KEY" }, "custom"],
+        [
+          { auth: { type: "command", command: "synthetic-auth-provider" } },
+          "custom",
+        ],
+        [{ requires_openai_auth: true }, "custom"],
+        [{ env_key: "OPENAI_API_KEY" }, undefined],
+        [
+          { auth: { type: "command", command: "synthetic-auth-provider" } },
+          undefined,
+        ],
+      ]) {
+        const selected = provider !== undefined;
+        const providerName = modelProvider ?? "openai";
+        const configured = selected && provider.requires_openai_auth !== true;
+        const config = {
+          model: "saved-model",
+          model_reasoning_effort: "ultra",
+          ...(selected
+            ? {
+                ...(modelProvider === undefined
+                  ? {}
+                  : { model_provider: modelProvider }),
+                model_providers: { [providerName]: provider },
+              }
+            : {}),
+        };
+        await writeFile(
+          join(root, "config.toml"),
+          selected
+            ? (modelProvider === undefined
+                ? ""
+                : `model_provider = "${modelProvider}"\n`) +
+                `[model_providers.${providerName}]\n` +
+                (provider.auth
+                  ? `[model_providers.${providerName}.auth]\ntype = "command"\ncommand = "synthetic-auth-provider"\n`
+                  : provider.requires_openai_auth
+                    ? "requires_openai_auth = true\n"
+                    : 'env_key = "OPENAI_API_KEY"\n')
+            : "",
+        );
+        for (const recipe of [undefined, { auth: "api-key", config }]) {
+          const prepared = await prepareNativeScan({
+            ...input(),
+            recipe,
+            model: "current-model",
+            reasoningEffort: "low",
+          });
+          assert.equal(
+            prepared.options.preserveProviderEnvironment,
+            configured ? true : undefined,
+          );
+          assert.equal(
+            prepared.client.config.codexOverrides.model_provider,
+            selected ? providerName : undefined,
+          );
+          const sdk = prepared.client.dependencies.createCodex({
+            codexPathOverride: executable,
+            config: prepared.client.config.codexOverrides,
+            env: {
+              ...prepared.client.dependencies.environment,
+              NATIVE_AUTH_CAPTURE: capture,
+            },
+          });
+          await sdk
+            .startThread({ workingDirectory: root, skipGitRepoCheck: true })
+            .run("Synthetic credential launch only.");
+          const observed = JSON.parse(await readFile(capture, "utf8"));
+          assert.equal(observed.codex, "synthetic-native-selected");
+          assert.equal(
+            observed.openai,
+            configured ? "synthetic-competing-key" : undefined,
+          );
+          assert.ok(
+            observed.argv.includes(
+              `model=${JSON.stringify(recipe ? "saved-model" : "current-model")}`,
+            ),
+          );
+          assert.ok(
+            observed.argv.includes(
+              `model_reasoning_effort=${JSON.stringify(recipe ? "ultra" : "low")}`,
+            ),
+          );
+          assert.equal(observed.executable, process.execPath);
+          assert.equal(process.env.CODEX_API_KEY, "synthetic-native-selected");
+          assert.equal(process.env.OPENAI_API_KEY, "synthetic-competing-key");
+        }
+      }
+      const accountConfig = {
+        cli_auth_credentials_store: "file",
+        forced_chatgpt_workspace_id: "synthetic-workspace",
+      };
+      await writeFile(
+        join(root, "config.toml"),
+        'cli_auth_credentials_store = "file"\nforced_chatgpt_workspace_id = "synthetic-workspace"\n',
+      );
+      delete process.env.CODEX_API_KEY;
+      for (const authenticated of [true, false]) {
+        if (authenticated)
+          await writeFile(join(root, "account-present"), "synthetic");
+        else await rm(join(root, "account-present"));
+        for (const recipe of [
+          undefined,
+          { auth: "auto", config: accountConfig },
+        ]) {
+          const prepared = await prepareNativeScan({ ...input(), recipe });
+          const login = JSON.parse(
+            await readFile(join(root, "login.json"), "utf8"),
+          );
+          assert.equal(login.codex, undefined);
+          assert.equal(login.openai, undefined);
+          assert.ok(login.argv.includes('cli_auth_credentials_store="file"'));
+          assert.ok(
+            login.argv.includes(
+              'forced_chatgpt_workspace_id="synthetic-workspace"',
+            ),
+          );
+          assert.equal(
+            prepared.options.auth,
+            authenticated ? "chatgpt" : recipe?.auth,
+          );
+          assert.equal(
+            prepared.client.dependencies.environment.OPENAI_API_KEY,
+            authenticated ? undefined : "synthetic-competing-key",
+          );
+          assert.equal(process.env.OPENAI_API_KEY, "synthetic-competing-key");
+        }
+      }
+      await writeFile(join(root, "account-present"), "synthetic");
+      await writeFile(
+        join(root, "config.toml"),
+        'model_provider = "custom"\n[model_providers.custom]\nrequires_openai_auth = true\n',
+      );
       for (const recipe of [
         undefined,
-        { auth: "api-key", config: { model_provider: "openai" } },
-      ]) {
-        const prepared = await prepareNativeScan({ ...input(), recipe });
-        const sdk = prepared.client.dependencies.createCodex({
-          codexPathOverride: executable,
-          env: {
-            ...prepared.client.dependencies.environment,
-            NATIVE_AUTH_CAPTURE: capture,
+        {
+          auth: "auto",
+          config: {
+            model_provider: "custom",
+            model_providers: { custom: { requires_openai_auth: true } },
           },
-        });
-        await sdk
-          .startThread({ workingDirectory: root, skipGitRepoCheck: true })
-          .run("Synthetic credential launch only.");
-        const observed = JSON.parse(await readFile(capture, "utf8"));
-        assert.equal(observed.codex, "synthetic-native-selected");
-        assert.equal(observed.openai, undefined);
-        assert.equal(observed.executable, process.execPath);
-        assert.equal(process.env.CODEX_API_KEY, "synthetic-native-selected");
+        },
+      ]) {
+        await rm(join(root, "login.json"));
+        const prepared = await prepareNativeScan({ ...input(), recipe });
+        assert.equal(prepared.options.preserveProviderEnvironment, undefined);
+        assert.equal(prepared.options.auth, "chatgpt");
+        assert.equal(
+          prepared.client.dependencies.environment.OPENAI_API_KEY,
+          undefined,
+        );
+        const login = JSON.parse(
+          await readFile(join(root, "login.json"), "utf8"),
+        );
+        assert.equal(login.openai, undefined);
         assert.equal(process.env.OPENAI_API_KEY, "synthetic-competing-key");
       }
+      await rm(join(root, "login.json"));
+      const forced = await prepareNativeScan({
+        ...input(),
+        recipe: { auth: "auto", config: { forced_login_method: "chatgpt" } },
+      });
+      assert.equal(forced.options.auth, "chatgpt");
+      assert.equal(
+        forced.client.dependencies.environment.OPENAI_API_KEY,
+        undefined,
+      );
+      await assert.rejects(readFile(join(root, "login.json")), {
+        code: "ENOENT",
+      });
     } finally {
       for (const key of keys) {
         if (before[key] === undefined) delete process.env[key];
@@ -281,7 +442,10 @@ test("native saved scans retain settings, auth environment, permissions and iden
       client.dependencies.environment.CODEX_API_KEY,
       "synthetic-key",
     );
-    assert.equal(client.dependencies.environment.OPENAI_API_KEY, undefined);
+    assert.equal(
+      client.dependencies.environment.OPENAI_API_KEY,
+      "synthetic-other-key",
+    );
     assert.equal(process.env.OPENAI_API_KEY, "synthetic-other-key");
     assert.equal(process.env.CODEX_API_KEY, "synthetic-key");
     for (const [auth, modelProvider] of [
@@ -299,11 +463,11 @@ test("native saved scans retain settings, auth environment, permissions and iden
       });
       assert.equal(
         selected.client.dependencies.environment.OPENAI_API_KEY,
-        undefined,
+        modelProvider === "openrouter" ? "synthetic-other-key" : undefined,
       );
       assert.equal(
         selected.client.dependencies.environment.CODEX_API_KEY,
-        auth === "auto" ? "synthetic-key" : undefined,
+        auth === "chatgpt" ? undefined : "synthetic-key",
       );
       assert.equal(
         selected.client.dependencies.environment.OPENROUTER_API_KEY,

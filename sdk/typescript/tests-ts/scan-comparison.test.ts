@@ -21,6 +21,7 @@ import {
 } from "@openai/codex-sdk";
 import { afterEach, describe, expect, spyOn, test } from "bun:test";
 import { resolveCodexCommand, runCodexCommand } from "../src/runtime.js";
+import type { JsonObject } from "../src/config.js";
 import {
   comparisonForScan,
   comparisonEnvironment,
@@ -164,6 +165,19 @@ process.exit(0);
             },
             workingDirectory: home,
             inheritedPermissions: constraints,
+            config:
+              constraints === undefined
+                ? undefined
+                : {
+                    codexOverrides: {
+                      permissions: { native: constraints },
+                      projects: {
+                        [join(home, "literal.[private]")]: {
+                          trust_level: "untrusted",
+                        },
+                      },
+                    },
+                  },
           },
         );
       }
@@ -193,6 +207,12 @@ process.exit(0);
       expect(overrides).toContain("features.shell_tool=false");
       expect(overrides).toContain("features.plugins=false");
       expect(constrained).not.toContain("--sandbox");
+      expect(
+        overrides.some((value) => value.startsWith("permissions.native")),
+      ).toBe(false);
+      expect(overrides.some((value) => value.startsWith("projects."))).toBe(
+        false,
+      );
       expect(ordinary![ordinary!.indexOf("--sandbox") + 1]).toBe("read-only");
       expect(
         ordinary!.some((value) => value.includes("codex_security_comparison")),
@@ -201,6 +221,126 @@ process.exit(0);
       startThread.mockRestore();
     }
   });
+
+  test.each([
+    { env_key: "OPENAI_API_KEY" },
+    { auth: { type: "command", command: "synthetic-auth-provider" } },
+  ] as JsonObject[])(
+    "preserves the native provider environment at the matcher process boundary: %j",
+    async (provider) => {
+      const home = await mkdtemp(
+        join(tmpdir(), "codex-security-matcher-provider-"),
+      );
+      temporaryDirectories.push(home);
+      await writeFile(
+        join(home, "config.toml"),
+        'model_provider="openai"\nmodel="ambient-model"\nmodel_reasoning_effort="low"\n',
+      );
+      const captures = join(home, "launches.jsonl");
+      const preload = join(home, "capture.mjs");
+      await writeFile(
+        preload,
+        `
+import { appendFileSync } from "node:fs";
+appendFileSync(${JSON.stringify(captures)}, JSON.stringify({
+  openai: process.env.OPENAI_API_KEY ?? null,
+  codex: process.env.CODEX_API_KEY ?? null,
+  argv: process.argv.slice(1),
+}) + "\\n");
+await new Promise((resolve) => { process.stdin.resume(); process.stdin.on("end", resolve); });
+console.log(JSON.stringify({ type: "thread.started", thread_id: "synthetic-comparison" }));
+console.log(JSON.stringify({ type: "item.completed", item: {
+  id: "answer", type: "agent_message", text: '{"matches":[],"uncertain":[]}'
+} }));
+console.log(JSON.stringify({ type: "turn.completed", usage: {
+  input_tokens: 1, cached_input_tokens: 0, output_tokens: 1
+} }));
+process.exit(0);
+`,
+      );
+      const nodeExecutable = execFileSync("node", ["-p", "process.execPath"], {
+        encoding: "utf8",
+      }).trim();
+      const environment = {
+        PATH: process.env["PATH"],
+        SystemRoot: process.env["SystemRoot"],
+        TEMP: process.env["TEMP"],
+        TMP: process.env["TMP"],
+        CODEX_HOME: home,
+        CODEX_SECURITY_SCAN_ID: "synthetic-parent",
+        OPENAI_API_KEY: "synthetic-provider-key",
+        CODEX_API_KEY: "synthetic-native-key",
+      };
+      const originalStartThread = Codex.prototype.startThread;
+      const startThread = spyOn(
+        Codex.prototype,
+        "startThread",
+      ).mockImplementation(function (this: Codex, options) {
+        const original = (this as unknown as { options: CodexOptions }).options;
+        return originalStartThread.call(
+          new Codex({
+            ...original,
+            codexPathOverride: nodeExecutable,
+            env: {
+              ...original.env,
+              NODE_OPTIONS: `--import=${JSON.stringify(pathToFileURL(preload).href)}`,
+            },
+          }),
+          options,
+        );
+      });
+      try {
+        for (const preserveProviderEnvironment of [true, false]) {
+          await matchScanFindings(
+            { before: [finding("before")], after: [finding("after")] },
+            {
+              environment,
+              config: {
+                codexOverrides: {
+                  model: "synthetic-native-model",
+                  model_reasoning_effort: "ultra",
+                  model_provider: "custom",
+                  model_providers: { custom: provider },
+                },
+              },
+              workingDirectory: home,
+              preserveProviderEnvironment,
+            },
+          );
+        }
+        const [native, ordinary] = (await readFile(captures, "utf8"))
+          .trim()
+          .split("\n")
+          .map((line) => JSON.parse(line));
+        expect(native.openai).toBe("synthetic-provider-key");
+        expect(native.codex).toBe("synthetic-native-key");
+        expect(native.argv).toContain('model_provider="custom"');
+        expect(native.argv).toContain('model="synthetic-native-model"');
+        expect(native.argv).toContain('model_reasoning_effort="ultra"');
+        if ("auth" in provider) {
+          expect(ordinary.openai).toBeNull();
+          expect(ordinary.codex).toBeNull();
+          const override = native.argv.find((value: string) =>
+            value.startsWith("model_providers="),
+          );
+          expect(parse(override)).toEqual({
+            model_providers: {
+              custom: {
+                auth: { ...(provider["auth"] as JsonObject), cwd: home },
+              },
+            },
+          });
+        } else {
+          expect(ordinary.openai).toBe("synthetic-provider-key");
+          expect(ordinary.codex).toBe("synthetic-provider-key");
+        }
+        expect(environment.OPENAI_API_KEY).toBe("synthetic-provider-key");
+        expect(environment.CODEX_API_KEY).toBe("synthetic-native-key");
+      } finally {
+        startThread.mockRestore();
+      }
+    },
+  );
 
   test.each([
     [
@@ -911,6 +1051,13 @@ process.exit(0);
       matchCompletedScan({
         scanId: "current",
         repository: "/repository",
+        preserveProviderEnvironment: true,
+        config: {
+          codexOverrides: {
+            model_reasoning_effort: "ultra",
+            model_provider: "synthetic",
+          },
+        },
         previousFindings: [open],
         falsePositives: [{ findingId: "dismissed", sourceScanId: "prior" }],
         findings: [after],
@@ -947,6 +1094,13 @@ process.exit(0);
         async matchFindings(value, options) {
           input = value;
           expect(options).toMatchObject({
+            preserveProviderEnvironment: true,
+            config: {
+              codexOverrides: {
+                model_reasoning_effort: "ultra",
+                model_provider: "synthetic",
+              },
+            },
             inheritedPermissions: {
               filesystem: { "/private": "deny", glob_scan_max_depth: 3 },
               network: { enabled: false },

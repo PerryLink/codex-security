@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import json
 import sqlite3
 from pathlib import Path
@@ -294,37 +295,47 @@ def test_stopped_standard_cannot_resume_and_preserves_checkpoint(
     )
 
 
-def test_native_cancel_retains_atomic_aggregate_and_marks_unmerged_child(tmp_path: Path) -> None:
+@pytest.mark.parametrize("accepted_membership", ["merged", "represented"])
+def test_native_cancel_retains_accepted_and_later_unmerged_findings(
+    tmp_path: Path, accepted_membership: str
+) -> None:
     target = tmp_path / "target"
     target.mkdir()
     (target / "app.py").write_text("print('fixture')\n")
     state = tmp_path / "state"
     parent = register(state, target, tmp_path / "scan", mode="deep")
-    directory = Path(parent["scanDir"]) / "artifacts/deep-scan/passes/pass-1"
-    saved = checkpoint(state, parent, passes=[{"directory": str(directory)}])
-    child = register(state, target, directory, parent=parent["scanId"])
-    write_completed_contract(
-        directory,
-        child["scanId"],
-        target,
-        relative_path="app.py",
-        identity_anchor="separate-unmerged-finding",
+    parent_dir = Path(parent["scanDir"])
+    children = []
+    for index, anchor in enumerate(("accepted-finding", "separate-unmerged-finding"), 1):
+        directory = parent_dir / f"artifacts/deep-scan/passes/pass-{index}"
+        child = register(state, target, directory, parent=parent["scanId"])
+        write_completed_contract(
+            directory, child["scanId"], target, relative_path="app.py", identity_anchor=anchor
+        )
+        run_workbench(state, "complete-scan", "--scan-id", child["scanId"])
+        protected = {
+            name: (directory / name).read_bytes()
+            for name in ("scan-manifest.json", "findings.json", "coverage.json")
+        }
+        children.append((child, directory, protected))
+    first, _, first_bytes = children[0]
+    original = json.loads(first_bytes["findings.json"])["findings"][0]
+    accepted = copy.deepcopy(original)
+    accepted["provenance"]["sourceFindingIds"] = [f"{first['scanId']}:0"]
+    accepted["provenance"]["sourceFindings"] = [{"id": f"{first['scanId']}:0", "finding": original}]
+    saved = checkpoint(
+        state,
+        parent,
+        passes=[
+            {"directory": directory.relative_to(parent_dir).as_posix(), "scanId": child["scanId"]}
+            for child, directory, _ in children
+        ],
+        merged=[first["scanId"]] if accepted_membership == "merged" else [],
     )
-    run_workbench(state, "complete-scan", "--scan-id", child["scanId"])
-    child_bytes = (directory / "findings.json").read_bytes()
-    accepted = tmp_path / "accepted"
-    accepted.mkdir()
-    write_completed_contract(
-        accepted,
-        parent["scanId"],
-        target,
-        relative_path="app.py",
-        identity_anchor="accepted-finding",
-    )
-    findings = json.loads((accepted / "findings.json").read_text())["findings"]
+    saved["noNewStreak"] = 2
     saved["aggregate"] = {
         "scanId": parent["scanId"],
-        "findings": findings,
+        "findings": [accepted],
         "coverage": {
             "completeness": "partial",
             "surfaces": [],
@@ -344,17 +355,36 @@ def test_native_cancel_retains_atomic_aggregate_and_marks_unmerged_child(tmp_pat
     run_workbench(state, "cancel-scan", "--scan-id", parent["scanId"])
     context = run_workbench(state, "get-scan", "--scan-id", parent["scanId"])["scan"]
     assert context["progress"]["status"] == "canceled"
-    assert context["findingCount"] == 1
-    retained = json.loads((Path(parent["scanDir"]) / "findings.json").read_text())["findings"]
-    assert retained[0]["identity"]["anchor"] == "accepted-finding"
-    coverage = json.loads((Path(parent["scanDir"]) / "coverage.json").read_text())
-    assert any(row["reason"].startswith("Accepted pass still") for row in coverage["deferred"])
-    assert any("artifacts/deep-scan/passes/pass-1" in row["reason"] for row in coverage["deferred"])
-    assert (directory / "findings.json").read_bytes() == child_bytes
-    assert (
-        run_workbench(state, "get-scan", "--scan-id", child["scanId"])["scan"]["progress"]["status"]
-        == "complete"
+    assert context["findingCount"] == 2
+    retained = json.loads((parent_dir / "findings.json").read_text())["findings"]
+    preserved = next(finding for finding in retained if finding["identity"] == accepted["identity"])
+    assert preserved["findingId"] == accepted["findingId"]
+    assert preserved["provenance"]["sourceFindings"] == accepted["provenance"]["sourceFindings"]
+    later, _, later_bytes = children[1]
+    recovered = next(
+        finding
+        for finding in retained
+        if finding["provenance"]["sourceFindingIds"] == [f"{later['scanId']}:0"]
     )
+    assert recovered["identity"]["anchor"] == "separate-unmerged-finding"
+    assert (
+        recovered["provenance"]["sourceFindings"][0]["finding"]
+        == json.loads(later_bytes["findings.json"])["findings"][0]
+    )
+    coverage = json.loads((parent_dir / "coverage.json").read_text())
+    assert coverage["completeness"] == "partial"
+    assert any(row["reason"].startswith("Accepted pass still") for row in coverage["deferred"])
+    assert any("artifacts/deep-scan/passes/pass-2" in row["reason"] for row in coverage["deferred"])
+    for child, directory, protected in children:
+        for name, contents in protected.items():
+            assert (directory / name).read_bytes() == contents
+        assert (
+            run_workbench(state, "get-scan", "--scan-id", child["scanId"])["scan"]["progress"][
+                "status"
+            ]
+            == "complete"
+        )
+    assert json.loads((parent_dir / CHECKPOINT).read_text()) == saved
 
 
 @pytest.mark.parametrize("child_state", ["complete", "checkpoint"])
@@ -375,6 +405,7 @@ def test_cancel_before_first_merge_preserves_ordinary_children(
         findings_path = directory / "findings.json"
         findings = json.loads(findings_path.read_text())["findings"]
         findings[0]["provenance"]["candidateId"] = "shared-candidate"
+        findings[0]["provenance"]["preservedIdentity"] = dict(findings[0]["identity"])
         findings[0]["writeup"] = {"reportPath": "findings/proof/proof.md"}
         report_dir = directory / "findings/proof"
         report_dir.mkdir(parents=True)

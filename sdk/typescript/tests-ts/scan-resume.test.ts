@@ -55,7 +55,11 @@ async function interruptedScan(
   bulk = false,
   settings: Pick<
     ScanOptions,
-    "safetyIdentifier" | "postScanPrompt" | "auth" | "inheritedPermissions"
+    | "safetyIdentifier"
+    | "postScanPrompt"
+    | "auth"
+    | "inheritedPermissions"
+    | "preserveProviderEnvironment"
   > = {},
   resolvedDeep = false,
   startedMerge = true,
@@ -136,7 +140,16 @@ async function interruptedScan(
     repository,
     target: { kind: "repository", paths: [] },
     mode,
-    config: { model: "gpt-5.6-sol", approval_policy: "never" },
+    config: {
+      model: "gpt-5.6-sol",
+      approval_policy: "never",
+      ...(settings.preserveProviderEnvironment
+        ? {
+            model_provider: "custom",
+            model_providers: { custom: { env_key: "OPENAI_API_KEY" } },
+          }
+        : {}),
+    },
     pluginVersion: "0.1.0",
     requiresScanPrompt: true,
     ...settings,
@@ -467,6 +480,11 @@ function resumeClient(
       environment: f.environment,
       prepareRuntime: async () => {
         const runtime = preparedRuntime(f.codexHome);
+        runtime.environment = Object.fromEntries(
+          Object.entries(f.environment).filter(
+            (entry): entry is [string, string] => entry[1] !== undefined,
+          ),
+        );
         runtime.plugin.version = JSON.parse(
           await readFile(
             join(PLUGIN_ROOT, ".codex-plugin", "plugin.json"),
@@ -952,17 +970,22 @@ test.each(["chatgpt", "api-key"] as const)(
 );
 
 test.each([
-  ["chatgpt", false],
-  ["api-key", false],
-  [undefined, false],
-  ["chatgpt", true],
-  ["api-key", true],
-  [undefined, true],
+  ["chatgpt", false, false],
+  ["api-key", false, false],
+  [undefined, false, false],
+  ["chatgpt", true, false],
+  ["api-key", true, false],
+  [undefined, true, false],
+  [undefined, false, true],
+  [undefined, true, true],
 ] as const)(
-  "resume restores saved launch settings with %s auth (bulk: %p)",
-  async (auth, bulk) => {
+  "resume restores saved launch settings with %s auth (bulk: %p, native provider: %p)",
+  async (auth, bulk, preserveProviderEnvironment) => {
     const settings = {
       auth,
+      ...(preserveProviderEnvironment
+        ? { preserveProviderEnvironment: true }
+        : {}),
       safetyIdentifier:
         auth === "chatgpt" ? undefined : "synthetic-original-user",
       postScanPrompt: "Run these exact saved post-scan instructions.\n",
@@ -1012,9 +1035,13 @@ test.each([
             settings.safetyIdentifier,
           );
           expect(options.apiKey).toBe(
-            auth === "chatgpt" ? undefined : "synthetic-resume-key",
+            preserveProviderEnvironment || auth === "chatgpt"
+              ? undefined
+              : "synthetic-resume-key",
           );
-          expect(options.env?.["OPENAI_API_KEY"]).toBeUndefined();
+          expect(options.env?.["OPENAI_API_KEY"]).toBe(
+            preserveProviderEnvironment ? "synthetic-resume-key" : undefined,
+          );
           expect(options.env?.["CODEX_API_KEY"]).toBeUndefined();
           return {
             startThread() {

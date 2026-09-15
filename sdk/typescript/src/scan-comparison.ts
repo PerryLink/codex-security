@@ -158,6 +158,8 @@ export interface ReadOnlyCodexOptions {
   /** @internal */
   codex?: ReadOnlyCodex;
   environment?: NodeJS.ProcessEnv;
+  /** @internal Keep authentication selected by a native provider. */
+  preserveProviderEnvironment?: boolean;
   /** @internal Constraints inherited from the scan that owns this helper. */
   inheritedPermissions?: { filesystem: JsonObject; network: JsonObject };
   model?: string;
@@ -175,10 +177,12 @@ export interface ScanComparisonOptions extends ReadOnlyCodexOptions {
 
 interface CompletedScanMatchingOptions extends Pick<
   ScanComparisonOptions,
-  "environment" | "model" | "signal"
+  "config" | "environment" | "model" | "signal"
 > {
   /** @internal */
   inheritedPermissions?: { filesystem: JsonObject; network: JsonObject };
+  /** @internal Keep authentication selected by a native provider. */
+  preserveProviderEnvironment?: boolean;
   scanId: string;
   repository: string;
   previousFindings: readonly Record<string, unknown>[];
@@ -573,6 +577,8 @@ async function startReadOnlyCodexThread(
     ? modelProviderConfigOverride(providerConfig)
     : [];
   if (options.inheritedPermissions !== undefined) {
+    delete sdkConfig["permissions"];
+    delete sdkConfig["projects"];
     delete sdkConfig["sandbox_mode"];
     sdkConfig["default_permissions"] = "codex_security_comparison";
     configOverrides.push(
@@ -591,6 +597,7 @@ async function startReadOnlyCodexThread(
           options.signal,
           undefined,
           providerConfig,
+          options.preserveProviderEnvironment,
         )
       : undefined;
   const command =
@@ -601,10 +608,11 @@ async function startReadOnlyCodexThread(
       codexPathOverride: executablePathForSpawn(command!.command),
       env: environment,
       // The SDK forwards its apiKey option as CODEX_API_KEY for Codex exec.
-      apiKey:
-        environmentEntry(environment!, "OPENAI_API_KEY")?.trim() ||
-        environmentEntry(environment!, "CODEX_API_KEY")?.trim() ||
-        undefined,
+      apiKey: options.preserveProviderEnvironment
+        ? undefined
+        : environmentEntry(environment!, "OPENAI_API_KEY")?.trim() ||
+          environmentEntry(environment!, "CODEX_API_KEY")?.trim() ||
+          undefined,
       ...(configOverrides.length === 0 ? {} : { configOverrides }),
       config: {
         ...sdkConfig,
@@ -759,8 +767,10 @@ export async function matchCompletedScan(
   };
   const comparison = await (options.matchFindings ?? matchScanFindings)(input, {
     allowHistoricalUncertainty: true,
+    config: options.config,
     environment: options.environment,
     inheritedPermissions: options.inheritedPermissions,
+    preserveProviderEnvironment: options.preserveProviderEnvironment,
     model: options.model,
     signal: options.signal,
     workingDirectory: options.repository,
@@ -1135,6 +1145,7 @@ export async function comparisonEnvironment(
   signal?: AbortSignal,
   prepareCredentialHome: typeof prepareCodexSecurityCredentialHome = prepareCodexSecurityCredentialHome,
   config?: JsonObject,
+  preserveProviderEnvironment = false,
 ): Promise<Record<string, string>> {
   signal?.throwIfAborted();
   const environment = Object.fromEntries(
@@ -1149,6 +1160,7 @@ export async function comparisonEnvironment(
       environment[key] = home;
     }
   }
+  if (preserveProviderEnvironment) return environment;
   if (
     hasCommandAuth(config ?? (await readCodexHomeConfig(environment, signal)))
   ) {

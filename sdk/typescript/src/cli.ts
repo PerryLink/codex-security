@@ -960,6 +960,7 @@ interface ScanArguments extends ResolvedScanSettings {
   projectConfig?: ProjectConfigProvenance;
   resumeScanId?: string;
   inheritedPermissions?: ScanOptions["inheritedPermissions"];
+  preserveProviderEnvironment?: boolean;
   mock?: boolean;
   workflowId?: string;
   safetyIdentifier?: string;
@@ -4508,6 +4509,8 @@ export async function main(
                         outputDir: scanDir,
                         safetyIdentifier: recipe.safetyIdentifier,
                         inheritedPermissions: recipe.inheritedPermissions,
+                        preserveProviderEnvironment:
+                          recipe.preserveProviderEnvironment,
                         postScanPrompt:
                           recipe.postScanPrompt ?? prompts.postScanPrompt,
                         signal: controller.signal,
@@ -6001,6 +6004,7 @@ async function prepareScanArgumentsFromRecipe(
     repository,
     inheritedPermissions:
       inheritedPermissions as ScanOptions["inheritedPermissions"],
+    preserveProviderEnvironment: recipe["preserveProviderEnvironment"] === true,
     auth: auth.data ?? DEFAULT_SCAN_AUTH,
     target:
       paths.length > 0
@@ -8165,6 +8169,7 @@ async function executeScan(
     const options: ScanOptions = {
       ...pickScanSettings(arguments_),
       inheritedPermissions: arguments_.inheritedPermissions,
+      preserveProviderEnvironment: arguments_.preserveProviderEnvironment,
       ...(arguments_.resumeScanId === undefined
         ? {}
         : { resumeScanId: arguments_.resumeScanId }),

@@ -9,10 +9,13 @@ import {
   type ScanOptions,
 } from "../../../../sdk/typescript/src/api.js";
 import {
+  hasCommandAuth,
   scanCompositionOverrides,
+  scanModelProvider,
   type JsonObject,
 } from "../../../../sdk/typescript/src/config.js";
 import { ScanSettingsSchema } from "../../../../sdk/typescript/src/scan-settings.js";
+import { accountStatus } from "../../../../sdk/typescript/src/auth.js";
 import { resolveDeepScanConfig } from "../../../../sdk/typescript/src/deep-config.js";
 import type { ScanResult } from "../../../../sdk/typescript/src/result.js";
 import {
@@ -55,7 +58,10 @@ export class NativeScanHost {
       const controller = new AbortController();
       const promise = Promise.resolve()
         .then(async () => {
-          const { client, options } = await this.prepare(input);
+          const { client, options } = await this.prepare(
+            input,
+            controller.signal,
+          );
           try {
             return await client.run(input.scan.targetPath, {
               ...options,
@@ -90,6 +96,7 @@ export class NativeScanHost {
 
 export async function prepareNativeScan(
   input: NativeScanInput,
+  signal?: AbortSignal,
 ): Promise<PreparedNativeScan> {
   const environment = await snapshotNativeEnvironment();
   environment.CODEX_CLI_PATH = resolveCodexPath(environment);
@@ -145,12 +152,41 @@ export async function prepareNativeScan(
     input,
     deep.settings.subagents,
   );
-  const selectedEnvironment = selectedScanEnvironment(
-    environment,
-    options.auth,
-    config.model_provider,
-  );
-  if (selectedEnvironment.CODEX_API_KEY?.trim())
+  let modelProvider = scanModelProvider(config);
+  const providers = config.model_providers as JsonObject | undefined;
+  if (modelProvider === undefined && providers?.openai !== undefined) {
+    config.model_provider = "openai";
+    modelProvider = "openai";
+  }
+  const provider = providers?.[
+    typeof modelProvider === "string" ? modelProvider : "openai"
+  ] as JsonObject | undefined;
+  const configuredProvider =
+    hasCommandAuth(config) ||
+    provider?.env_key !== undefined ||
+    (provider?.requires_openai_auth !== true &&
+      ((modelProvider !== undefined && modelProvider !== "openai") ||
+        provider !== undefined));
+  if (!configuredProvider && (options.auth ?? "auto") === "auto") {
+    if (
+      config.forced_login_method === "chatgpt" ||
+      (!environment.CODEX_API_KEY?.trim() &&
+        environment.OPENAI_API_KEY?.trim() &&
+        (
+          await accountStatus(
+            { command: environment.CODEX_CLI_PATH },
+            selectedScanEnvironment(environment, "chatgpt"),
+            signal,
+            config,
+          )
+        ).authenticated)
+    )
+      options.auth = "chatgpt";
+  }
+  const selectedEnvironment = configuredProvider
+    ? environment
+    : selectedScanEnvironment(environment, options.auth, modelProvider);
+  if (!configuredProvider && selectedEnvironment.CODEX_API_KEY?.trim())
     delete selectedEnvironment.OPENAI_API_KEY;
   const client = new CodexSecurity(
     {
@@ -171,6 +207,7 @@ export async function prepareNativeScan(
       ...options,
       ...deep.settings,
       inheritedPermissions,
+      ...(configuredProvider ? { preserveProviderEnvironment: true } : {}),
       target:
         (recipe.target as JsonObject | undefined)?.kind === "paths"
           ? ((recipe.target as JsonObject).paths as string[])
@@ -195,6 +232,11 @@ export async function nativeScanConfiguration(
   input: Pick<NativeScanInput, "recipe" | "model" | "reasoningEffort">,
   subagents: number,
 ): Promise<JsonObject> {
+  if (input.recipe?.config !== undefined)
+    return scanCompositionOverrides(
+      input.recipe.config as JsonObject,
+      subagents,
+    );
   const ambientPath = join(
     environment.CODEX_HOME ?? join(homedir(), ".codex"),
     "config.toml",
@@ -212,7 +254,6 @@ export async function nativeScanConfiguration(
     {
       ...parseToml(ambient),
       ...selected,
-      ...(input.recipe?.config as JsonObject | undefined),
     } as JsonObject,
     subagents,
   );
