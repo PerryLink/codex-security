@@ -1250,7 +1250,13 @@ def migrate_legacy_scan(db: Any, connection: Any, scan: Any) -> Any:
         coverage.pop(field, None)
     for field in ("includePaths", "excludePaths"):
         aggregate.get("scope", {}).pop(field, None)
+    merge_failures = 0
     for worker in workers:
+        if worker["kind"] == "dedup":
+            if worker["status"] == "succeeded":
+                merge_failures = 0
+            elif worker["status"] == "failed":
+                merge_failures += 1
         if worker["kind"] != "discovery" or worker in accepted:
             continue
         directory = Path(worker["artifact_dir"]).relative_to(scan_dir).as_posix()
@@ -1269,6 +1275,7 @@ def migrate_legacy_scan(db: Any, connection: Any, scan: Any) -> Any:
         "aggregate": aggregate,
         "noNewStreak": run["consecutive_no_new"],
         "consecutiveErrors": run["consecutive_errors"],
+        "mergeFailures": merge_failures,
         "legacy": {
             "originThreadId": scan["continuation_thread_id"] or scan["deep_scan_owner_thread_id"],
             "discoveryRuns": run["discovery_runs_dispatched"],

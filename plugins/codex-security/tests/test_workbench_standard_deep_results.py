@@ -1836,6 +1836,16 @@ def test_legacy_resume_imports_accepted_progress_once(tmp_path: Path) -> None:
         "unmerged" in item["reason"] for item in checkpoint["legacy"]["coverage"]["deferred"]
     )
     assert all(path.read_bytes() == contents for path, contents in snapshots.items())
+    checkpoint["mergeFailures"] = 2
+    run_workbench(
+        state,
+        "save-scan-artifact",
+        "--scan-id",
+        scan_id,
+        "--artifact-path",
+        "artifacts/deep-scan/checkpoint.json",
+        input_text=json.dumps(checkpoint),
+    )
     first_checkpoint = checkpoint_path.read_bytes()
     run_workbench(state, "set-scan-thread", "--scan-id", scan_id, "--thread-id", "ordinary-merge")
     assert (
@@ -1859,6 +1869,102 @@ def test_legacy_resume_imports_accepted_progress_once(tmp_path: Path) -> None:
     assert failed["findingCount"] == 1
     assert failed["findings"][0]["identity"] == original["identity"]
     assert all(path.read_bytes() == contents for path, contents in snapshots.items())
+
+
+@pytest.mark.parametrize(
+    ("history", "expected"),
+    [
+        (
+            [
+                ("dedup", "failed"),
+                ("discovery", "succeeded"),
+                ("dedup", "canceled"),
+                ("dedup", "failed"),
+                ("discovery", "failed"),
+                ("dedup", "failed"),
+            ],
+            3,
+        ),
+        (
+            [
+                ("dedup", "failed"),
+                ("dedup", "queued"),
+                ("discovery", "canceled"),
+                ("dedup", "failed"),
+                ("dedup", "running"),
+            ],
+            2,
+        ),
+        (
+            [
+                ("dedup", "failed"),
+                ("dedup", "failed"),
+                ("dedup", "succeeded"),
+                ("dedup", "failed"),
+                ("discovery", "succeeded"),
+                ("dedup", "canceled"),
+            ],
+            1,
+        ),
+    ],
+    ids=["threshold", "under-threshold", "success-resets"],
+)
+def test_legacy_resume_preserves_merger_failure_streak(
+    tmp_path: Path, history: list[tuple[str, str]], expected: int
+) -> None:
+    state, _, _, scan_dir, scan_id = deep_scan_fixture(tmp_path)
+    for index, (kind, status) in enumerate(history):
+        prompt, directory, result = worker_paths(scan_dir, f"history-{index}")
+        seed_legacy_worker(
+            state,
+            scan_id,
+            f"history-{index}",
+            kind=kind,
+            status=status,
+            prompt=prompt,
+            directory=directory,
+        )
+        if status == "succeeded":
+            result.write_text(
+                json.dumps(
+                    {
+                        "scanId": scan_id,
+                        "findings": [],
+                        "coverage": {
+                            "completeness": "complete",
+                            "surfaces": [],
+                            "explicitExclusions": [],
+                            "deferred": [],
+                        },
+                    }
+                )
+            )
+    with sqlite3.connect(state / "workbench.sqlite3") as connection:
+        connection.execute(
+            "UPDATE deep_scan_runs SET updated_at='2000-01-01T00:00:00Z', "
+            "consecutive_no_new=2, consecutive_errors=1, stop_after_consecutive_errors=3 "
+            "WHERE scan_id=?",
+            (scan_id,),
+        )
+        connection.execute("UPDATE deep_scan_workers SET attempt=4 WHERE scan_id=?", (scan_id,))
+        workers_before = connection.execute(
+            "SELECT * FROM deep_scan_workers WHERE scan_id=? ORDER BY created_at,id", (scan_id,)
+        ).fetchall()
+    run_workbench(state, "get-cli-scan-resume", "--migrate", "--scan-id", scan_id)
+    checkpoint = json.loads((scan_dir / "artifacts/deep-scan/checkpoint.json").read_text())
+    assert checkpoint["mergeFailures"] == expected
+    assert checkpoint["consecutiveErrors"] == 1
+    assert checkpoint["noNewStreak"] == 2
+    with sqlite3.connect(state / "workbench.sqlite3") as connection:
+        assert (
+            connection.execute(
+                "SELECT * FROM deep_scan_workers WHERE scan_id=? ORDER BY created_at,id", (scan_id,)
+            ).fetchall()
+            == workers_before
+        )
+        assert connection.execute("SELECT status FROM scans WHERE id=?", (scan_id,)).fetchone() == (
+            "running",
+        )
 
 
 def test_legacy_conversion_crash_does_not_resume_old_conversation(tmp_path: Path) -> None:
