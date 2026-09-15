@@ -301,9 +301,16 @@ describe("ordinary scan composition", () => {
     ]);
   });
 
-  test.each([0, 1, 3])(
-    "resumes a sealed child with %i independent merge failures",
-    async (failures) => {
+  test.each([
+    [0, 0],
+    [0, 1],
+    [0, 3],
+    [2, 0],
+    [2, 1],
+    [3, 0],
+  ])(
+    "resumes a sealed child with %i saved and %i new merge failures",
+    async (priorFailures, failures) => {
       const h = await harness({ stopAfterNoNew: 1, maxDiscoveryRuns: 1 });
       const childDirectory = "artifacts/deep-scan/passes/pass-1";
       const scanDir = join(h.input.scanDir, childDirectory);
@@ -327,6 +334,7 @@ describe("ordinary scan composition", () => {
         aggregate: null,
         noNewStreak: 0,
         consecutiveErrors: 2,
+        ...(priorFailures === 0 ? {} : { mergeFailures: priorFailures }),
       });
       const merge = h.input.merge;
       let attempts = 0;
@@ -334,12 +342,17 @@ describe("ordinary scan composition", () => {
         if (++attempts <= failures) throw new Error("Merge failed.");
         return merge(...args);
       };
-      if (failures === 3) {
-        await expect(runDeepScans(h.input)).rejects.toThrow("Merge failed.");
-        expect(attempts).toBe(3);
+      if (priorFailures + failures >= 3) {
+        await expect(runDeepScans(h.input)).rejects.toThrow(
+          priorFailures === 3
+            ? "consecutive merge error limit"
+            : "Merge failed.",
+        );
+        expect(attempts).toBe(3 - priorFailures);
         expect(h.calls).toEqual([]);
         expect(await h.checkpoint()).toMatchObject({
           consecutiveErrors: 2,
+          mergeFailures: 3,
           noNewStreak: 0,
           mergedScanIds: [],
           terminalReason: "failed",
@@ -353,6 +366,7 @@ describe("ordinary scan composition", () => {
       expect(h.mergeInputs).toEqual([1]);
       expect(state.mergedScanIds).toEqual([scanId]);
       expect(state.consecutiveErrors).toBe(2);
+      expect(state.mergeFailures).toBe(0);
       expect(attempts).toBe(failures + 1);
       expect(state.terminalReason).toBe("capped");
       expect(h.published.at(-1)!.findings).toHaveLength(1);
@@ -365,6 +379,26 @@ describe("ordinary scan composition", () => {
       expect(await readFile(join(scanDir, "findings.json"))).toEqual(bytes);
     },
   );
+
+  test("stops at the saved merge error limit before scheduling discovery", async () => {
+    const h = await harness();
+    await h.seed({
+      version: 2,
+      startedAt: h.input.startedAt,
+      passes: [],
+      mergedScanIds: [],
+      aggregate: null,
+      noNewStreak: 0,
+      consecutiveErrors: 0,
+      mergeFailures: 3,
+    });
+    await expect(runDeepScans(h.input)).rejects.toThrow(
+      "consecutive merge error limit",
+    );
+    expect(h.calls).toEqual([]);
+    expect(h.mergeInputs).toEqual([]);
+    expect((await h.checkpoint()).mergeFailures).toBe(3);
+  });
 
   test("continues the already reserved final pass before applying the run cap", async () => {
     const h = await harness({ maxDiscoveryRuns: 1 });

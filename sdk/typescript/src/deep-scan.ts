@@ -28,6 +28,7 @@ export interface DeepScanCheckpoint {
   aggregate: SemanticScan | null;
   noNewStreak: number;
   consecutiveErrors: number;
+  mergeFailures?: number;
   legacy?: {
     discoveryRuns: number;
     coverage: JsonObject;
@@ -237,6 +238,8 @@ export async function runDeepScans(
   }, 1_000);
   cancellationTimer.unref();
   const mergePending = async (allowEmpty = false): Promise<void> => {
+    if ((state.mergeFailures ?? 0) >= settings.stopAfterConsecutiveErrors)
+      throw new Error("Deep Scan reached its consecutive merge error limit.");
     const pending = state.passes.flatMap((pass) => {
       const result =
         pass.scanId === undefined ? undefined : accepted.get(pass.scanId);
@@ -246,7 +249,6 @@ export async function runDeepScans(
     });
     if (!pending.length && (!allowEmpty || state.aggregate !== null)) return;
     let merged: ReturnType<typeof validateMerge>;
-    let mergeFailures = 0;
     for (;;) {
       executionSignal.throwIfAborted();
       try {
@@ -261,7 +263,10 @@ export async function runDeepScans(
         break;
       } catch (error) {
         if (executionSignal.aborted) throw error;
-        if (++mergeFailures >= settings.stopAfterConsecutiveErrors) throw error;
+        state.mergeFailures = (state.mergeFailures ?? 0) + 1;
+        await save();
+        if (state.mergeFailures >= settings.stopAfterConsecutiveErrors)
+          throw error;
       }
     }
     executionSignal.throwIfAborted();
@@ -274,6 +279,7 @@ export async function runDeepScans(
         state.legacy?.coverage,
       ),
     };
+    state.mergeFailures = 0;
     state.mergedScanIds.push(...pending.map((result) => result.scanId));
     state.noNewStreak =
       merged.newFindings > 0 ? 0 : state.noNewStreak + pending.length;
