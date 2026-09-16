@@ -21,6 +21,9 @@ import { startRpc } from "./package-rpc.mjs";
 import { packageSmokeTimeouts } from "../package-smoke-timeouts.mjs";
 
 const installedRoot = await realpath(process.argv[2]);
+const { resolvePluginPython } = await import(
+  pathToFileURL(join(installedRoot, "dist", "runtime.js")).href
+);
 const root = await realpath(
   await mkdtemp(join(tmpdir(), "package deep % fixture-")),
 );
@@ -102,6 +105,7 @@ async function fixture(name, pluginRoot, executable) {
       "TMP",
       "TEMP",
       "TMPDIR",
+      "PYTHON",
     ]
       .filter((key) => process.env[key] !== undefined)
       .map((key) => [key, process.env[key]]),
@@ -114,7 +118,6 @@ async function fixture(name, pluginRoot, executable) {
     CODEX_SECURITY_PLUGIN_ROOT: pluginRoot,
     CODEX_SECURITY_STATE_DIR: join(directory, "state"),
     CODEX_SECURITY_SCAN_ROOT: join(directory, "scans"),
-    PYTHON: process.env.PYTHON || "python3",
     OPENAI_API_KEY: "synthetic-package-deep-key",
     ...(process.platform === "win32"
       ? {
@@ -123,6 +126,11 @@ async function fixture(name, pluginRoot, executable) {
         }
       : {}),
     PACKAGE_DEEP_TRACE: join(directory, "executions.jsonl"),
+  });
+  env.PYTHON = await resolvePluginPython({
+    environment: env,
+    protectedRoot: target,
+    homeDirectory: home,
   });
   return { directory, target, home, env, pluginRoot };
 }
@@ -465,6 +473,9 @@ async function readExecutions(f) {
 
 async function assertExecutions(f, scanId, preflights = 3) {
   const executions = await readExecutions(f);
+  for (const execution of executions) {
+    assert.equal(execution.python, f.env.PYTHON);
+  }
   const workers = executions.filter((entry) => entry.phase === "worker");
   const reducers = executions.filter((entry) => entry.phase === "reducer");
   const incomplete = f.env.PACKAGE_DEEP_EMPTY_ONCE ? 1 : 0;
