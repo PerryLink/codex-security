@@ -75,24 +75,61 @@ def test_projection_normalizes_multiline_and_block_structural_text() -> None:
     assert "Text: ## Injected remediation - unsafe instruction" in markdown
 
 
-def test_linked_writeup_retains_distinct_source_fixes() -> None:
+@pytest.mark.parametrize("linked_writeup", [False, True], ids=["inline", "linked"])
+def test_projection_retains_distinct_source_fixes(linked_writeup: bool) -> None:
     manifest, findings, coverage = canonical_documents()
     finding = findings["findings"][0]
-    finding["writeup"] = {"reportPath": "findings/parser/parser.md"}
+    if linked_writeup:
+        finding["writeup"] = {"reportPath": "findings/parser/parser.md"}
     finding["remediation"] = "Validate the record length."
+    finding["remediationTests"] = ["Reject a record longer than the allowed size."]
+    finding["preventiveControls"] = ["Centralize record validation."]
     finding["provenance"] = {
         "sourceFindings": [
             {"id": "review-1:0", "finding": {"remediation": "Validate the record length."}},
-            {"id": "review-2:0", "finding": {"remediation": "Reject duplicate record keys."}},
-            {"id": "review-3:0", "finding": {"remediation": "Reject duplicate record keys."}},
+            {
+                "id": "review-2:0",
+                "finding": {
+                    "remediation": "Reject duplicate record keys.",
+                    "remediationTests": [
+                        "Reject a record longer than the allowed size.",
+                        "Cover duplicate keys in parser tests.",
+                    ],
+                    "preventiveControls": [
+                        "Centralize record validation.",
+                        "Track keys while parsing a record.",
+                    ],
+                },
+            },
+            {
+                "id": "review-3:0",
+                "finding": {
+                    "remediation": "Reject duplicate record keys.",
+                    "remediationTests": [
+                        "Cover duplicate keys in parser tests.",
+                        "Reject case-variant duplicate keys.",
+                    ],
+                    "preventiveControls": ["Track keys while parsing a record."],
+                },
+            },
         ]
     }
 
     markdown = PROJECTION.build_report_markdown(manifest, findings, coverage)
 
-    assert "findings/parser/parser.md" in markdown
-    assert markdown.count("Validate the record length.") == 1
-    assert markdown.count("Reject duplicate record keys.") == 1
+    if linked_writeup:
+        assert "findings/parser/parser.md" in markdown
+    assert "Source review-2:0: Reject duplicate record keys." in markdown
+    for text in (
+        "Validate the record length.",
+        "Reject duplicate record keys.",
+        "Reject a record longer than the allowed size.",
+        "Cover duplicate keys in parser tests.",
+        "Reject case-variant duplicate keys.",
+        "Centralize record validation.",
+        "Track keys while parsing a record.",
+    ):
+        assert markdown.count(text) == 1
 
 
 def test_projection_renders_inline_code_and_section_code_evidence() -> None:
