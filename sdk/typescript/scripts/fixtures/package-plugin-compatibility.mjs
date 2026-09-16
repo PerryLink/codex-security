@@ -112,6 +112,15 @@ const client = new CodexSecurity(
                             riskArea: " ",
                           }),
                         );
+                        delete document.surfaces[1].receiptRefs;
+                        document.surfaces.push({
+                          label: "Unidentified surface",
+                          disposition: "reported",
+                        });
+                        document.completeness = "partial";
+                        document.deferred = [
+                          { reason: "Deployment review remains." },
+                        ];
                       }
                       await writeFile(file, JSON.stringify(document));
                     }
@@ -168,6 +177,10 @@ try {
   assert.equal(result.findings.findings[0].locations[0].role, " ");
   assert.equal(result.coverage.surfaces[0].notes, " ");
   assert.equal(result.coverage.surfaces[0].riskArea, " ");
+  assert.equal(result.coverage.completeness, "partial");
+  assert.equal(result.coverage.surfaces[1].disposition, "needs_follow_up");
+  assert.deepEqual(result.coverage.surfaces[1].receiptRefs, []);
+  assert.deepEqual(result.coverage.deferred, []);
   assert.ok(
     result.coverage.openQuestions.length > 0 &&
       result.coverage.openQuestions.every(

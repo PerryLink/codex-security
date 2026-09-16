@@ -148,10 +148,8 @@ for (const scenario of cases) {
         completeness: scenario.coverage,
         surfaces: [
           {
-            id: "archive-extraction",
             label: "Archive extraction",
             disposition: "reported",
-            receiptRefs: [],
           },
         ],
         explicitExclusions: [],
@@ -160,7 +158,6 @@ for (const scenario of cases) {
             ? []
             : [
                 {
-                  id: "deployment",
                   reason: "Deployment controls remain unverified.",
                 },
               ],

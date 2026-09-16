@@ -86,6 +86,20 @@ const canonicalScanDraftInputSchema = loadArtifactZodSchema(
         ...scanDraftDocument.$defs.coverage,
         properties: {
           ...coverageDocument.properties,
+          surfaces: {
+            ...coverageDocument.properties.surfaces,
+            items: {
+              ...coverageDocument.properties.surfaces.items,
+              required: scanDraftDocument.$defs.surface.required,
+            },
+          },
+          deferred: {
+            ...coverageDocument.properties.deferred,
+            items: {
+              ...coverageDocument.properties.deferred.items,
+              required: scanDraftDocument.$defs.coverage.properties.deferred.items.required,
+            },
+          },
           // String questions are normalized by the finalizer after admission.
           openQuestions: {
             ...coverageDocument.properties.openQuestions,
