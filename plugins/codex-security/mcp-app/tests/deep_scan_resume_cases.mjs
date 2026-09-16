@@ -338,7 +338,7 @@ export async function testDeepScanResumeCases({
       includeUnstartedReducer);
   }
 
-  async function testResumeUsesHistoricalCandidateSnapshotForEachReducer(legacyLayout = false) {
+  async function testResumeUsesHistoricalCandidateSnapshotForEachReducer() {
     const fixture = await fixtureRun({
       workers: 3,
       subagents: 0,
@@ -416,5 +416,4 @@ export async function testDeepScanResumeCases({
   await testResumedManifestPreservesCompletedReducer();
   await testResumedManifestPreservesCompletedReducer(true);
   await testResumeUsesHistoricalCandidateSnapshotForEachReducer();
-  await testResumeUsesHistoricalCandidateSnapshotForEachReducer(true);
 }
