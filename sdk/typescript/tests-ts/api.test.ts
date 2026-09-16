@@ -6993,10 +6993,10 @@ if ([basename(process.argv[1]), ...process.argv.slice(2)].join(" ") !== "login s
         },
       );
 
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 5_000);
       try {
-        const scan = client.run(repository, {
-          signal: AbortSignal.timeout(5_000),
-        });
+        const scan = client.run(repository, { signal: controller.signal });
         if (terminal === "completion")
           await expect(scan).resolves.toMatchObject({
             threadId: "thread-1",
@@ -7004,6 +7004,7 @@ if ([basename(process.argv[1]), ...process.argv.slice(2)].join(" ") !== "login s
           });
         else await expect(scan).rejects.toThrow("401 invalid API key");
       } finally {
+        clearTimeout(timeout);
         await expect(client.close()).resolves.toBeUndefined();
       }
       await expect(client.close()).resolves.toBeUndefined();

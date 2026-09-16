@@ -15,7 +15,7 @@ import * as timers from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 import { afterEach, beforeAll, describe, expect, spyOn, test } from "bun:test";
 import type { ScanOptions } from "../src/api.js";
-import { estimateScanCost } from "../src/cost.js";
+import { estimateScanCost, type ScanCost } from "../src/cost.js";
 import type { JsonObject as WorkbenchJsonObject } from "../src/config.js";
 import {
   runDeepScans,
@@ -97,6 +97,7 @@ interface SavedRecord {
   parentScanId: string;
   targetPath: string;
   progress: { status: string };
+  cost?: ScanCost | null;
 }
 
 async function harness(
@@ -311,17 +312,24 @@ describe("ordinary scan composition", () => {
   });
 
   test.each([
-    [0, 0, false],
-    [0, 1, false],
-    [0, 3, false],
-    [2, 0, false],
-    [2, 1, false],
-    [3, 0, false],
-    [2, 1, true],
+    [0, 0, "merge"],
+    [0, 1, "merge"],
+    [0, 3, "merge"],
+    [2, 0, "merge"],
+    [2, 1, "merge"],
+    [3, 0, "merge"],
+    [2, 1, "permission"],
+    [1, 0, "discovery"],
+    [1, 0, "failed discovery"],
+    [0, 0, "cost"],
   ] as const)(
-    "resumes a sealed child with %i saved and %i new merge failures (permission: %p)",
-    async (priorFailures, failures, permissionFailure) => {
+    "resumes a sealed child with %i saved and %i new merge failures (%s)",
+    async (priorFailures, failures, kind) => {
       const h = await harness({ stopAfterNoNew: 1, maxDiscoveryRuns: 1 });
+      const permissionFailure = kind === "permission";
+      const discoveryLimit =
+        kind === "discovery" || kind === "failed discovery";
+      const consecutiveErrors = discoveryLimit ? 3 : 2;
       const childDirectory = "artifacts/deep-scan/passes/pass-1";
       const scanDir = join(h.input.scanDir, childDirectory);
       await mkdir(dirname(scanDir), { recursive: true, mode: 0o700 });
@@ -334,6 +342,7 @@ describe("ordinary scan composition", () => {
         parentScanId: h.input.scanId,
         targetPath: h.input.repository,
         progress: { status: "complete" },
+        ...(kind === "cost" ? { cost: null } : {}),
       });
       const bytes = await readFile(join(scanDir, "findings.json"));
       await h.seed({
@@ -343,8 +352,11 @@ describe("ordinary scan composition", () => {
         mergedScanIds: [],
         aggregate: null,
         noNewStreak: 0,
-        consecutiveErrors: 2,
+        consecutiveErrors,
         ...(priorFailures === 0 ? {} : { mergeFailures: priorFailures }),
+        ...(kind === "failed discovery"
+          ? { terminalReason: "failed" as const }
+          : {}),
       });
       const merge = h.input.merge;
       const failure = permissionFailure
@@ -355,18 +367,38 @@ describe("ordinary scan composition", () => {
         if (++attempts <= failures) throw failure;
         return merge(...args);
       };
-      if (permissionFailure || priorFailures + failures >= 3) {
-        await expect(runDeepScans(h.input)).rejects.toThrow(
-          priorFailures === 3
-            ? "consecutive merge error limit"
-            : failure.message,
+      if (kind === "cost") {
+        h.input.scanOptions.requireCost = true;
+        await expect(runDeepScans(h.input)).rejects.toBeInstanceOf(
+          ScanCostTrackingError,
         );
-        expect(attempts).toBe(permissionFailure ? 1 : 3 - priorFailures);
+        expect(h.calls).toEqual([]);
+        expect(attempts).toBe(0);
+        expect(h.published).toEqual([]);
+        expect(await readFile(join(scanDir, "findings.json"))).toEqual(bytes);
+        return;
+      }
+      if (
+        discoveryLimit ||
+        permissionFailure ||
+        priorFailures + failures >= 3
+      ) {
+        await expect(runDeepScans(h.input)).rejects.toThrow(
+          discoveryLimit
+            ? "consecutive error limit"
+            : priorFailures === 3
+              ? "consecutive merge error limit"
+              : failure.message,
+        );
+        expect(attempts).toBe(
+          discoveryLimit ? 0 : permissionFailure ? 1 : 3 - priorFailures,
+        );
         expect(h.calls).toEqual([]);
         expect(h.published).toEqual([]);
         expect(await h.checkpoint()).toMatchObject({
-          consecutiveErrors: 2,
-          mergeFailures: permissionFailure ? priorFailures : 3,
+          consecutiveErrors,
+          mergeFailures:
+            discoveryLimit || permissionFailure ? priorFailures : 3,
           noNewStreak: 0,
           mergedScanIds: [],
           terminalReason: "failed",
@@ -379,7 +411,7 @@ describe("ordinary scan composition", () => {
       expect(h.calls).toEqual([]);
       expect(h.mergeInputs).toEqual([1]);
       expect(state.mergedScanIds).toEqual([scanId]);
-      expect(state.consecutiveErrors).toBe(2);
+      expect(state.consecutiveErrors).toBe(consecutiveErrors);
       expect(state.mergeFailures).toBe(0);
       expect(attempts).toBe(failures + 1);
       expect(state.terminalReason).toBe("capped");
@@ -584,6 +616,49 @@ describe("ordinary scan composition", () => {
     },
   );
 
+  test("keeps the consecutive error limit when a sibling finishes after it", async () => {
+    retryDelay = spyOn(timers, "setTimeout").mockImplementation(
+      async <T>(_delay?: number, value?: T): Promise<T> => value as T,
+    );
+    const h = await harness({ workers: 2, stopAfterConsecutiveErrors: 1 });
+    let releaseSibling!: () => void;
+    const thresholdReached = new Promise<void>((resolve) => {
+      releaseSibling = resolve;
+    });
+    const workbench = h.input.workbench;
+    h.input.workbench = async (args, input) => {
+      const result = await workbench(args, input);
+      if (
+        args[0] === "save-scan-artifact" &&
+        JSON.parse(input!).consecutiveErrors === 1
+      )
+        releaseSibling();
+      return result;
+    };
+    let siblingSignal: AbortSignal | undefined;
+    h.setRun(async (options) => {
+      if (options.outputDir!.endsWith("pass-1"))
+        throw new Error("Discovery failed.");
+      siblingSignal = options.signal;
+      await thresholdReached;
+      return result(options.resumeScanId!, options.outputDir!);
+    });
+    await expect(runDeepScans(h.input)).rejects.toThrow(
+      "consecutive error limit",
+    );
+    expect(siblingSignal?.aborted).toBe(true);
+    expect(h.calls).toHaveLength(5);
+    expect(h.metrics().closed).toBe(2);
+    expect(h.mergeInputs).toEqual([]);
+    expect(h.published).toEqual([]);
+    expect(await h.checkpoint()).toMatchObject({
+      terminalReason: "failed",
+      consecutiveErrors: 1,
+      noNewStreak: 0,
+      mergedScanIds: [],
+    });
+  });
+
   test.each([false, true])(
     "counts exhausted unregistered passes toward the run cap (restart: %p)",
     async (restart) => {
@@ -640,6 +715,44 @@ describe("ordinary scan composition", () => {
         noNewStreak: 0,
         terminalReason: "failed",
       });
+    },
+  );
+
+  test.each([false, true])(
+    "replaces partial child cost with unavailable completed cost (required: %p)",
+    async (requireCost) => {
+      const h = await harness({ stopAfterNoNew: 1, maxDiscoveryRuns: 2 });
+      h.input.scanOptions.requireCost = requireCost;
+      const partial = estimateScanCost("gpt-6-astra", {
+        input_tokens: 10000,
+        output_tokens: 2000,
+      })!;
+      const costs: Array<Readonly<ScanCost> | null> = [];
+      h.input.onCost = (_key, cost) => costs.push(cost);
+      h.setRun(async (options) => {
+        options.onCost?.(partial);
+        return result(options.resumeScanId!, options.outputDir!);
+      });
+      if (requireCost) {
+        await expect(runDeepScans(h.input)).rejects.toBeInstanceOf(
+          ScanCostTrackingError,
+        );
+        expect(h.mergeInputs).toEqual([]);
+        expect(h.published).toEqual([]);
+        expect(await h.checkpoint()).toMatchObject({
+          terminalReason: "failed",
+          consecutiveErrors: 0,
+          noNewStreak: 0,
+          mergedScanIds: [],
+        });
+      } else {
+        await runDeepScans(h.input);
+        expect(h.mergeInputs).toEqual([1]);
+        expect((await h.checkpoint()).terminalReason).toBe("saturated");
+      }
+      expect(h.calls).toHaveLength(1);
+      expect(costs[0]).toEqual(partial);
+      expect(costs.at(-1)).toBeNull();
     },
   );
 

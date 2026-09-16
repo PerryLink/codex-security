@@ -163,15 +163,22 @@ def require_composition_complete(connection: sqlite3.Connection, scan: sqlite3.R
 def independent_review_progress(
     connection: sqlite3.Connection, scan: sqlite3.Row
 ) -> dict[str, Any] | None:
+    run = connection.execute(
+        "SELECT completion_sequence, updated_at, max_discovery_runs FROM deep_scan_runs WHERE scan_id = ?",
+        (scan["id"],),
+    ).fetchone()
     checkpoint = read_composition_checkpoint(scan)
     if checkpoint is not None:
         children = composition_children(connection, scan)
         recipe = json.loads(scan["recipe_json"]) if scan["recipe_json"] else {}
+        legacy = run if checkpoint.get("legacy") is not None else None
         return {
             "active": sum(child["status"] == "running" for child in children),
-            "completed": sum(child["status"] == "complete" for child in children),
+            "completed": sum(child["status"] == "complete" for child in children)
+            + (legacy["completion_sequence"] if legacy is not None else 0),
             "maximum": recipe.get("deepScan", {}).get(
-                "maxDiscoveryRuns", len(checkpoint["passes"])
+                "maxDiscoveryRuns",
+                legacy["max_discovery_runs"] if legacy is not None else len(checkpoint["passes"]),
             ),
             "consolidating": any(
                 child["status"] == "complete" and child["id"] not in checkpoint["mergedScanIds"]
@@ -179,10 +186,6 @@ def independent_review_progress(
             ),
             "updatedAt": max([scan["updated_at"], *(child["updated_at"] for child in children)]),
         }
-    run = connection.execute(
-        "SELECT completion_sequence, phase, updated_at, max_discovery_runs FROM deep_scan_runs WHERE scan_id = ?",
-        (scan["id"],),
-    ).fetchone()
     if run is None:
         return None
     return {

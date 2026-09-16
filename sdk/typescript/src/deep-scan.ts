@@ -74,7 +74,7 @@ export interface DeepScanComposition {
   onRetry?(message: string): void;
   writer: ScanArtifactRestorer;
   publish(draft: SemanticScan): Promise<void>;
-  onCost(key: string, cost: Readonly<ScanCost>): void;
+  onCost(key: string, cost: Readonly<ScanCost> | null): void;
   historicalCost?(threadId: string): Promise<ScanCost | null>;
 }
 
@@ -155,6 +155,17 @@ export async function runDeepScans(
   const validateMerge = await createScanMergeValidator(input.pluginRoot);
   const accepted = new Map<string, ScanMergeInput>();
   const saved = new Map<string, SavedPass>();
+  const reportCompletedCost = (
+    key: string,
+    cost: Readonly<ScanCost> | null,
+  ) => {
+    input.onCost(key, cost);
+    if (cost === null && input.scanOptions.requireCost)
+      throw new ScanCostTrackingError(
+        "The completed child scan cost is unavailable; its cost limit cannot be verified.",
+        scanDir,
+      );
+  };
   const refreshPasses = async (): Promise<void> => {
     const listed = await workbench([
       "list-scans",
@@ -179,7 +190,9 @@ export async function runDeepScans(
       }
       pass.scanId = record.scanId;
       saved.set(record.scanId, record);
-      if (record.cost) input.onCost(pass.directory, record.cost);
+      if (record.progress.status === "complete")
+        reportCompletedCost(pass.directory, record.cost ?? null);
+      else if (record.cost) input.onCost(pass.directory, record.cost);
       if (
         record.progress.status === "complete" &&
         !accepted.has(record.scanId)
@@ -222,6 +235,9 @@ export async function runDeepScans(
   };
   tick();
   const externalStop = new AbortController();
+  const consecutiveErrorLimit = new Error(
+    "Deep Scan reached its consecutive error limit.",
+  );
   const executionSignal = AbortSignal.any([signal, externalStop.signal]);
   const discoverySignal = AbortSignal.any([
     executionSignal,
@@ -339,7 +355,8 @@ export async function runDeepScans(
               signal,
             ),
           );
-          if (result.cost) input.onCost(pass.directory, result.cost);
+          reportCompletedCost(pass.directory, result.cost);
+          executionSignal.throwIfAborted();
           state.consecutiveErrors = 0;
           await save();
           return;
@@ -365,6 +382,8 @@ export async function runDeepScans(
             }
             pass.failed = true;
             state.consecutiveErrors += 1;
+            if (state.consecutiveErrors >= settings.stopAfterConsecutiveErrors)
+              externalStop.abort(consecutiveErrorLimit);
             await save();
             return;
           }
@@ -395,6 +414,8 @@ export async function runDeepScans(
     }
   };
   try {
+    if (state.consecutiveErrors >= settings.stopAfterConsecutiveErrors)
+      throw consecutiveErrorLimit;
     while (state.terminalReason === undefined) {
       executionSignal.throwIfAborted();
       await mergePending();
@@ -406,9 +427,6 @@ export async function runDeepScans(
       ) {
         state.terminalReason = "saturated";
         break;
-      }
-      if (state.consecutiveErrors >= settings.stopAfterConsecutiveErrors) {
-        throw new Error("Deep Scan reached its consecutive error limit.");
       }
       const unfinished = state.passes.filter(
         (pass) =>
@@ -472,6 +490,7 @@ export async function runDeepScans(
       signal.reason instanceof ScanCostLimitExceededError
         ? "capped"
         : executionSignal.aborted &&
+            executionSignal.reason !== consecutiveErrorLimit &&
             !(executionSignal.reason instanceof ScanCostTrackingError) &&
             !(executionSignal.reason instanceof ScanPermissionError)
           ? "canceled"

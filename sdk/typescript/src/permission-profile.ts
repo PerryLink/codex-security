@@ -39,10 +39,9 @@ export function createPermissionCheckedCodex({
       return thread.id;
     },
     async runStreamed(input: string, turnOptions: TurnOptions = {}) {
+      const parentSignal = turnOptions.signal;
       const controller = new AbortController();
-      const signal = turnOptions.signal
-        ? AbortSignal.any([turnOptions.signal, controller.signal])
-        : controller.signal;
+      const signal = controller.signal;
       const turnConfig = {
         ...(options.baseUrl ? { openai_base_url: options.baseUrl } : {}),
         ...(threadOptions.model ? { model: threadOptions.model } : {}),
@@ -96,36 +95,52 @@ export function createPermissionCheckedCodex({
           "Scan permissions could not be verified.",
         );
       }
-      await verifyPermissionProfile({
-        executable: options.codexPathOverride,
-        cwd: threadOptions.workingDirectory ?? process.cwd(),
-        environment,
-        overrides: effectiveOverrides,
-        profileId,
-        expectedProfile,
-        signal,
-      });
+      // The parent signal can outlive this turn and its SDK child.
+      const abort = () => controller.abort(parentSignal?.reason);
+      const detachAbort = () =>
+        parentSignal?.removeEventListener("abort", abort);
+      if (parentSignal?.aborted) abort();
+      else parentSignal?.addEventListener("abort", abort, { once: true });
+      try {
+        await verifyPermissionProfile({
+          executable: options.codexPathOverride,
+          cwd: threadOptions.workingDirectory ?? process.cwd(),
+          environment,
+          overrides: effectiveOverrides,
+          profileId,
+          expectedProfile,
+          signal,
+        });
+      } catch (error) {
+        detachAbort();
+        throw error;
+      }
       return {
         events: (async function* () {
-          const { events } = await thread.runStreamed(input, {
-            ...turnOptions,
-            signal,
-          });
-          for await (const event of events) {
-            const message =
-              event.type === "error"
-                ? event.message
-                : event.type === "item.completed" && event.item.type === "error"
-                  ? event.item.message
-                  : undefined;
-            if (isPermissionFallback(message, profileId)) {
-              const error = new ScanPermissionError(
-                `Codex rejected the required ${profileId} permission profile. The scan was stopped.`,
-              );
-              controller.abort(error);
-              throw error;
+          try {
+            const { events } = await thread.runStreamed(input, {
+              ...turnOptions,
+              signal,
+            });
+            for await (const event of events) {
+              const message =
+                event.type === "error"
+                  ? event.message
+                  : event.type === "item.completed" &&
+                      event.item.type === "error"
+                    ? event.item.message
+                    : undefined;
+              if (isPermissionFallback(message, profileId)) {
+                const error = new ScanPermissionError(
+                  `Codex rejected the required ${profileId} permission profile. The scan was stopped.`,
+                );
+                controller.abort(error);
+                throw error;
+              }
+              yield event;
             }
-            yield event;
+          } finally {
+            detachAbort();
           }
         })(),
       };
