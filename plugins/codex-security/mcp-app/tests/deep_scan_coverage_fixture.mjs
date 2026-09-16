@@ -68,6 +68,12 @@ export async function publishCoverageFixture(root, completeness, { resume = fals
       deferred: pending ? [{ id: "same-id", candidateId: "candidate-1", reason: index === 0 ? "Verify entry boundaries." : "Verify symbolic links.", paths: ["source.py"], surfaceIds: ["shared-surface"] }] : [],
       openQuestions: pending ? [{ question: `Deployment question ${index + 1}.` }] : [],
     };
+    for (const field of ["surfaces", "explicitExclusions", "deferred", "openQuestions"]) {
+      for (const item of coverage[field]) item.provenance = {
+        description: `Original ${field} context.`, details: { evidence: ["source review"] },
+        workerId: "untrusted-worker", attempt: 99, sourceId: "untrusted-source", candidateId: "untrusted-candidate",
+      };
+    }
     await mkdir(path.join(artifactDir, "artifacts"), { recursive: true });
     await writeFile(path.join(artifactDir, "artifacts", "review.md"), "Synthetic review evidence.\n");
     const resultPath = path.join(artifactDir, "result.json");
@@ -78,7 +84,11 @@ export async function publishCoverageFixture(root, completeness, { resume = fals
         coverage: { completeness: status, surfaces: [{ id: "current", label: "Current review", disposition: "no_issue_found", receiptRefs: ["artifacts/review.md"] }], explicitExclusions: [], deferred: [] },
       });
     } else {
-      await writeFile(resultPath, bytes);
+      await recordCodexSecurityWorkerScanDraft({ root: artifactDir, repoRoot: targetPath, layout: "worker", scanId: run.scanId }, JSON.parse(bytes));
+      for (const name of await readdir(path.join(artifactDir, "checkpoints"))) {
+        const checkpointPath = path.join(artifactDir, "checkpoints", name);
+        rawSources.set(checkpointPath, await readFile(checkpointPath, "utf8"));
+      }
     }
     rawSources.set(resultPath, await readFile(resultPath, "utf8"));
   };

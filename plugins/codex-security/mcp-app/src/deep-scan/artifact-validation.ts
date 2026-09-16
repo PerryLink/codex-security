@@ -247,14 +247,20 @@ export function projectDiscoveryCoverage(
   const prefix = `${worker.id}-attempt-${worker.attempt ?? "unknown"}`;
   const surfaces = coverage.surfaces as Record<string, unknown>[];
   const surfaceIds = new Map(surfaces.map((surface, index) => [surface.id, `${prefix}-surface-${index + 1}`]));
-  const project = (item: Record<string, unknown>) => ({
-    ...structuredClone(item),
-    provenance: {
+  const project = (item: Record<string, unknown>) => {
+    const result = structuredClone(item);
+    const descriptions = result.provenance;
+    const projected = typeof descriptions === "object" && descriptions !== null && !Array.isArray(descriptions)
+      ? descriptions as Record<string, unknown> : {};
+    for (const key of ["workerId", "attempt", "sourceId", "candidateId"]) delete projected[key];
+    result.provenance = {
+      ...projected,
       ...provenance,
       ...(item.id === undefined ? {} : { sourceId: item.id }),
       ...(item.candidateId === undefined ? {} : { candidateId: item.candidateId }),
-    },
-  });
+    };
+    return result;
+  };
   return {
     completeness: coverage.completeness,
     reviews: [{ ...provenance, completeness: coverage.completeness }],

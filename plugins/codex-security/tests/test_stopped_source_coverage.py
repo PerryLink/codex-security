@@ -318,9 +318,9 @@ def test_standard_publication_preserves_uninterpreted_coverage_provenance(
     [
         ({"candidateId": ["candidate-1"]}, False),
         ({"workerId": ["worker-1"], "candidateId": "candidate-1"}, False),
-        ({"workerId": "worker-1", "candidateId": "candidate-1"}, True),
+        ({"workerId": "worker-1", "candidateId": "candidate-1"}, False),
     ],
-    ids=["local-candidate", "local-worker", "independent-worker"],
+    ids=["local-candidate", "local-worker", "descriptive-worker"],
 )
 def test_standard_recovery_resolves_local_candidates_with_uninterpreted_provenance(
     workbench_api, workbench_db, publication_scan, provenance, pending
@@ -446,3 +446,137 @@ def test_partial_parent_projection_keeps_only_missing_worker_records(
     )
     assert retained_surface["receiptRefs"] == [receipt.relative_to(scan.scan_dir).as_posix()]
     assert receipt.read_text() == "Retained source review evidence.\n"
+
+
+@pytest.mark.parametrize("retry_publication", [False, True])
+def test_standard_recovery_keeps_distinct_candidate_with_descriptive_provenance(
+    workbench_api, workbench_db, publication_scan, monkeypatch, retry_publication
+):
+    scan = publication_scan(mode="standard")
+    manifest_path = scan.scan_dir / "scan-manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["scan"]["complete"] = False
+    manifest_path.write_text(json.dumps(manifest))
+    scan.coverage["surfaces"][0]["candidateId"] = "candidate-A"
+    (scan.scan_dir / "coverage.json").write_text(json.dumps(scan.coverage))
+    deferred = {
+        "id": "distinct-review",
+        "candidateId": "candidate-B",
+        "reason": "Independent validation remains unresolved.",
+        "provenance": {"candidateId": "candidate-A", "description": "Related earlier review."},
+    }
+    checkpoint = write_checkpoint(
+        scan.scan_dir / "checkpoints",
+        {
+            "scanId": scan.scan_id,
+            "complete": False,
+            "findings": [],
+            "coverage": {
+                "completeness": "partial",
+                "surfaces": [],
+                "explicitExclusions": [],
+                "deferred": [deferred],
+            },
+        },
+    )
+    original = checkpoint.read_bytes()
+    with monkeypatch.context() as interrupted:
+        if retry_publication:
+
+            def fail_publication(*args, **kwargs):
+                raise OSError("Synthetic publication interruption.")
+
+            interrupted.setattr(
+                workbench_api["saved_results"],
+                "_write_prepared_scan_finalization",
+                fail_publication,
+            )
+        stopped = workbench_api["fail_scan"](
+            workbench_db,
+            Namespace(
+                scan_id=scan.scan_id, claim_token=None, cost_json=None, message="Audit stopped."
+            ),
+        )["scan"]
+    assert stopped["resultsRecoveryNeeded"] is retry_publication
+    recovered = workbench_api["recover_scan_results"](
+        workbench_db, Namespace(scan_id=scan.scan_id)
+    )["scan"]
+    assert recovered["resultsRecoveryNeeded"] is False
+    assert recovered["findingCount"] == 1
+    coverage = json.loads((scan.scan_dir / "coverage.json").read_text())
+    assert deferred in coverage["deferred"]
+    assert coverage["completeness"] == "partial"
+    assert checkpoint.read_bytes() == original
+    published = {
+        name: (scan.scan_dir / name).read_bytes()
+        for name in ("scan-manifest.json", "findings.json", "coverage.json", "report.md")
+    }
+    assert deferred["reason"] in published["report.md"].decode()
+    workbench_api["recover_scan_results"](workbench_db, Namespace(scan_id=scan.scan_id))
+    assert all((scan.scan_dir / name).read_bytes() == data for name, data in published.items())
+    assert checkpoint.read_bytes() == original
+
+
+def test_deep_recovery_reconciles_recognized_projected_candidates(
+    workbench_api, workbench_db, publication_scan
+):
+    scan = publication_scan()
+    (scan.scan_dir / "findings.json").write_text(json.dumps({"findings": []}))
+    manifest_path = scan.scan_dir / "scan-manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["scan"]["complete"] = False
+    manifest_path.write_text(json.dumps(manifest))
+    result = add_worker(workbench_db, scan)
+    worker_id = result.parent.name
+    deferred = [
+        {"id": candidate, "candidateId": candidate, "reason": f"Review {candidate}."}
+        for candidate in ("candidate-A", "candidate-B")
+    ]
+    result.write_text(
+        json.dumps(
+            {
+                "scanId": scan.scan_id,
+                "complete": True,
+                "findings": [],
+                "coverage": {**scan.coverage, "completeness": "partial", "deferred": deferred},
+            }
+        )
+    )
+    original = result.read_bytes()
+    (scan.scan_dir / "coverage.json").write_text(
+        json.dumps(
+            {
+                **scan.coverage,
+                "completeness": "partial",
+                "reviews": [{"workerId": worker_id, "attempt": 1, "completeness": "partial"}],
+                "surfaces": [
+                    {
+                        "id": f"{worker_id}-attempt-1-surface-1",
+                        "label": "Resolved review",
+                        "candidateId": f"{worker_id}-attempt-1-candidate-1",
+                        "disposition": "rejected",
+                        "receiptRefs": [],
+                        "provenance": {
+                            "workerId": worker_id,
+                            "attempt": 1,
+                            "candidateId": "candidate-A",
+                        },
+                    }
+                ],
+            }
+        )
+    )
+    workbench_api["fail_scan"](
+        workbench_db,
+        Namespace(scan_id=scan.scan_id, claim_token=None, cost_json=None, message="Audit stopped."),
+    )
+    recovered = workbench_api["recover_scan_results"](
+        workbench_db, Namespace(scan_id=scan.scan_id)
+    )["scan"]
+    assert recovered["resultsRecoveryNeeded"] is False
+    coverage = json.loads((scan.scan_dir / "coverage.json").read_text())
+    pending = [item for item in coverage["deferred"] if item["id"] != "scan-stopped"]
+    assert len(pending) == 1
+    assert pending[0]["provenance"]["candidateId"] == "candidate-B"
+    assert pending[0]["provenance"]["workerId"] == worker_id
+    assert result.read_bytes() == original

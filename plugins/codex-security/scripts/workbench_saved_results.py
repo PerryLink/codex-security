@@ -880,8 +880,12 @@ def merge_saved_results(
         if owner is None and isinstance(provenance, dict):
             source_owner = provenance.get("workerId")
             source_candidate = provenance.get("candidateId", candidate_id)
-            if (source_owner is None or isinstance(source_owner, str)) and isinstance(
-                source_candidate, str
+            if (
+                isinstance(source_owner, str)
+                and source_owner in workers_by_id
+                and isinstance(provenance.get("attempt"), int)
+                and (source_owner, provenance["attempt"]) in reviewed_attempts
+                and isinstance(source_candidate, str)
             ):
                 return source_owner, source_candidate
         if isinstance(candidate_id, str):
