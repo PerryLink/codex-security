@@ -77,10 +77,11 @@ try {
   await testWorkerReasoningSummaries();
   await testWorkerProviderSelection();
   await testIsolatedReconstructedWorkers();
+  await testWorkerCancellation();
+  await testDisallowedWorkerProfileFailsBeforeWorkerLaunch();
   if (process.platform !== "win32") await testNullUsageCompletion();
   if (process.platform !== "win32") {
     await testMissingParentSandboxFailsBeforeWorkerLaunch();
-    await testDisallowedWorkerProfileFailsBeforeWorkerLaunch();
     await testRuntimePermissionProfileFallbackStopsAndDiscards();
     await testWorkerLaunchesWithoutGlobalCodex();
     await testPreflightBindsExecutableAndHomeBeforeChangingCwd();
@@ -93,8 +94,6 @@ try {
     await testSandboxNamespaceDiagnosticIsSanitized();
     await testOwnedArtifactToolFailureDiagnosticIsSanitized();
     await testStreamTerminationWithoutTerminalEventFails();
-    await testCompletedWorkerSettlesWithoutWaitingForProcessExit();
-    await testAbortPropagation();
     await testConfigurationFailureIsNonRetryable();
     await testThreadStartConfigurationFailureIsNonRetryable();
     await testPolicyFailuresAreNonRetryable();
@@ -1298,88 +1297,94 @@ async function testStreamTerminationWithoutTerminalEventFails() {
   }
 }
 
-async function testAbortPropagation() {
+async function testWorkerCancellation() {
   const fixture = await fakeCodexFixture();
   const previousPath = process.env.CODEX_CLI_PATH;
-  process.env.CODEX_CLI_PATH = fixture.executablePath;
-  try {
-    const promptPath = path.join(fixture.root, "prompt.md");
-    const workingDirectory = path.join(fixture.root, "artifacts");
-    await mkdir(workingDirectory);
-    await writeFile(promptPath, "BLOCK_AFTER_START\n");
-    const abortController = new AbortController();
-    const execution = new CodexSdkWorkerExecutor({
-      parentSandbox: trustedParentSandbox
-    }).run({
-      kind: "discovery",
-      promptPath,
-      workingDirectory,
-      subagents: 0,
-      signal: abortController.signal,
-      onThreadStarted: () => abortController.abort("fixture cancellation")
-    });
-    await assert.rejects(execution, (error) => error?.name === "AbortError" || /abort|SIGTERM/i.test(error?.message ?? ""));
-  } finally {
-    restoreEnv("CODEX_CLI_PATH", previousPath);
-  }
-}
-
-async function testCompletedWorkerSettlesWithoutWaitingForProcessExit() {
-  const fixture = await fakeCodexFixture();
-  const previousPath = process.env.CODEX_CLI_PATH;
-  process.env.CODEX_CLI_PATH = fixture.executablePath;
-  const controller = new AbortController();
-  const unexpectedErrors = [];
-  const captureUnexpectedError = (error) => unexpectedErrors.push(error);
-  let execution;
+  const originalSpawn = childProcess.spawn;
+  let worker;
+  let workerSignal;
+  let cancelDuringCleanup;
   let timeout;
-  let childPid;
-
-  process.on("uncaughtException", captureUnexpectedError);
+  childProcess.spawn = (command, args, options) => {
+    const child = originalSpawn(command, command === process.execPath || command === path.toNamespacedPath(process.execPath)
+      ? [fixture.executablePath, ...args] : args, options);
+    if (args[0] === "exec") {
+      assertFlagPair(args, "--thread-source", "security_scan");
+      worker = child;
+      workerSignal = options.signal;
+      const kill = child.kill;
+      child.kill = function (...args) {
+        cancelDuringCleanup?.();
+        return kill.apply(this, args);
+      };
+    }
+    return child;
+  };
+  syncBuiltinESMExports();
+  process.env.CODEX_CLI_PATH = process.execPath;
   try {
     const promptPath = path.join(fixture.root, "prompt.md");
     const workingDirectory = path.join(fixture.root, "artifacts");
     await mkdir(workingDirectory);
-    await writeFile(promptPath, "COMPLETE_THEN_HANG\n");
-    execution = new CodexSdkWorkerExecutor({
-      parentSandbox: trustedParentSandbox
-    }).run({
-      kind: "discovery",
-      promptPath,
-      workingDirectory,
-      subagents: 0,
-      signal: controller.signal
+    const executor = new CodexSdkWorkerExecutor({ parentSandbox: trustedParentSandbox });
+    const run = (controller, onThreadStarted) => executor.run({
+      kind: "discovery", promptPath, workingDirectory, subagents: 0,
+      signal: controller.signal, onThreadStarted
     });
+    const preAborted = new AbortController();
+    const beforeStartup = new Error("coordinator canceled before worker startup");
+    preAborted.abort(beforeStartup);
+    await assert.rejects(run(preAborted), (error) => error === beforeStartup);
+    assert.equal(worker, undefined);
+    await assert.rejects(readFile(fixture.preflightMarkerPath), { code: "ENOENT" });
+    await assert.rejects(readFile(fixture.markerPath), { code: "ENOENT" });
 
-    const result = await Promise.race([
-      execution,
-      new Promise((_, reject) => {
-        timeout = setTimeout(() => {
-          controller.abort("completed worker fixture timed out");
-          reject(new Error("completed worker did not settle after turn.completed"));
-        }, 1_000);
-      })
-    ]);
-    clearTimeout(timeout);
-    assert.equal(result.threadId, "fixture-thread-id");
-    assert.equal(result.finalResponse, "fixture final response");
-    childPid = JSON.parse(await readFile(fixture.markerPath, "utf8")).pid;
-
-    controller.abort("coordinator immediately canceled its remaining workers");
-    await new Promise((resolve) => setTimeout(resolve, 250));
-
-    assert.deepEqual(unexpectedErrors, []);
-    assert.throws(() => process.kill(childPid, 0), { code: "ESRCH" });
+    for (const prompt of ["BLOCK_AFTER_START", "COMPLETE_THEN_HANG", "FAIL_THEN_HANG"]) {
+      await writeFile(promptPath, `${prompt}\n`);
+      const controller = new AbortController();
+      const cancellation = new Error("coordinator canceled its remaining workers");
+      // Exercise cancellation inside the real SDK's iterator cleanup, before kill returns.
+      cancelDuringCleanup = prompt === "COMPLETE_THEN_HANG"
+        ? () => controller.abort(cancellation) : undefined;
+      const deadline = new Promise((_, reject) => {
+        timeout = setTimeout(() => reject(new Error(`${prompt} worker did not settle`)), 10_000);
+      });
+      const execution = Promise.race([
+        run(controller, () => {
+          if (prompt === "BLOCK_AFTER_START") controller.abort(cancellation);
+        }),
+        deadline
+      ]);
+      if (prompt === "BLOCK_AFTER_START") {
+        await assert.rejects(execution, (error) => error?.name === "AbortError" || /abort|SIGTERM/i.test(error?.message ?? ""));
+        assert.equal(workerSignal.aborted, true);
+        assert.equal(workerSignal.reason, cancellation);
+      } else {
+        if (prompt === "FAIL_THEN_HANG") {
+          await assert.rejects(execution, /fixture worker failed/);
+          controller.abort(cancellation);
+        } else {
+          const result = await execution;
+          assert.equal(result.threadId, "fixture-thread-id");
+          assert.equal(result.finalResponse, "fixture final response");
+        }
+        assert.equal(controller.signal.aborted, true);
+        assert.equal(workerSignal.aborted, false);
+      }
+      assert.notEqual(workerSignal, controller.signal);
+      assert.equal(worker.killed, true);
+      if (worker.exitCode === null && worker.signalCode === null) {
+        await Promise.race([new Promise((resolve) => worker.once("close", resolve)), deadline]);
+      }
+      clearTimeout(timeout);
+      cancelDuringCleanup = undefined;
+    }
   } finally {
     clearTimeout(timeout);
-    if (!controller.signal.aborted) controller.abort("completed worker fixture cleanup");
-    await execution?.catch(() => {});
-    if (childPid) {
-      try {
-        process.kill(childPid, "SIGKILL");
-      } catch {}
-    }
-    process.removeListener("uncaughtException", captureUnexpectedError);
+    cancelDuringCleanup = undefined;
+    if (worker && worker.exitCode === null && worker.signalCode === null) worker.kill("SIGKILL");
+    childProcess.spawn = originalSpawn;
+    syncBuiltinESMExports();
     restoreEnv("CODEX_CLI_PATH", previousPath);
   }
 }
@@ -1580,7 +1585,15 @@ async function testMissingParentSandboxFailsBeforeWorkerLaunch() {
 async function testDisallowedWorkerProfileFailsBeforeWorkerLaunch() {
   const fixture = await fakeCodexFixture(emptyWorkerPermissionProfile, false);
   const previousPath = process.env.CODEX_CLI_PATH;
-  process.env.CODEX_CLI_PATH = fixture.executablePath;
+  const originalSpawn = childProcess.spawn;
+  childProcess.spawn = (command, args, options) => originalSpawn(
+    command,
+    command === process.execPath || command === path.toNamespacedPath(process.execPath)
+      ? [fixture.executablePath, ...args] : args,
+    options
+  );
+  syncBuiltinESMExports();
+  process.env.CODEX_CLI_PATH = process.execPath;
   try {
     const promptPath = path.join(fixture.root, "prompt.md");
     const workingDirectory = path.join(fixture.root, "artifacts");
@@ -1613,6 +1626,8 @@ async function testDisallowedWorkerProfileFailsBeforeWorkerLaunch() {
       (error) => error?.code === "ENOENT"
     );
   } finally {
+    childProcess.spawn = originalSpawn;
+    syncBuiltinESMExports();
     restoreEnv("CODEX_CLI_PATH", previousPath);
   }
 }
@@ -1714,8 +1729,7 @@ async function fakeCodexFixture(
     "for await (const chunk of process.stdin) stdin += chunk;",
     "const openaiAuthentication = stdin.includes('CAPTURE_SYNTHETIC_OPENAI_AUTH') ? { OPENAI_API_KEY: process.env.OPENAI_API_KEY, CODEX_API_KEY: process.env.CODEX_API_KEY } : undefined;",
     "const bedrockAuthentication = stdin.includes('CAPTURE_SYNTHETIC_BEDROCK_AUTH') ? Object.fromEntries(JSON.parse(process.env.FAKE_CODEX_BEDROCK_ENV_KEYS).map((name) => [name, process.env[name]])) : undefined;",
-    "writeFileSync(process.env.FAKE_CODEX_MARKER, JSON.stringify({ executable: process.execPath, argv: process.argv.slice(2), stdin, cwd: process.cwd(), codexHome: process.env.CODEX_HOME, configPath: process.env.CODEX_SECURITY_CONFIG_PATH, scanValue: process.env.FAKE_CODEX_SCAN_VALUE, deepConfigPath: process.env.CODEX_SECURITY_DEEP_SCAN_CONFIG_PATH, originator: process.env.CODEX_INTERNAL_ORIGINATOR_OVERRIDE, ...(stdin.includes('COMPLETE_THEN_HANG') ? { pid: process.pid } : {}), ...(openaiAuthentication ? { openaiAuthentication } : {}), ...(bedrockAuthentication ? { bedrockAuthentication } : {}) }));",
-    "if (stdin.includes('COMPLETE_THEN_HANG')) process.on('SIGTERM', () => setTimeout(() => process.exit(0), 100));",
+    "writeFileSync(process.env.FAKE_CODEX_MARKER, JSON.stringify({ executable: process.execPath, argv: process.argv.slice(2), stdin, cwd: process.cwd(), codexHome: process.env.CODEX_HOME, configPath: process.env.CODEX_SECURITY_CONFIG_PATH, scanValue: process.env.FAKE_CODEX_SCAN_VALUE, deepConfigPath: process.env.CODEX_SECURITY_DEEP_SCAN_CONFIG_PATH, originator: process.env.CODEX_INTERNAL_ORIGINATOR_OVERRIDE, ...(openaiAuthentication ? { openaiAuthentication } : {}), ...(bedrockAuthentication ? { bedrockAuthentication } : {}) }));",
     "if (stdin.includes('THREAD_START_CONFIG_ERROR')) { console.error('Error: thread/start: thread/start failed: agents.max_threads cannot be set when features.multi_agent_v2 is enabled (code -32600)'); process.exit(1); }",
     "if (stdin.includes('CONFIG_ERROR')) { console.error('failed to load configuration: invalid value'); process.exit(2); }",
     "if (stdin.includes('MCP_STARTUP_TIMEOUT') || stdin.includes('CATALOG_AUTH_ONLY') || stdin.includes('SYNC_AUTH_ONLY')) {",
@@ -1738,7 +1752,8 @@ async function fakeCodexFixture(
     "const permissionProfileFallbackWarning = 'Configured value for `permission_profile` is disallowed by requirements; falling back from `codex_security_deep_scan_worker` to required value `:read-only`.';",
     "if (stdin.includes('PERMISSION_PROFILE_FALLBACK_ITEM')) console.log(JSON.stringify({ type: 'item.completed', item: { id: 'warning-1', type: 'error', message: permissionProfileFallbackWarning } }));",
     "if (stdin.includes('PERMISSION_PROFILE_FALLBACK_EVENT')) console.log(JSON.stringify({ type: 'error', message: permissionProfileFallbackWarning }));",
-    "if (stdin.includes('BLOCK_AFTER_START')) await new Promise(() => {});",
+    "if (stdin.includes('BLOCK_AFTER_START')) { setInterval(() => {}, 1_000); await new Promise(() => {}); }",
+    "if (stdin.includes('FAIL_THEN_HANG')) { console.log(JSON.stringify({ type: 'turn.failed', error: { message: 'fixture worker failed' } })); setInterval(() => {}, 1_000); await new Promise(() => {}); }",
     "if (stdin.includes('RATE_LIMIT_CYBER_POLICY_ERROR')) { console.log(JSON.stringify({ type: 'turn.failed', error: { message: '429 Too Many Requests: Request blocked by cyberPolicy.' } })); process.exit(0); }",
     "if (stdin.includes('CYBER_POLICY_ERROR')) { console.log(JSON.stringify({ type: 'turn.failed', error: { message: 'Request blocked by cyberPolicy.' } })); process.exit(0); }",
     "if (stdin.includes('SAFETY_POLICY_ERROR')) { console.log(JSON.stringify({ type: 'turn.failed', error: { message: 'Request blocked by a safety policy violation.' } })); process.exit(0); }",
