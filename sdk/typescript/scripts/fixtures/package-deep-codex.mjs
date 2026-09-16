@@ -18,7 +18,7 @@ try {
 async function trace(event) {
   await appendFile(
     process.env.PACKAGE_DEEP_TRACE,
-    `${JSON.stringify(event)}\n`,
+    `${JSON.stringify({ ...event, python: process.env.PYTHON })}\n`,
   );
 }
 
