@@ -1200,7 +1200,7 @@ def migrate_legacy_scan(db: Any, connection: Any, scan: Any) -> Any:
         binding,
         accepted,
         warnings,
-        stopped=True,
+        stopped=run["status"] != "succeeded",
         reason="Saved Deep Scan execution migrated to ordinary scans.",
     )
     aggregate = {
@@ -1336,6 +1336,15 @@ def _stopped_child_draft(db: Any, child: Any, scan_dir: Path) -> dict[str, Any] 
             draft_documents=documents,
         )
     db.verify_manifest_binding(child, manifest)
+    findings["findings"] = [
+        finding
+        for finding in findings["findings"]
+        if any(
+            path_within_scope(location["path"], scope)
+            for location in finding["locations"]
+            for scope in manifest["scan"]["scope"]["includePaths"]
+        )
+    ]
     prefix = child_dir.relative_to(scan_dir).as_posix()
     for index, finding in enumerate(findings["findings"]):
         original = copy.deepcopy(finding)

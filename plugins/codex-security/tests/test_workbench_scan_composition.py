@@ -977,6 +977,7 @@ def test_native_cancel_retains_accepted_and_later_unmerged_findings(
     ("terminal_reason", "child_state"),
     [
         ("capped", "failed"),
+        ("capped", "canonical"),
         ("capped", "checkpoint"),
         ("capped", "coverage"),
         ("saturated", "checkpoint"),
@@ -1007,6 +1008,16 @@ def test_terminal_scoped_parent_preserves_unmerged_child_results(
             inventory_strategy="scoped_path",
         )
         findings = json.loads((directory / "findings.json").read_text())["findings"]
+        outside = copy.deepcopy(findings[0])
+        outside["identity"]["anchor"] = f"outside-{index}"
+        outside["locations"][0]["path"] = "outside.py"
+        outside["writeup"] = {"reportPath": "findings/outside/outside.md"}
+        report = directory / "findings/outside/outside.md"
+        report.parent.mkdir(parents=True)
+        report.write_text("# Outside the selected scope\n")
+        findings[0]["locations"].insert(0, copy.deepcopy(outside["locations"][0]))
+        findings.insert(0, outside)
+        (directory / "findings.json").write_text(json.dumps({"findings": findings}))
         coverage = json.loads((directory / "coverage.json").read_text())
         (directory / "artifacts").mkdir()
         (directory / "artifacts/receipt.json").write_text(json.dumps({"pass": index}))
@@ -1027,6 +1038,16 @@ def test_terminal_scoped_parent_preserves_unmerged_child_results(
         (directory / "coverage.json").write_text(json.dumps(coverage))
         if index == 1:
             run_workbench(state, "complete-scan", "--scan-id", child["scanId"])
+        elif child_state == "canonical":
+            run_workbench(
+                state,
+                "fail-scan",
+                "--scan-id",
+                child["scanId"],
+                "--defer-publication",
+                "--message",
+                "Discovery deadline reached.",
+            )
         else:
             if child_state != "coverage":
                 write_checkpoint(
@@ -1057,7 +1078,7 @@ def test_terminal_scoped_parent_preserves_unmerged_child_results(
         }
         children.append((child, directory, protected))
     first, first_dir, _ = children[0]
-    original = json.loads((first_dir / "findings.json").read_text())["findings"][0]
+    original = json.loads((first_dir / "findings.json").read_text())["findings"][1]
     accepted = copy.deepcopy(original)
     accepted["provenance"]["sourceFindingIds"] = [f"{first['scanId']}:0"]
     accepted["provenance"]["sourceFindings"] = [{"id": f"{first['scanId']}:0", "finding": original}]
@@ -1153,10 +1174,21 @@ def test_terminal_scoped_parent_preserves_unmerged_child_results(
                 item for item in findings if item["provenance"]["sourceFindingIds"] == [source_id]
             )
             source = finding["provenance"]["sourceFindings"][0]
-            assert (
-                source["finding"]
-                == json.loads((directory / "findings.json").read_text())["findings"][0]
+            original = next(
+                item
+                for item in json.loads((directory / "findings.json").read_text())["findings"]
+                if item["identity"]["anchor"] == f"independent-{index}"
             )
+            if index == 2 and child_state == "canonical":
+                for key in original:
+                    assert source["finding"][key] == original[key]
+            else:
+                assert source["finding"] == original
+            assert [location["path"] for location in finding["locations"]] == [
+                "outside.py",
+                "src/app.py",
+            ]
+        assert not (parent_dir / f"findings/{child['scanId']}-outside").exists()
         if index == 1 and has_aggregate:
             assert finding["findingId"] == accepted["findingId"]
             assert finding["identity"] == accepted["identity"]

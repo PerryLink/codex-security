@@ -12,7 +12,11 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
-import { runDeepScans, ScanCostTrackingError } from "./deep-scan.js";
+import {
+  runDeepScans,
+  ScanCostTrackingError,
+  type DeepScanCheckpoint,
+} from "./deep-scan.js";
 import {
   acquireScanExecution,
   ScanTransportClosedError,
@@ -1522,6 +1526,16 @@ export class CodexSecurity {
         throwIfAborted(signal, scanDir);
         return snapshot;
       };
+      const historicalCost = async (threadId: string) => {
+        const historical = new ScanCostTracker({
+          codexHome: runtime.codexHome,
+          model,
+          repository: repo,
+          scanDirectory: scanDir,
+        });
+        historical.start(threadId);
+        return (await stopTracking(historical)).cost;
+      };
       const reportCost = (cost: Readonly<ScanCost>): void => {
         latestCost = cost;
         notifyObserver(
@@ -1923,14 +1937,7 @@ export class CodexSecurity {
           }
         }
         if (mode === "deep" && checkpoint == null) {
-          const historical = new ScanCostTracker({
-            codexHome: runtime.codexHome,
-            model,
-            repository: repo,
-            scanDirectory: scanDir,
-          });
-          historical.start(sealedThreadId);
-          completionCost = (await stopTracking(historical)).cost;
+          completionCost = await historicalCost(sealedThreadId);
         }
         completionCost ??=
           (savedScan["cost"] as unknown as ScanCost | undefined) ?? null;
@@ -1946,6 +1953,29 @@ export class CodexSecurity {
             scanDir,
           );
       } else {
+        if (
+          mode === "deep" &&
+          options.maxCostUsd !== undefined &&
+          (options.resumeScanId !== undefined ||
+            options.registeredScan !== undefined)
+        ) {
+          const saved = await workbench(workbenchOptions, [
+            "get-scan",
+            "--scan-id",
+            scanId,
+          ]);
+          const checkpoint = saved["compositionCheckpoint"] as
+            DeepScanCheckpoint | null | undefined;
+          if (
+            checkpoint?.legacy &&
+            !checkpoint.legacy.cost &&
+            (!checkpoint.legacy.originThreadId ||
+              !(await historicalCost(checkpoint.legacy.originThreadId)))
+          )
+            throw new CodexSecurityError(
+              "Restore the original Deep Scan session logs to verify its saved cost limit.",
+            );
+        }
         activeScan = { id: scanId, options: workbenchOptions };
       }
       await options.onRegisteredScan?.(registration);
@@ -2446,16 +2476,7 @@ export class CodexSecurity {
                   onWarning: options.onWarning,
                   onObserverError: options.onObserverError,
                 },
-                historicalCost: async (threadId) => {
-                  const historical = new ScanCostTracker({
-                    codexHome: runtime.codexHome,
-                    model,
-                    repository: repo,
-                    scanDirectory: scanDir,
-                  });
-                  historical.start(threadId);
-                  return (await stopTracking(historical)).cost;
-                },
+                historicalCost,
                 onCost: (key, cost) => {
                   passCosts.set(key, cost);
                   if (cost === null) return;

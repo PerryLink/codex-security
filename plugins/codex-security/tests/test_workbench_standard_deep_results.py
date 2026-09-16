@@ -1771,6 +1771,59 @@ def test_independent_worker_candidate_ids_do_not_share_rejection(tmp_path: Path)
     assert "previousFindings" not in rejected
 
 
+@pytest.mark.parametrize(
+    ("completeness", "unreadable_checkpoint"),
+    [("complete", False), ("partial", False), ("complete", True)],
+    ids=["complete", "partial", "checkpoint-warning"],
+)
+def test_succeeded_legacy_resume_preserves_parent_coverage(
+    tmp_path: Path, completeness: str, unreadable_checkpoint: bool
+) -> None:
+    state, _, target, scan_dir, scan_id = deep_scan_fixture(tmp_path)
+    write_completed_contract(
+        scan_dir, scan_id, target, relative_path="app.py", coverage_mode="deep_repository"
+    )
+    original = json.loads((scan_dir / "findings.json").read_text())["findings"][0]
+    coverage_path = scan_dir / "coverage.json"
+    coverage = json.loads(coverage_path.read_text())
+    coverage["completeness"] = completeness
+    if completeness == "partial":
+        coverage["deferred"] = [
+            {"id": "pending-review", "reason": "A synthetic surface remains unreviewed."}
+        ]
+    coverage_path.write_text(json.dumps(coverage))
+    if unreadable_checkpoint:
+        checkpoints = scan_dir / "checkpoints"
+        checkpoints.mkdir()
+        (checkpoints / ("0" * 64 + ".json")).write_text("{incomplete")
+    with sqlite3.connect(state / "workbench.sqlite3") as connection:
+        connection.execute(
+            "UPDATE deep_scan_runs SET status = 'succeeded', phase = 'terminal', "
+            "terminal_reason = 'saturated', manifest_path = ?, completed_at = updated_at "
+            "WHERE scan_id = ?",
+            (str(scan_dir / "scan-manifest.json"), scan_id),
+        )
+
+    run_workbench(state, "get-cli-scan-resume", "--migrate", "--scan-id", scan_id)
+
+    checkpoint = json.loads((scan_dir / "artifacts/deep-scan/checkpoint.json").read_text())
+    assert checkpoint["terminalReason"] == "saturated"
+    retained = checkpoint["aggregate"]["findings"]
+    assert len(retained) == 1
+    assert retained[0]["identity"] == original["identity"]
+    assert retained[0]["locations"] == original["locations"]
+    migrated = checkpoint["aggregate"]["coverage"]
+    assert migrated == checkpoint["legacy"]["coverage"]
+    assert migrated["completeness"] == ("partial" if unreadable_checkpoint else completeness)
+    assert not any(item.get("id") == "scan-stopped" for item in migrated["deferred"])
+    for item in coverage["deferred"]:
+        assert item in migrated["deferred"]
+    if unreadable_checkpoint:
+        assert any(
+            "Preserved unreadable checkpoint" in item["reason"] for item in migrated["deferred"]
+        )
+
+
 def test_legacy_resume_imports_accepted_progress_once(tmp_path: Path) -> None:
     state, codex_home, target, scan_dir, scan_id = deep_scan_fixture(tmp_path)
     worker_id, result = accepted_standard_worker(state, codex_home, scan_dir, scan_id)

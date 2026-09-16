@@ -668,9 +668,13 @@ test.each([
   },
 );
 
-test.each([false, true])(
-  "completed legacy discovery recovers partial results when its saved budget is exhausted (sealed: %p)",
-  async (sealed) => {
+test.each([
+  [false, false],
+  [true, false],
+  [false, true],
+])(
+  "completed legacy discovery recovers partial results when its saved budget is exhausted (sealed: %p, restore logs: %p)",
+  async (sealed, restoreLogs) => {
     const f = await interruptedScan(
       "deep",
       false,
@@ -715,7 +719,12 @@ test.each([false, true])(
       noNewStreak: 0,
       consecutiveErrors: 0,
       terminalReason: "capped",
-      legacy: { discoveryRuns: 1, coverage, originThreadId: f.threadId, cost },
+      legacy: {
+        discoveryRuns: 1,
+        coverage,
+        originThreadId: f.threadId,
+        ...(restoreLogs ? {} : { cost }),
+      },
     };
     await f.command(
       [
@@ -748,27 +757,55 @@ test.each([false, true])(
           artifactNames.map((name) => readFile(join(f.scanDir, name))),
         )
       : undefined;
+    let starts = 0;
     let turns = 0;
     const client = resumeClient(f, () => ({
-      startThread: () => ({
-        id: null,
-        async runStreamed() {
-          turns++;
-          throw new Error("Completed legacy discovery needs no model turn.");
-        },
-      }),
+      startThread() {
+        starts++;
+        return {
+          id: null,
+          async runStreamed() {
+            turns++;
+            throw new Error("Completed legacy discovery needs no model turn.");
+          },
+        };
+      },
       resumeThread() {
         throw new Error("The retired coordinator must not resume.");
       },
     }))({ codexOverrides: f.recipe.config });
+    const options: ScanOptions = {
+      mode: "deep",
+      outputDir: f.scanDir,
+      resumeScanId: f.scanId,
+      maxCostUsd: 0.001,
+      ...f.recipe.deepScan,
+    };
     try {
-      const result = await client.run(f.repository, {
-        mode: "deep",
-        outputDir: f.scanDir,
-        resumeScanId: f.scanId,
-        maxCostUsd: 0.001,
-        ...f.recipe.deepScan,
-      });
+      if (restoreLogs) {
+        const savedSession = await readFile(f.sessionPath);
+        const checkpointPath = join(f.scanDir, DEEP_SCAN_CHECKPOINT);
+        const savedCheckpoint = await readFile(checkpointPath);
+        const before = await f.command(["get-scan", "--scan-id", f.scanId]);
+        await rm(f.sessionPath);
+        try {
+          await expect(client.run(f.repository, options)).rejects.toThrow(
+            "Restore the original Deep Scan session logs",
+          );
+          expect(starts).toBe(0);
+          expect(turns).toBe(0);
+          expect(before["scan"]).toMatchObject({
+            progress: { status: "running" },
+          });
+          expect(await f.command(["get-scan", "--scan-id", f.scanId])).toEqual(
+            before,
+          );
+          expect(await readFile(checkpointPath)).toEqual(savedCheckpoint);
+        } finally {
+          await writeFile(f.sessionPath, savedSession);
+        }
+      }
+      const result = await client.run(f.repository, options);
       expect(result.manifest.scan.id).toBe(f.scanId);
       expect(result.manifest.scan.sealedAt).toBeString();
       expect(result.threadId).toBe(f.threadId);
