@@ -5,6 +5,7 @@ import type * as z from "zod/v4";
 import commonSchema from "../../schemas/definitions/artifact-common.schema.json";
 import scanDraftDocument from "../../schemas/tools/scan-draft.schema.json";
 import scanManifestDocument from "../../schemas/scan-manifest.schema.json";
+import coverageDocument from "../../schemas/coverage.schema.json";
 import type { ArtifactContext } from "./artifact-context.js";
 import type { RunArtifactWorkbench } from "./artifact-context.js";
 import {
@@ -63,13 +64,20 @@ export const scanDraftInputSchema = loadArtifactZodSchema(
   "scanDraftInput",
 ) as z.ZodType<ScanDraftInput>;
 
-// Sealed documents retain the existing public ID contract; live drafts require UUIDs.
+// Canonical documents retain their public IDs; live drafts use UUIDs and slugs.
 const canonicalScanDraftInputSchema = loadArtifactZodSchema(
   [commonSchema, {
     ...scanDraftDocument,
     $defs: {
       ...scanDraftDocument.$defs,
       scanId: scanManifestDocument.properties.scan.properties.id,
+      surface: {
+        ...scanDraftDocument.$defs.surface,
+        properties: {
+          ...scanDraftDocument.$defs.surface.properties,
+          id: coverageDocument.properties.surfaces.items.properties.id,
+        },
+      },
     },
   }] as SchemaDocument[],
   scanDraftDocument.$id,

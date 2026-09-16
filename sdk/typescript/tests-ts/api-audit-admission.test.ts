@@ -36,6 +36,8 @@ await writeFile(bundlePath, bundle.outputFiles[0]!.contents);
 const {
   createDeepScanArtifacts,
   recordCodexSecurityScanDraft,
+  parseCanonicalScanDraft,
+  parseScanDraft,
   readDiscoveryAuditDraft,
   DeepScanWorkerRunner,
 } = await import(pathToFileURL(bundlePath).href);
@@ -198,7 +200,6 @@ for (const scenario of cases) {
       writeFile(join(standardRoot, "coverage.json"), JSON.stringify(coverage)),
     ]);
     const standard = await observeStandardAdmission(
-      root,
       repository,
       standardRoot,
       scanId,
@@ -257,7 +258,6 @@ for (const scenario of cases) {
     if (scenario.accepted) {
       expect(standard.error).toBe(standard.finalization);
       expect(standard.finalizations).toBe(1);
-      expect(standard.drafts).toHaveLength(1);
       expect(deepResult.status).toBe("succeeded");
       expect(acceptedPaths).toEqual([deepResult.worker.resultPath]);
       const deepDraft: ScanDraftInput = await readDiscoveryAuditDraft(
@@ -265,10 +265,18 @@ for (const scenario of cases) {
         deepResult.worker.resultPath,
         scanId,
       );
-      expect(standard.drafts[0]!.findings).toEqual(deepDraft.findings);
-      expect(standard.drafts[0]!.coverage).toEqual(deepDraft.coverage);
-      expect(standard.drafts[0]!.scope).toEqual(deepDraft.scope);
-      expect(standard.drafts[0]!.threatModel).toEqual(deepDraft.threatModel);
+      const canonicalDraft = parseCanonicalScanDraft({
+        scanId,
+        manifest: JSON.parse(
+          await readFile(join(standardRoot, "scan-manifest.json"), "utf8"),
+        ),
+        findings,
+        coverage,
+      });
+      expect(deepDraft.findings).toEqual(canonicalDraft.findings);
+      expect(deepDraft.coverage).toEqual(canonicalDraft.coverage);
+      expect(deepDraft.scope).toEqual(canonicalDraft.scope);
+      expect(deepDraft.threatModel).toEqual(canonicalDraft.threatModel);
       if (scenario.mutation === "legacy-details") {
         expect(deepDraft.findings[0]!["validation"]).toEqual({
           limitations: ["Legacy persisted limitation."],
@@ -281,7 +289,6 @@ for (const scenario of cases) {
       expect(deepResult.status).toBe("failed");
       expect(acceptedPaths).toHaveLength(0);
     }
-    expect(standard.calls).toBe(1);
     const manifest = JSON.parse(
       await readFile(join(standardRoot, "scan-manifest.json"), "utf8"),
     );
@@ -298,41 +305,56 @@ test("Standard admission preserves existing canonical scan IDs", async () => {
   const manifest = JSON.parse(
     await readFile(join(scanDir, "scan-manifest.json"), "utf8"),
   );
-  const standard = await observeStandardAdmission(root, repository, scanDir);
+  const standard = await observeStandardAdmission(repository, scanDir);
   expect(manifest.scan.id).toBe("scan_example_001");
   expect(standard.error).toBe(standard.finalization);
   expect(standard.finalizations).toBe(1);
-  expect(standard.drafts).toHaveLength(1);
-  expect(standard.calls).toBe(1);
-  expect(standard.drafts[0]!.scanId).toBe(manifest.scan.id);
 });
 
+test.each(["HTTP API", "ArchiveSurface", "", 17])(
+  "canonical coverage ID %j follows the canonical contract",
+  async (id) => {
+    const root = await temporaryDirectory();
+    const repository = join(root, "repository");
+    await mkdir(repository);
+    const scanDir = await copyCompletedScan(root);
+    const [manifest, findings, coverage] = await Promise.all(
+      ["scan-manifest.json", "findings.json", "coverage.json"].map(
+        async (name) => JSON.parse(await readFile(join(scanDir, name), "utf8")),
+      ),
+    );
+    coverage.surfaces[0].id = id;
+    await writeFile(join(scanDir, "coverage.json"), JSON.stringify(coverage));
+    const canonical = {
+      scanId: manifest.scan.id,
+      manifest,
+      findings,
+      coverage,
+    };
+    const standard = await observeStandardAdmission(repository, scanDir);
+    if (typeof id === "string" && id.length > 0) {
+      const draft = parseCanonicalScanDraft(canonical);
+      expect(draft.coverage.surfaces[0].id).toBe(id);
+      expect(standard.error).toBe(standard.finalization);
+      expect(standard.finalizations).toBe(1);
+      expect(() => parseScanDraft({ ...draft, scanId })).toThrow();
+      const live = structuredClone(draft);
+      for (const surface of live.coverage.surfaces) surface.id = "http-api";
+      expect(() => parseScanDraft({ ...live, scanId })).not.toThrow();
+    } else {
+      expect(() => parseCanonicalScanDraft(canonical)).toThrow();
+      expect(standard.error).toBeInstanceOf(Error);
+      expect(standard.error).not.toBe(standard.finalization);
+      expect(standard.finalizations).toBe(0);
+    }
+  },
+);
+
 async function observeStandardAdmission(
-  root: string,
   repository: string,
   scanDir: string,
   scanId?: string,
 ) {
-  const pluginRoot = join(root, "observed-plugin");
-  const helperPath = join(pluginRoot, "mcp", "helpers.mjs");
-  await mkdir(join(pluginRoot, "mcp"), { recursive: true });
-  // The bundled exports are immutable getters. Observe the real parser through
-  // a local delegator instead of mocking its module or copying its semantics.
-  await writeFile(
-    helperPath,
-    `import helpers from ${JSON.stringify(pathToFileURL(join(PLUGIN_ROOT, "mcp", "helpers.mjs")).href)};
-export const drafts = [];
-export let calls = 0;
-export default { ...helpers, parseCanonicalScanDraft(input) {
-  calls++;
-  const draft = helpers.parseCanonicalScanDraft(input);
-  drafts.push(draft);
-  return draft;
-} };`,
-  );
-  const observed: { drafts: ScanDraftInput[]; calls: number } = await import(
-    pathToFileURL(helperPath).href
-  );
   const finalization = new Error("The enclosing finalizer owns the next step.");
   let finalizations = 0;
   const error = await runScanEvents({
@@ -346,7 +368,7 @@ export default { ...helpers, parseCanonicalScanDraft(input) {
     events: completedEvents("standard-thread"),
     signal: new AbortController().signal,
     scanDir,
-    pluginRoot,
+    pluginRoot: PLUGIN_ROOT,
     expectation: {
       repository,
       repositoryRevision: null,
@@ -363,8 +385,6 @@ export default { ...helpers, parseCanonicalScanDraft(input) {
     error,
     finalization,
     finalizations,
-    drafts: observed.drafts,
-    calls: observed.calls,
   };
 }
 

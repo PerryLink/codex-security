@@ -3747,9 +3747,10 @@ export async function runScanEvents(
             ),
         ),
       );
+      // Admission uses the SDK parser even when executing an older plugin.
       const helper = (
         await import(
-          pathToFileURL(join(options.pluginRoot, "mcp/helpers.mjs")).href
+          pathToFileURL(join(await bundledPluginRoot(), "mcp/helpers.mjs")).href
         )
       ).default;
       return helper.parseCanonicalScanDraft({
