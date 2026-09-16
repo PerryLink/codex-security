@@ -1184,7 +1184,7 @@ function compareCompletionSequence(left: AcceptedDiscovery, right: AcceptedDisco
 }
 
 function workerLabelSequence(worker: PersistedDeepScanWorker, kind: "discovery" | "dedup"): number {
-  const match = worker.promptPath.match(new RegExp(`${kind}-(\\d+)`));
+  const match = basename(dirname(worker.promptPath)).match(new RegExp(`${kind}-(\\d+)`));
   return match ? Number(match[1]) : 0;
 }
 

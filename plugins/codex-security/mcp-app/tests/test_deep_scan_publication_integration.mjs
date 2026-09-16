@@ -88,14 +88,18 @@ test("public partial drafts retain checkpoints after coordinator adoption", asyn
   assert.deepEqual(await readdir(path.join(run.scanDir, "drafts")), []);
 });
 
-for (const [label, offsets, ids] of [
+for (const [label, offsets, ids, paths, recoveryOnly] of [
   ["increasing timestamps", [1, 2], [highId, lowId]],
   ["equal timestamps and descending UUIDs", [1, 1], [highId, lowId]],
   ["decreasing timestamps", [2, 1], [lowId, highId]],
   ["equal timestamps and ascending UUIDs", [1, 1], [lowId, highId]],
+  ["scan root collision, live publication", [1, 1], [highId, lowId], { scanRoot: "dedup-123/scans" }],
+  ["scan root collision, recovery", [1, 1], [highId, lowId], { scanRoot: "dedup-123/scans" }, true],
+  ["target name collision, live publication", [1, 1], [highId, lowId], { target: "dedup-456-target" }],
+  ["target name collision, recovery", [1, 1], [highId, lowId], { target: "dedup-456-target" }, true],
 ]) {
   test(`selected reducer survives recovery and public completion: ${label}`, async (t) => {
-    const fixture = await createFixture(t);
+    const fixture = await createFixture(t, paths);
     const { run, store, call, runWorkbench, instant } = fixture;
     assertSuccess(await call("record_codex_security_scan_draft", partial(run, "parent-checkpoint-only")));
     const parentCheckpoints = await checkpoints(run);
@@ -115,11 +119,13 @@ for (const [label, offsets, ids] of [
       }, runWorkbench, undefined, { coordinatorGeneration, resultPath: results[index] })
     );
 
-    await publish(1);
-    const selected = await snapshot(run);
-    await assert.rejects(publish(0), /superseded publication selection/);
-    await assert.rejects(publish(1, 1), /newer generation/);
-    assert.deepEqual(await snapshot(run), selected);
+    if (!recoveryOnly) {
+      await publish(1);
+      const selected = await snapshot(run);
+      await assert.rejects(publish(0), /superseded publication selection/);
+      await assert.rejects(publish(1, 1), /newer generation/);
+      assert.deepEqual(await snapshot(run), selected);
+    }
 
     const publications = [];
     const coordinator = new DeepScanCoordinator({
@@ -159,21 +165,21 @@ for (const [label, offsets, ids] of [
   });
 }
 
-async function createFixture(t) {
+async function createFixture(t, paths = {}) {
   const root = await mkdtemp(path.join(tmpdir(), "deep-publication-"));
   let client;
   t.after(async () => {
     await client?.close();
     await rm(root, { recursive: true, force: true });
   });
-  const targetPath = path.join(root, "target");
+  const targetPath = path.join(root, paths.target ?? "target");
   await mkdir(targetPath);
   await writeFile(path.join(targetPath, "fixture.py"), "# Synthetic publication fixture\n");
   const environment = {
     ...process.env,
     CODEX_HOME: path.join(root, "home"),
     CODEX_SECURITY_STATE_DIR: path.join(root, "state"),
-    CODEX_SECURITY_SCAN_ROOT: path.join(root, "scans"),
+    CODEX_SECURITY_SCAN_ROOT: path.join(root, paths.scanRoot ?? "scans"),
   };
   delete environment.CODEX_SECURITY_DEEP_SCAN_CONFIG_PATH;
   const instant = new Date().toISOString();
