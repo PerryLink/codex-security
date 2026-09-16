@@ -6,11 +6,12 @@ import {
   readFile,
   realpath,
   rm,
+  symlink,
   writeFile,
 } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, sep } from "node:path";
 import { test } from "node:test";
 import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
@@ -224,12 +225,13 @@ test("native cancellation drains only its parent; shutdown drains the rest", asy
   assert.deepEqual(closed, ["first", "second"]);
 });
 
-test("native scans resolve empty and unset Codex homes consistently", async () => {
+test("native scans preserve selected Codex homes and saved settings", async () => {
   const root = await realpath(
     await mkdtemp(join(tmpdir(), "native-codex-home-")),
   );
   const defaultHome = join(root, ".codex");
   const explicitHome = join(root, "explicit");
+  const spacedHome = join(root, "explicit ");
   const pluginRoot = join(root, "plugin");
   const keys = [
     "HOME",
@@ -253,10 +255,14 @@ test("native scans resolve empty and unset Codex homes consistently", async () =
       join(pluginRoot, ".codex-plugin/plugin.json"),
       JSON.stringify({ name: "codex-security", version: "0.0.0" }),
     );
-    for (const [home, model, workers] of [
+    const homes = [
       [defaultHome, "synthetic-default", 2],
       [explicitHome, "synthetic-explicit", 4],
-    ]) {
+      ...(process.platform === "win32"
+        ? []
+        : [[spacedHome, "synthetic-spaced", 3]]),
+    ];
+    for (const [home, model, workers] of homes) {
       await mkdir(join(home, "codex-security"), { recursive: true });
       await writeFile(join(home, "config.toml"), `model = "${model}"\n`);
       await writeFile(
@@ -264,28 +270,60 @@ test("native scans resolve empty and unset Codex homes consistently", async () =
         `[deep_scan]\nworkers = ${workers}\n`,
       );
     }
+    const nested = join(explicitHome, "nested");
+    const link = join(defaultHome, "link");
+    await mkdir(nested);
+    await symlink(
+      nested,
+      link,
+      process.platform === "win32" ? "junction" : "dir",
+    );
+    const linkedHome = `${link}${sep}..`;
+    const physicalHome = await realpath(linkedHome);
+    const linkedSettings = homes.find(([home]) => home === physicalHome);
+    assert.ok(linkedSettings);
     for (const [override, home, model, workers] of [
       [undefined, defaultHome, "synthetic-default", 2],
       ["", defaultHome, "synthetic-default", 2],
       [explicitHome, explicitHome, "synthetic-explicit", 4],
+      ...(process.platform === "win32"
+        ? []
+        : [[spacedHome, spacedHome, "synthetic-spaced", 3]]),
+      [linkedHome, ...linkedSettings],
     ]) {
       if (override === undefined) delete process.env.CODEX_HOME;
       else process.env.CODEX_HOME = override;
-      const prepared = await prepareNativeScan({
-        ...input(),
-        pluginRoot,
-        recipe: { auth: "api-key" },
-      });
-      assert.equal(prepared.client.config.codexOverrides.model, model);
-      assert.equal(prepared.options.workers, workers);
-      const runtime = await prepared.client.dependencies.prepareRuntime({});
-      try {
-        const expectedHome = await realpath(home);
-        assert.equal(runtime.codexHome, expectedHome);
-        assert.equal(runtime.environment.CODEX_HOME, expectedHome);
-        assert.equal(process.env.CODEX_HOME, override);
-      } finally {
-        await rm(runtime.bootstrapWorkspace, { recursive: true, force: true });
+      for (const saved of [false, true]) {
+        const prepared = await prepareNativeScan({
+          ...input(),
+          pluginRoot,
+          recipe: {
+            auth: "api-key",
+            ...(saved
+              ? {
+                  config: { model: "synthetic-saved" },
+                  deepScan: { workers: 6 },
+                }
+              : {}),
+          },
+        });
+        assert.equal(
+          prepared.client.config.codexOverrides.model,
+          saved ? "synthetic-saved" : model,
+        );
+        assert.equal(prepared.options.workers, saved ? 6 : workers);
+        const runtime = await prepared.client.dependencies.prepareRuntime({});
+        try {
+          const expectedHome = await realpath(home);
+          assert.equal(runtime.codexHome, expectedHome);
+          assert.equal(runtime.environment.CODEX_HOME, expectedHome);
+          assert.equal(process.env.CODEX_HOME, override);
+        } finally {
+          await rm(runtime.bootstrapWorkspace, {
+            recursive: true,
+            force: true,
+          });
+        }
       }
     }
   } finally {

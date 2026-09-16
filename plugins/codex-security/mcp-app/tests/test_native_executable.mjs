@@ -21,8 +21,8 @@ try {
   await testWindowsAppsCodexFallsBackToRelocatedBinary();
   await testWindowsNpmPackageResolution();
   await testWindowsNpmPackageResolution("managed");
+  await testCodexHomePathsStayBoundToOriginalDirectory();
   if (process.platform === "win32") {
-    await testWindowsRootRelativePathsStayBoundToOriginalDrive();
     await testWindowsWorkerEnvironmentPreservesMixedCaseKeys();
     await testWindowsLauncherSkipsExtensionlessNpmShim();
   }
@@ -34,17 +34,19 @@ try {
   await Promise.all(temporaryRoots.map((root) => rm(root, { recursive: true, force: true })));
 }
 
-async function testWindowsRootRelativePathsStayBoundToOriginalDrive() {
-  assert.equal(
-    resolveCodexPath({ CODEX_CLI_PATH: "\\Tools\\codex.exe" }, "win32", process.arch, "C:\\original\\cwd"),
-    "C:\\Tools\\codex.exe"
-  );
-  assert.equal(
-    resolveCodexPath({ CODEX_CLI_PATH: "/Tools/codex.exe" }, "win32", process.arch, "D:\\original\\cwd"),
-    "D:\\Tools\\codex.exe"
-  );
+async function testCodexHomePathsStayBoundToOriginalDirectory() {
+  if (process.platform === "win32") {
+    assert.equal(
+      resolveCodexPath({ CODEX_CLI_PATH: "\\Tools\\codex.exe" }, "win32", process.arch, "C:\\original\\cwd"),
+      "C:\\Tools\\codex.exe"
+    );
+    assert.equal(
+      resolveCodexPath({ CODEX_CLI_PATH: "/Tools/codex.exe" }, "win32", process.arch, "D:\\original\\cwd"),
+      "D:\\Tools\\codex.exe"
+    );
+  }
 
-  const root = await mkdtemp(path.join(tmpdir(), "codex-security-windows-home-"));
+  const root = await mkdtemp(path.join(tmpdir(), "codex-security-native-home-"));
   temporaryRoots.push(root);
   const target = path.join(root, "target", "nested");
   await Promise.all([
@@ -56,31 +58,39 @@ async function testWindowsRootRelativePathsStayBoundToOriginalDrive() {
 
   const previousCodexHome = process.env.CODEX_HOME;
   try {
-    const rootRelativeHome = `\\${path.relative(path.parse(root).root, root)}\\link\\..\\home`;
-    process.env.CODEX_HOME = rootRelativeHome;
-    const expectedHome = await realpath(rootRelativeHome);
-    const environment = await snapshotNativeEnvironment();
-    assert.equal(environment.CODEX_HOME, expectedHome);
-    assert.equal(process.env.CODEX_HOME, rootRelativeHome);
-    const childCwd = await realpath(target);
-    const child = spawnSync(process.execPath, ["-e", [
-      "const { realpathSync } = require('node:fs');",
-      "process.stdout.write(JSON.stringify({ cwd: process.cwd(), codexHome: process.env.CODEX_HOME, resolvedHome: realpathSync(process.env.CODEX_HOME) }));"
-    ].join("\n")], { encoding: "utf8", env: environment, cwd: childCwd });
-    assert.equal(child.error, undefined);
-    assert.equal(child.status, 0);
-    assert.deepEqual(JSON.parse(child.stdout), {
-      cwd: childCwd,
-      codexHome: expectedHome,
-      resolvedHome: expectedHome
-    });
+    const homes = [
+      `${root}${path.sep}link${path.sep}..${path.sep}home`,
+      `${path.relative(process.cwd(), root)}${path.sep}link${path.sep}..${path.sep}home`,
+      ...(process.platform === "win32"
+        ? [`\\${path.relative(path.parse(root).root, root)}\\link\\..\\home`]
+        : [])
+    ];
+    for (const home of homes) {
+      process.env.CODEX_HOME = home;
+      const expectedHome = await realpath(home);
+      const environment = await snapshotNativeEnvironment();
+      assert.equal(environment.CODEX_HOME, expectedHome);
+      assert.equal(process.env.CODEX_HOME, home);
+      const childCwd = await realpath(target);
+      const child = spawnSync(process.execPath, ["-e", [
+        "const { realpathSync } = require('node:fs');",
+        "process.stdout.write(JSON.stringify({ cwd: process.cwd(), codexHome: process.env.CODEX_HOME, resolvedHome: realpathSync(process.env.CODEX_HOME) }));"
+      ].join("\n")], { encoding: "utf8", env: environment, cwd: childCwd });
+      assert.equal(child.error, undefined);
+      assert.equal(child.status, 0);
+      assert.deepEqual(JSON.parse(child.stdout), {
+        cwd: childCwd,
+        codexHome: expectedHome,
+        resolvedHome: expectedHome
+      });
+    }
   } finally {
     restoreEnv("CODEX_HOME", previousCodexHome);
   }
 }
 
 async function testWindowsWorkerEnvironmentPreservesMixedCaseKeys() {
-  const root = await mkdtemp(path.join(tmpdir(), "codex-security-windows-env-"));
+  const root = await realpath(await mkdtemp(path.join(tmpdir(), "codex-security-windows-env-")));
   temporaryRoots.push(root);
   const names = ["CODEX_CLI_PATH", "CODEX_HOME", "CODEX_MANAGED_PACKAGE_ROOT", "LOCALAPPDATA"];
   const previousEnvironment = Object.fromEntries(

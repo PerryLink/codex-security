@@ -160,7 +160,11 @@ export async function prepareNativeScan(
   const deep = await resolveDeepScanConfig(
     options,
     environment.CODEX_SECURITY_DEEP_SCAN_CONFIG_PATH ??
-      join(configuredCodexHome(environment), "codex-security", "config.toml"),
+      join(
+        environment.CODEX_HOME || configuredCodexHome(environment),
+        "codex-security",
+        "config.toml",
+      ),
   );
   const config = await nativeScanConfiguration(
     environment,
@@ -219,7 +223,9 @@ export async function prepareNativeScan(
       environment: selectedEnvironment,
       inheritedPermissions,
       prepareRuntime: async (_config, runtimeSignal) => {
-        const codexHome = await realpath(configuredCodexHome(environment));
+        const codexHome = await realpath(
+          environment.CODEX_HOME || configuredCodexHome(environment),
+        );
         const bootstrapWorkspace = await createIsolatedHome();
         try {
           const marketplaceRoot = await createMarketplace(
@@ -289,7 +295,10 @@ export async function nativeScanConfiguration(
       input.recipe.config as JsonObject,
       subagents,
     );
-  const ambientPath = join(configuredCodexHome(environment), "config.toml");
+  const ambientPath = join(
+    environment.CODEX_HOME || configuredCodexHome(environment),
+    "config.toml",
+  );
   const ambient = await readFile(ambientPath, "utf8").catch(
     (error: NodeJS.ErrnoException) => {
       if (error.code === "ENOENT") return "";
