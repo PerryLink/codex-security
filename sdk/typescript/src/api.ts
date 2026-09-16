@@ -1822,6 +1822,7 @@ export class CodexSecurity {
         );
       }
       const sealed = typeof registration["sealedProducerVersion"] === "string";
+      let sealedThreadId: string | undefined;
       if (sealed) {
         // Reconcile sealing before the ordinary completion transaction without rewriting artifacts.
         const saved = await workbench(workbenchOptions, [
@@ -1830,16 +1831,23 @@ export class CodexSecurity {
           scanId,
         ]);
         const savedScan = saved["scan"] as JsonObject;
+        const checkpoint = saved["compositionCheckpoint"] as
+          | { legacy?: { cost?: ScanCost; originThreadId?: string } }
+          | null
+          | undefined;
         resumeThreadId = savedScan["continuationThreadId"];
-        if (typeof resumeThreadId !== "string")
+        // Legacy cost already includes this origin session; do not restart its tracker.
+        sealedThreadId =
+          typeof resumeThreadId === "string"
+            ? resumeThreadId
+            : checkpoint?.legacy?.originThreadId;
+        if (typeof sealedThreadId !== "string")
           throw new CodexSecurityError(
             "The sealed scan has no saved execution session.",
           );
-        const checkpoint = saved["compositionCheckpoint"] as
-          { legacy?: { cost?: ScanCost } } | undefined;
         if (checkpoint?.legacy?.cost)
           passCosts.set("legacy", checkpoint.legacy.cost);
-        if (checkpoint !== undefined) {
+        if (checkpoint != null) {
           const children = await workbench(workbenchOptions, [
             "list-scans",
             "--scan-root",
@@ -1853,14 +1861,14 @@ export class CodexSecurity {
               );
           }
         }
-        if (mode === "deep" && checkpoint === undefined) {
+        if (mode === "deep" && checkpoint == null) {
           const historical = new ScanCostTracker({
             codexHome: runtime.codexHome,
             model,
             repository: repo,
             scanDirectory: scanDir,
           });
-          historical.start(resumeThreadId);
+          historical.start(sealedThreadId);
           completionCost = (await historical.stop()).cost;
         }
         completionCost ??=
@@ -2234,7 +2242,7 @@ export class CodexSecurity {
                   ? scanCostUsage(completionCost)
                   : snapshot.usage,
               },
-              resumeThreadId as string,
+              sealedThreadId!,
               scanDir,
               runtime.plugin.installedRoot,
               expectation,

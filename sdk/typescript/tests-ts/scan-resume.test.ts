@@ -475,6 +475,7 @@ function resumeClient(
   createCodex: NonNullable<
     ConstructorParameters<typeof TestClient>[1]["createCodex"]
   >,
+  workbench: typeof runWorkbench = runWorkbench,
 ) {
   return (config: ConstructorParameters<typeof TestClient>[0]) =>
     new TestClient(config, {
@@ -495,7 +496,7 @@ function resumeClient(
         return runtime;
       },
       resolvePluginPython: async () => f.python,
-      runWorkbench,
+      runWorkbench: workbench,
       createCodex,
     });
 }
@@ -658,81 +659,272 @@ test.each([
   },
 );
 
-test("completed legacy discovery seals partial results when its saved budget is exhausted", async () => {
-  const f = await interruptedScan(
-    "deep",
-    false,
-    { maxCostUsd: 0.001 },
-    true,
-    false,
-  );
-  const cost = estimateScanCost("gpt-5.6-sol", {
-    input_tokens: 10000,
-    output_tokens: 2000,
-  })!;
-  const coverage = {
-    completeness: "partial",
-    surfaces: [],
-    explicitExclusions: [],
-    deferred: [{ reason: "Retained legacy discovery coverage." }],
-  };
-  const checkpoint: DeepScanCheckpoint = {
-    version: 2,
-    startedAt: "2000-01-01T00:00:00Z",
-    passes: [],
-    mergedScanIds: [],
-    aggregate: { scanId: f.scanId, findings: [], coverage },
-    noNewStreak: 0,
-    consecutiveErrors: 0,
-    terminalReason: "capped",
-    legacy: { discoveryRuns: 1, coverage, originThreadId: f.threadId, cost },
-  };
-  await f.command(
-    [
-      "save-scan-artifact",
-      "--scan-id",
-      f.scanId,
-      "--artifact-path",
+test.each([false, true])(
+  "completed legacy discovery recovers partial results when its saved budget is exhausted (sealed: %p)",
+  async (sealed) => {
+    const f = await interruptedScan(
+      "deep",
+      false,
+      { maxCostUsd: 0.001 },
+      true,
+      false,
+    );
+    const cost = estimateScanCost("gpt-5.6-sol", {
+      input_tokens: 10000,
+      output_tokens: 2000,
+    })!;
+    const expectedCost = {
+      inputTokens: 10000,
+      outputTokens: 2000,
+      estimatedUsd: cost.estimatedUsd,
+    };
+    await appendFile(
+      f.sessionPath,
+      JSON.stringify({
+        type: "event_msg",
+        payload: {
+          type: "token_count",
+          info: {
+            total_token_usage: { input_tokens: 10000, output_tokens: 2000 },
+          },
+        },
+      }) + "\n",
+    );
+    const coverage = {
+      completeness: "partial",
+      surfaces: [],
+      explicitExclusions: [],
+      deferred: [{ reason: "Retained legacy discovery coverage." }],
+    };
+    const checkpoint: DeepScanCheckpoint = {
+      version: 2,
+      startedAt: "2000-01-01T00:00:00Z",
+      passes: [],
+      mergedScanIds: [],
+      aggregate: { scanId: f.scanId, findings: [], coverage },
+      noNewStreak: 0,
+      consecutiveErrors: 0,
+      terminalReason: "capped",
+      legacy: { discoveryRuns: 1, coverage, originThreadId: f.threadId, cost },
+    };
+    await f.command(
+      [
+        "save-scan-artifact",
+        "--scan-id",
+        f.scanId,
+        "--artifact-path",
+        DEEP_SCAN_CHECKPOINT,
+      ],
+      JSON.stringify(checkpoint),
+    );
+    const artifactNames = [
+      "scan-manifest.json",
+      "findings.json",
+      "coverage.json",
+      "report.md",
       DEEP_SCAN_CHECKPOINT,
-    ],
-    JSON.stringify(checkpoint),
-  );
-  let turns = 0;
-  const client = resumeClient(f, () => ({
-    startThread: () => ({
-      id: null,
-      async runStreamed() {
-        turns++;
-        throw new Error("Completed legacy discovery needs no model turn.");
+    ];
+    if (sealed) {
+      await writeDraft(
+        f.command,
+        f.registration,
+        "deep",
+        checkpoint.aggregate!,
+      );
+      await f.command(["prepare-scan-completion", "--scan-id", f.scanId]);
+    }
+    const artifacts = sealed
+      ? await Promise.all(
+          artifactNames.map((name) => readFile(join(f.scanDir, name))),
+        )
+      : undefined;
+    let turns = 0;
+    const client = resumeClient(f, () => ({
+      startThread: () => ({
+        id: null,
+        async runStreamed() {
+          turns++;
+          throw new Error("Completed legacy discovery needs no model turn.");
+        },
+      }),
+      resumeThread() {
+        throw new Error("The retired coordinator must not resume.");
       },
-    }),
-    resumeThread() {
-      throw new Error("The retired coordinator must not resume.");
-    },
-  }))({ codexOverrides: f.recipe.config });
-  try {
-    const result = await client.run(f.repository, {
-      mode: "deep",
-      outputDir: f.scanDir,
-      resumeScanId: f.scanId,
-      maxCostUsd: 0.001,
-      ...f.recipe.deepScan,
-    });
-    expect(result.manifest.scan.id).toBe(f.scanId);
-    expect(result.manifest.scan.sealedAt).toBeString();
-    expect(result.threadId).toBe(f.threadId);
-    expect(result.coverage.completeness).toBe("partial");
-    expect(result.cost!.estimatedUsd).toBe(cost.estimatedUsd);
-    expect(turns).toBe(0);
+    }))({ codexOverrides: f.recipe.config });
+    try {
+      const result = await client.run(f.repository, {
+        mode: "deep",
+        outputDir: f.scanDir,
+        resumeScanId: f.scanId,
+        maxCostUsd: 0.001,
+        ...f.recipe.deepScan,
+      });
+      expect(result.manifest.scan.id).toBe(f.scanId);
+      expect(result.manifest.scan.sealedAt).toBeString();
+      expect(result.threadId).toBe(f.threadId);
+      expect(result.coverage.completeness).toBe("partial");
+      expect(result.cost).toMatchObject(expectedCost);
+      expect(turns).toBe(0);
+      expect(
+        (await f.command(["get-scan", "--scan-id", f.scanId]))["scan"],
+      ).toMatchObject({
+        progress: { status: "complete" },
+        cost: expectedCost,
+      });
+      if (sealed) {
+        expect(
+          await Promise.all(
+            artifactNames.map((name) => readFile(join(f.scanDir, name))),
+          ),
+        ).toEqual(artifacts!);
+      }
+    } finally {
+      await client.close();
+    }
+  },
+);
+
+test.each([
+  ["null", null],
+  ["undefined", undefined],
+])(
+  "sealed legacy discovery recovers historical worker costs with a %s composition checkpoint",
+  async (_label, checkpoint) => {
+    const f = await interruptedScan();
+    await finishDiscovery(f);
+    await rm(join(f.scanDir, DEEP_SCAN_CHECKPOINT));
+    execFileSync(f.python, [
+      "-c",
+      `import sqlite3, sys
+with sqlite3.connect(sys.argv[1]) as connection:
+    timestamp = connection.execute("SELECT started_at FROM scans WHERE id = ?", (sys.argv[2],)).fetchone()[0]
+    connection.execute(
+        "INSERT INTO deep_scan_runs (scan_id, schema_version, workflow_version, "
+        "status, phase, workers, subagents, stop_after_no_new, max_discovery_runs, "
+        "manifest_path, terminal_reason, created_at, updated_at, completed_at) "
+        "VALUES (?, 1, 'publication-test', 'succeeded', 'terminal', 1, 0, 1, 1, "
+        "?, 'saturated', ?, ?, ?)",
+        (sys.argv[2], sys.argv[3], timestamp, timestamp, timestamp),
+    )
+`,
+      join(f.environment.CODEX_SECURITY_STATE_DIR, "workbench.sqlite3"),
+      f.scanId,
+      join(f.scanDir, "scan-manifest.json"),
+    ]);
+    await f.command(["prepare-scan-completion", "--scan-id", f.scanId]);
+    const artifactNames = [
+      "scan-manifest.json",
+      "findings.json",
+      "coverage.json",
+      "report.md",
+    ];
+    const artifacts = await Promise.all(
+      artifactNames.map((name) => readFile(join(f.scanDir, name))),
+    );
     expect(
-      (await f.command(["get-scan", "--scan-id", f.scanId]))["scan"],
-    ).toMatchObject({
-      progress: { status: "complete" },
-    });
-  } finally {
-    await client.close();
-  }
-});
+      (await f.command(["get-scan", "--scan-id", f.scanId]))[
+        "compositionCheckpoint"
+      ],
+    ).toBeNull();
+    for (const [threadId, cwd, inputTokens, outputTokens, timestamp] of [
+      [f.threadId, f.scanDir, 1000, 10, "2026-07-26T12:00:00.900Z"],
+      [
+        randomUUID(),
+        join(f.scanDir, "artifacts/deep_discovery/workers/worker/output"),
+        250,
+        2,
+        "2026-07-26T12:00:00.900Z",
+      ],
+      [
+        randomUUID(),
+        join(f.scanDir, "artifacts"),
+        125,
+        1,
+        "2026-07-26T12:02:00Z",
+      ],
+    ] as const) {
+      await writeFile(
+        join(f.codexHome, "sessions", `rollout-${threadId}.jsonl`),
+        [
+          JSON.stringify({
+            type: "session_meta",
+            payload: { id: threadId, cwd, timestamp },
+          }),
+          JSON.stringify({
+            type: "event_msg",
+            payload: {
+              type: "token_count",
+              info: {
+                total_token_usage: {
+                  input_tokens: inputTokens,
+                  output_tokens: outputTokens,
+                },
+              },
+            },
+          }),
+          "",
+        ].join("\n"),
+      );
+    }
+    let turns = 0;
+    const client = resumeClient(
+      f,
+      () => ({
+        startThread() {
+          throw new Error(
+            "The sealed legacy scan already has a saved session.",
+          );
+        },
+        resumeThread(threadId) {
+          expect(threadId).toBe(f.threadId);
+          return {
+            id: threadId,
+            async runStreamed() {
+              turns++;
+              throw new Error("Sealed legacy discovery needs no model turn.");
+            },
+          };
+        },
+      }),
+      async (options, args, input) => {
+        const result = await runWorkbench(options, args, input);
+        if (args[0] === "get-scan" && checkpoint === undefined)
+          delete result["compositionCheckpoint"];
+        return result;
+      },
+    )({ codexOverrides: f.recipe.config });
+    try {
+      const result = await client.run(f.repository, {
+        mode: "deep",
+        outputDir: f.scanDir,
+        resumeScanId: f.scanId,
+        ...f.recipe.deepScan,
+      });
+      const cost = estimateScanCost("gpt-5.6-sol", {
+        input_tokens: 1375,
+        output_tokens: 13,
+      })!;
+      const expectedCost = {
+        inputTokens: 1375,
+        outputTokens: 13,
+        estimatedUsd: cost.estimatedUsd,
+      };
+      expect(result.threadId).toBe(f.threadId);
+      expect(result.cost).toMatchObject(expectedCost);
+      expect(turns).toBe(0);
+      expect(
+        (await f.command(["get-scan", "--scan-id", f.scanId]))["scan"],
+      ).toMatchObject({ progress: { status: "complete" }, cost: expectedCost });
+      expect(
+        await Promise.all(
+          artifactNames.map((name) => readFile(join(f.scanDir, name))),
+        ),
+      ).toEqual(artifacts);
+    } finally {
+      await client.close();
+    }
+  },
+);
 
 test("bulk recovery merges a sealed child when the parent stopped before its first merge thread", async () => {
   const f = await interruptedScan("deep", true, {}, false, false);

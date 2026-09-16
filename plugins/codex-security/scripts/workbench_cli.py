@@ -268,18 +268,21 @@ def parse_args(description: str) -> argparse.Namespace:
     cancel_scan = subparsers.add_parser("cancel-scan")
     cancel_scan.add_argument("--scan-id", required=True)
     cancel_scan.add_argument("--thread-id")
+    cancel_scan.add_argument("--defer-publication", action="store_true", help=argparse.SUPPRESS)
 
     fail_scan = subparsers.add_parser("fail-scan")
     fail_scan.add_argument("--scan-id", required=True)
     fail_scan.add_argument("--message", required=True)
     fail_scan.add_argument("--claim-token")
     fail_scan.add_argument("--cost-json")
+    fail_scan.add_argument("--defer-publication", action="store_true", help=argparse.SUPPRESS)
 
     preserve_scan = subparsers.add_parser("preserve-scan-results")
     preserve_scan.add_argument("--scan-id", required=True)
     preserve_scan.add_argument("--thread-id")
     preserve_scan.add_argument("--claim-token")
     preserve_scan.add_argument("--cost-json")
+    preserve_scan.add_argument("--after-stop", action="store_true", help=argparse.SUPPRESS)
 
     recovery_help = "Validate and republish retained checkpoints for a failed, non-canceled scan."
     recover_scan = subparsers.add_parser(

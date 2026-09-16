@@ -14,7 +14,10 @@ import {
   scanModelProvider,
   type JsonObject,
 } from "../../../../sdk/typescript/src/config.js";
-import { ScanSettingsSchema } from "../../../../sdk/typescript/src/scan-settings.js";
+import {
+  ScanSettingsSchema,
+  type DeepScanOptions,
+} from "../../../../sdk/typescript/src/scan-settings.js";
 import { accountStatus } from "../../../../sdk/typescript/src/auth.js";
 import { CodexSecurityError } from "../../../../sdk/typescript/src/errors.js";
 import { resolveDeepScanConfig } from "../../../../sdk/typescript/src/deep-config.js";
@@ -30,6 +33,7 @@ import type { ScanResults } from "./types.js";
 export interface NativeScanInput {
   scan: ScanResults;
   recipe?: JsonObject;
+  savedDeepScanSettings?: DeepScanOptions;
   threadId: string;
   pluginRoot: string;
   pythonPath: string;
@@ -128,6 +132,7 @@ export async function prepareNativeScan(
     network: { enabled: false },
   };
   const options = ScanSettingsSchema.parse({
+    ...input.savedDeepScanSettings,
     ...(recipe.deepScan as JsonObject | undefined),
     auth: recipe.auth,
     knowledgeBasePaths:

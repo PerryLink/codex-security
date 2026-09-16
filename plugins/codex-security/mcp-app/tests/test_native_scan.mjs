@@ -690,6 +690,38 @@ test("native saved scans retain settings, auth environment, permissions and iden
     );
     assert.equal(resumed.model, "saved-model");
     assert.equal(resumed.model_reasoning_summary, "none");
+    const savedDeepScanSettings = {
+      workers: 2,
+      subagents: 1,
+      stopAfterNoNew: 3,
+      stopAfterConsecutiveErrors: 4,
+      maxDiscoveryRuns: 7,
+      maxTimeHours: 0.5,
+    };
+    process.env.CODEX_SECURITY_DEEP_SCAN_CONFIG_PATH = join(root, "deep.toml");
+    await writeFile(
+      process.env.CODEX_SECURITY_DEEP_SCAN_CONFIG_PATH,
+      "[invalid",
+    );
+    for (const recipe of [
+      undefined,
+      { deepScan: { workers: 3, subagents: 2 } },
+    ]) {
+      const restored = await prepareNativeScan({
+        ...request,
+        recipe,
+        savedDeepScanSettings,
+      });
+      const expected = { ...savedDeepScanSettings, ...recipe?.deepScan };
+      for (const [key, value] of Object.entries(expected)) {
+        assert.equal(restored.options[key], value);
+      }
+      assert.equal(
+        restored.client.config.codexOverrides.features.multi_agent_v2
+          .max_concurrent_threads_per_session,
+        expected.subagents + 1,
+      );
+    }
   } finally {
     for (const [key, value] of Object.entries(before)) {
       if (value === undefined) delete process.env[key];

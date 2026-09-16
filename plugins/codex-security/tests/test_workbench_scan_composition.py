@@ -172,6 +172,18 @@ def test_native_parent_binds_once_and_keeps_native_claim(tmp_path: Path) -> None
         "--claim-token",
         token,
     )
+    delivered = run_workbench(
+        state,
+        "mark-handoff-delivered",
+        "--scan-id",
+        scan["scanId"],
+        "--thread-id",
+        "native-owner",
+        "--claim-token",
+        token,
+    )
+    assert delivered["results"]["handoffStatus"] == "delivered"
+    assert delivered["results"]["continuationThreadId"] == "sdk-execution"
     assert (
         run_workbench(state, *context_args, "--user-context", "After merger.")["scan"][
             "userContext"
@@ -197,6 +209,18 @@ def test_native_parent_binds_once_and_keeps_native_claim(tmp_path: Path) -> None
             check=False,
         )
         assert rejected["returncode"] != 0
+        rejected_delivery = run_workbench(
+            state,
+            "mark-handoff-delivered",
+            "--scan-id",
+            scan["scanId"],
+            "--thread-id",
+            owner,
+            "--claim-token",
+            claim,
+            check=False,
+        )
+        assert rejected_delivery["returncode"] != 0
     assert (
         run_workbench(state, "get-scan", "--scan-id", scan["scanId"])["scan"]["userContext"]
         == "After merger."
@@ -254,6 +278,60 @@ def test_native_parent_binds_once_and_keeps_native_claim(tmp_path: Path) -> None
         check=False,
     )
     assert rejected["returncode"] != 0
+
+
+def test_native_legacy_settings_are_returned_only_without_a_saved_recipe(tmp_path: Path) -> None:
+    target = tmp_path / "target"
+    target.mkdir()
+    state = tmp_path / "state"
+    created = run_workbench(
+        state,
+        "begin-deep-scan",
+        "--thread-id",
+        "native-owner",
+        "--target-path",
+        str(target),
+        "--scan-root",
+        str(tmp_path / "scans"),
+    )
+    assert "deepScanSettings" not in created
+    scan = created["scan"]
+    joined_args = (
+        "begin-deep-scan",
+        "--scan-id",
+        scan["scanId"],
+        "--thread-id",
+        "native-owner",
+        "--claim-token",
+        scan["handoffClaimToken"],
+    )
+    assert "deepScanSettings" not in run_workbench(state, *joined_args)
+    with sqlite3.connect(state / "workbench.sqlite3") as connection:
+        connection.execute(
+            "INSERT INTO deep_scan_runs (scan_id, schema_version, workflow_version, "
+            "status, phase, workers, subagents, stop_after_no_new, "
+            "stop_after_consecutive_errors, max_discovery_runs, max_time_hours, "
+            "created_at, updated_at) "
+            "VALUES (?, 1, 'synthetic-legacy', 'running', 'setup', 2, 0, 3, 4, 8, 0.5, ?, ?)",
+            (scan["scanId"], "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z"),
+        )
+    assert run_workbench(state, *joined_args)["deepScanSettings"] == {
+        "workers": 2,
+        "subagents": 0,
+        "stopAfterNoNew": 3,
+        "stopAfterConsecutiveErrors": 4,
+        "maxDiscoveryRuns": 8,
+        "maxTimeHours": 0.5,
+    }
+    saved_recipe = recipe(target, "deep")
+    with sqlite3.connect(state / "workbench.sqlite3") as connection:
+        connection.execute(
+            "UPDATE scans SET recipe_json = ? WHERE id = ?",
+            (json.dumps(saved_recipe), scan["scanId"]),
+        )
+    joined = run_workbench(state, *joined_args)
+    assert joined["recipe"] == saved_recipe
+    assert "deepScanSettings" not in joined
 
 
 def test_parent_reads_completed_child_after_registration_checkpoint_crash(tmp_path: Path) -> None:
@@ -747,6 +825,139 @@ def test_capped_scoped_parent_preserves_unmerged_child_results(
     assert [scan["scanId"] for scan in run_workbench(state, "list-scans")["scans"]] == [
         parent["scanId"]
     ]
+
+
+@pytest.mark.parametrize("action", ["cancel-scan", "fail-scan"])
+def test_deferred_stop_retains_drained_child_and_cost_before_freezing(
+    tmp_path: Path, action: str
+) -> None:
+    target = tmp_path / "target"
+    target.mkdir()
+    (target / "app.py").write_text("\n" * 50)
+    state = tmp_path / "state"
+    parent = register(state, target, tmp_path / "scan", mode="deep")
+    parent_dir = Path(parent["scanDir"])
+    child_dir = parent_dir / "artifacts/deep-scan/passes/pass-1"
+    child = register(state, target, child_dir, parent=parent["scanId"])
+    checkpoint(state, parent, passes=[{"directory": child_dir.relative_to(parent_dir).as_posix()}])
+    run_workbench(
+        state, "set-scan-thread", "--scan-id", parent["scanId"], "--thread-id", "native-owner"
+    )
+    stop = (
+        action,
+        "--scan-id",
+        parent["scanId"],
+        "--defer-publication",
+        *(
+            ("--thread-id", "native-owner")
+            if action == "cancel-scan"
+            else ("--message", "Stopped.")
+        ),
+    )
+    wrong_authority = (
+        ("--thread-id", "other-owner")
+        if action == "cancel-scan"
+        else ("--claim-token", "00000000-0000-4000-8000-000000000001")
+    )
+    assert run_workbench(state, *stop, *wrong_authority, check=False)["returncode"] != 0
+    run_workbench(state, *stop)
+    assert run_workbench(state, *stop, *wrong_authority, check=False)["returncode"] != 0
+    usage = {
+        "coverage": "complete",
+        "source": "codex_rollout",
+        "threadCount": 1,
+        "inputTokens": 10,
+        "cachedInputTokens": 0,
+        "cacheWriteInputTokens": 0,
+        "outputTokens": 5,
+        "reasoningOutputTokens": 0,
+        "totalTokens": 15,
+    }
+    with sqlite3.connect(state / "workbench.sqlite3") as connection:
+        stopped = connection.execute(
+            "SELECT status, completed_at, canceled_at, retained_source_digests_json FROM scans WHERE id = ?",
+            (parent["scanId"],),
+        ).fetchone()
+        assert stopped[0] == "failed"
+        assert (stopped[2] is not None) == (action == "cancel-scan")
+        assert stopped[3] is None
+        connection.execute(
+            "UPDATE scans SET cost_json = ? WHERE id = ?",
+            (json.dumps({"usage": usage}), parent["scanId"]),
+        )
+    write_completed_contract(child_dir, child["scanId"], target, relative_path="app.py")
+    payload = {
+        "scanId": child["scanId"],
+        "findings": json.loads((child_dir / "findings.json").read_text())["findings"],
+        "coverage": json.loads((child_dir / "coverage.json").read_text()),
+        "complete": False,
+    }
+    write_checkpoint(child_dir / "checkpoints", payload)
+    for name in ("scan-manifest.json", "findings.json", "coverage.json"):
+        (child_dir / name).unlink()
+    for tokens, include_usage in ((10, False), (10, False), (20, False), (20, True)):
+        cost = {
+            "model": "synthetic-model",
+            "inputTokens": tokens,
+            "cachedInputTokens": 0,
+            "cacheWriteInputTokens": 0,
+            "outputTokens": 5,
+            "estimatedUsd": tokens / 1000,
+        }
+        updated = run_workbench(
+            state,
+            "fail-scan",
+            "--scan-id",
+            parent["scanId"],
+            "--message",
+            "Drained.",
+            "--cost-json",
+            json.dumps({"usage": usage, "cost": cost} if include_usage else cost),
+        )
+        assert updated["scan"]["cost"] == cost
+        assert updated["scan"]["usage"] == usage
+    run_workbench(state, *stop)
+    with sqlite3.connect(state / "workbench.sqlite3") as connection:
+        assert (
+            connection.execute(
+                "SELECT status, completed_at, canceled_at, retained_source_digests_json FROM scans WHERE id = ?",
+                (parent["scanId"],),
+            ).fetchone()
+            == stopped
+        )
+    preserve = (
+        "preserve-scan-results",
+        "--scan-id",
+        parent["scanId"],
+        "--after-stop",
+        "--thread-id",
+        "native-owner",
+    )
+    assert (
+        run_workbench(state, *preserve, "--thread-id", "other-owner", check=False)["returncode"]
+        != 0
+    )
+    retained = run_workbench(state, *preserve)
+    assert retained["scan"]["findingCount"] == 1
+    assert retained["scan"]["cost"] == cost
+    published = {
+        name: (parent_dir / name).read_bytes()
+        for name in ("scan-manifest.json", "findings.json", "coverage.json", "report.md")
+    }
+    frozen = json.loads(published["scan-manifest.json"])["scan"]["preservedSources"]
+    assert frozen
+    payload["findings"][0]["summary"] = "A later checkpoint must not replace retained evidence."
+    write_checkpoint(child_dir / "checkpoints", payload)
+    run_workbench(state, *stop)
+    assert run_workbench(state, *preserve)["scan"]["findingCount"] == 1
+    assert {name: (parent_dir / name).read_bytes() for name in published} == published
+    with sqlite3.connect(state / "workbench.sqlite3") as connection:
+        row = connection.execute(
+            "SELECT completed_at, canceled_at, retained_source_digests_json FROM scans WHERE id = ?",
+            (parent["scanId"],),
+        ).fetchone()
+    assert row[:2] == stopped[1:3]
+    assert json.loads(row[2]) == frozen
 
 
 @pytest.mark.parametrize("child_state", ["complete", "checkpoint"])

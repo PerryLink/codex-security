@@ -932,7 +932,21 @@ def begin_deep_scan(connection: sqlite3.Connection, args: argparse.Namespace) ->
     )
     if scan["status"] == "running" and scan["canceled_at"] is None:
         require_scan_target_identity(scan)
-    return {**scan_context(connection, scan["id"]), "startDisposition": "joined"}
+    context = scan_context(connection, scan["id"])
+    if scan["recipe_json"] is None:
+        legacy = connection.execute(
+            "SELECT * FROM deep_scan_runs WHERE scan_id = ?", (scan["id"],)
+        ).fetchone()
+        if legacy is not None:
+            context["deepScanSettings"] = {
+                "workers": legacy["workers"],
+                "subagents": legacy["subagents"],
+                "stopAfterNoNew": legacy["stop_after_no_new"],
+                "stopAfterConsecutiveErrors": legacy["stop_after_consecutive_errors"],
+                "maxDiscoveryRuns": legacy["max_discovery_runs"],
+                "maxTimeHours": legacy["max_time_hours"],
+            }
+    return {**context, "startDisposition": "joined"}
 
 
 def start_prompt_only_scan(

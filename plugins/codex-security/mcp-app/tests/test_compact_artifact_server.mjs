@@ -25,12 +25,14 @@ try {
 
   await testParentToolList(runtimeBundle);
   await testClaimedParentArtifactOperations(runtimeBundle, "source");
+  await testPromptDrivenPrivateRecipe(runtimeBundle, "source");
   await testSemanticScanDraftCompletion(runtimeBundle, "source");
   await testCompactDiffScanCompletion(runtimeBundle, "source");
 
   const shippedRuntime = path.join(bundledPluginRoot, "mcp", "server.mjs");
   await testParentToolList(shippedRuntime);
   await testClaimedParentArtifactOperations(shippedRuntime, "shipped");
+  await testPromptDrivenPrivateRecipe(shippedRuntime, "shipped");
   await testSemanticScanDraftCompletion(shippedRuntime, "shipped");
   await testCompactDiffScanCompletion(shippedRuntime, "shipped");
 } finally {
@@ -698,12 +700,14 @@ async function testClaimedParentArtifactOperations(bundle, runtimeLabel) {
   ]);
   await writeFile(path.join(repoRoot, "src", "fixture.py"), "print('fixture')\n");
 
-  const client = await startClient(bundle, {
+  const environment = {
     CODEX_SECURITY_SCAN_ROOT: scanRoot,
     CODEX_SECURITY_STATE_DIR: stateRoot
-  });
+  };
+  let client = await startClient(bundle, environment);
   const ownerThread = `compact-artifact-owner-${runtimeLabel}`;
   const otherThread = `compact-artifact-other-${runtimeLabel}`;
+  const executionThread = `compact-artifact-sdk-merge-${runtimeLabel}`;
   const call = (name, arguments_, threadId = ownerThread) => client.callTool({
     name,
     arguments: arguments_,
@@ -774,6 +778,49 @@ async function testClaimedParentArtifactOperations(bundle, runtimeLabel) {
     }), "authenticate parent scan owner");
     assert.equal(delivered.scan.continuationThreadId, ownerThread);
     assert.equal(delivered.scan.handoffClaimToken, undefined);
+
+    const recipe = privateScanRecipe(repoRoot, "deep");
+    runWorkbenchFixture(runtimeLabel, environment, [
+      "register-cli-scan", "--repository", repoRoot, "--scan-dir", scanDirectory,
+      "--registration-json-stdin"
+    ], { recipe, scanId, threadId: ownerThread, claimToken });
+    runWorkbenchFixture(runtimeLabel, environment, [
+      "set-scan-thread", "--scan-id", scanId, "--claim-token", claimToken,
+      "--thread-id", executionThread
+    ]);
+
+    await client.close();
+    client = await startClient(bundle, environment);
+    for (const threadId of [otherThread, executionThread]) {
+      requireToolError(
+        await call("get_codex_security_scan_context", {
+          scanId, handoffClaimToken: claimToken
+        }, threadId),
+        /owning Codex thread/,
+        `${runtimeLabel}: reject context reload from a different native owner`
+      );
+    }
+    requireToolError(
+      await call("get_codex_security_scan_context", {
+        scanId, handoffClaimToken: randomUUID()
+      }),
+      /owned by another continuation/,
+      `${runtimeLabel}: reject context reload with a different claim`
+    );
+    const reloadedResult = await call("get_codex_security_scan_context", {
+      scanId, handoffClaimToken: claimToken
+    });
+    const reloaded = requireSuccessfulTool(reloadedResult, "reload original native owner after SDK execution");
+    assert.equal(reloaded.scan.continuationThreadId, executionThread);
+    assertPrivateRecipeOmitted(reloadedResult, recipe, `${runtimeLabel}: reloaded context`);
+    const progressResult = await call("update_codex_security_scan_progress", {
+      scanId, handoffClaimToken: claimToken, preflightChecks: []
+    });
+    requireSuccessfulTool(progressResult, "update native owner progress after SDK execution");
+    assertPrivateRecipeOmitted(progressResult, recipe, `${runtimeLabel}: progress response`);
+    assert.deepEqual(runWorkbenchFixture(runtimeLabel, environment, [
+      "get-scan-recipe", "--scan-id", scanId
+    ]).recipe, recipe, `${runtimeLabel}: model responses preserve the complete host recipe`);
 
     for (const [name, arguments_] of [
       ["prepare_codex_security_review_items", { scanId }],
@@ -919,6 +966,98 @@ async function testClaimedParentArtifactOperations(bundle, runtimeLabel) {
   } finally {
     await client.close();
   }
+}
+
+async function testPromptDrivenPrivateRecipe(bundle, runtimeLabel) {
+  for (const kind of ["prompt-only", "headless"]) {
+    const fixtureRoot = path.join(temporaryRoot, `private-recipe-${kind}-${runtimeLabel}`);
+    const repoRoot = path.join(fixtureRoot, "repository");
+    const environment = {
+      CODEX_SECURITY_SCAN_ROOT: path.join(fixtureRoot, "scans"),
+      CODEX_SECURITY_STATE_DIR: path.join(fixtureRoot, "state")
+    };
+    await mkdir(repoRoot, { recursive: true });
+    await mkdir(environment.CODEX_SECURITY_SCAN_ROOT, { mode: 0o700 });
+    await writeFile(path.join(repoRoot, "fixture.py"), "print('fixture')\n");
+    const client = await startClient(bundle, environment);
+    const ownerThread = `private-recipe-${kind}-${runtimeLabel}`;
+    const toolName = kind === "prompt-only"
+      ? "start_codex_security_prompt_only_scan"
+      : "start_codex_security_standard_scan";
+    const callStart = () => client.callTool({
+      name: toolName,
+      arguments: {
+        targetPath: repoRoot,
+        scope: ".",
+        ...(kind === "prompt-only" ? { mode: "standard" } : {})
+      },
+      _meta: { "openai/threadId": ownerThread }
+    });
+
+    try {
+      const started = requireSuccessfulTool(await callStart(), `${runtimeLabel}: start ${kind} scan`);
+      const { scanId, scanDir } = started.scan;
+      const claimToken = started.handoffClaimToken;
+      const recipe = privateScanRecipe(repoRoot, "standard");
+      runWorkbenchFixture(runtimeLabel, environment, [
+        "register-cli-scan", "--repository", repoRoot, "--scan-dir", scanDir,
+        "--registration-json-stdin"
+      ], { recipe, scanId, threadId: ownerThread, ...(claimToken ? { claimToken } : {}) });
+      if (claimToken) {
+        runWorkbenchFixture(runtimeLabel, environment, [
+          "set-scan-thread", "--scan-id", scanId, "--claim-token", claimToken,
+          "--thread-id", ownerThread
+        ]);
+      }
+      const joinedResult = await callStart();
+      const joined = requireSuccessfulTool(joinedResult, `${runtimeLabel}: rejoin ${kind} scan`);
+      assert.equal(joined.startDisposition, "joined");
+      assert.equal(joined.scan.scanId, scanId);
+      assertPrivateRecipeOmitted(joinedResult, recipe, `${runtimeLabel}: ${kind} rejoin`);
+      assert.deepEqual(runWorkbenchFixture(runtimeLabel, environment, [
+        "get-scan-recipe", "--scan-id", scanId
+      ]).recipe, recipe, `${runtimeLabel}: ${kind} rejoin preserves the complete host recipe`);
+    } finally {
+      await client.close();
+    }
+  }
+}
+
+function privateScanRecipe(repository, mode) {
+  return {
+    repository,
+    mode,
+    target: { kind: "repository", paths: [] },
+    config: {
+      model_provider: "fixture",
+      model_providers: {
+        fixture: {
+          http_headers: { Authorization: "Bearer synthetic-private-header-marker" },
+          auth: { type: "command", command: "synthetic-private-auth-command-marker" }
+        }
+      }
+    }
+  };
+}
+
+function assertPrivateRecipeOmitted(result, recipe, label) {
+  assert.equal(Object.hasOwn(result.structuredContent, "recipe"), false, `${label}: omit host recipe`);
+  const serialized = JSON.stringify(result);
+  const provider = recipe.config.model_providers.fixture;
+  for (const marker of [provider.http_headers.Authorization, provider.auth.command]) {
+    assert.equal(serialized.includes(marker), false, `${label}: omit private provider settings`);
+  }
+}
+
+function runWorkbenchFixture(runtimeLabel, environment, arguments_, input) {
+  return JSON.parse(execFileSync(process.env.PYTHON ?? "python3", [
+    path.join(runtimeLabel === "shipped" ? bundledPluginRoot : pluginRoot, "scripts", "workbench_db.py"),
+    ...arguments_
+  ], {
+    env: { ...process.env, ...environment },
+    encoding: "utf8",
+    ...(input === undefined ? {} : { input: JSON.stringify(input) })
+  }));
 }
 
 function requireSuccessfulTool(result, label) {

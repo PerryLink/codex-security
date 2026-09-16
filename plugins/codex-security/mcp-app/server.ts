@@ -11,7 +11,6 @@ import type { ScanResults } from "./src/types.js";
 import { MCP_APP_VERSION } from "./src/version.js";
 import {
   handoffClaimTokenSchema,
-  recoveryHandoffClaimTokenSchema,
   registerScanHandoffTools
 } from "./src/server/handoff-tools.js";
 import { registerCompactArtifactTools } from "./src/server/compact-artifact-tools.js";
@@ -496,7 +495,7 @@ export function createCodexSecurityServer(): McpServer {
         text: `${started.startDisposition === "created" ? "Started" : "Rejoined"} Standard scan ${scanId}. When the scan is in preflight, complete security_scan preflight before reviewing the target or creating a goal. Preserve the returned handoffClaimToken for scan progress, the semantic draft, and completion.`
       }],
       structuredContent: {
-        ...redactHandoffClaimToken(started),
+        ...scanResponseContext(redactHandoffClaimToken(started)),
         scanId,
         scanDir,
         handoffClaimToken
@@ -742,6 +741,7 @@ export function createCodexSecurityServer(): McpServer {
       await nativeScans.run({
         scan,
         ...(isJsonObject(begun.recipe) ? { recipe: begun.recipe as NativeScanInput["recipe"] } : {}),
+        ...(isJsonObject(begun.deepScanSettings) ? { savedDeepScanSettings: begun.deepScanSettings as NativeScanInput["savedDeepScanSettings"] } : {}),
         threadId,
         ...modelSettings,
         parentSandbox,
@@ -763,13 +763,23 @@ export function createCodexSecurityServer(): McpServer {
   });
 
   const cancelSecurityScan = async (scanId: string, threadId?: string) => {
-    const workspace = await runWorkbench([
+    await runWorkbench([
       "cancel-scan",
       "--scan-id", scanId,
+      "--defer-publication",
       ...optionalArg("--thread-id", threadId)
     ]);
     await nativeScans.cancel(scanId);
-    return workspaceResult(workspace as unknown as WorkspaceState);
+    const current = await runWorkbench(["get-scan", "--scan-id", scanId]);
+    const scan = isJsonObject(current.scan) ? current.scan : undefined;
+    const retained = await runWorkbench([
+      "preserve-scan-results",
+      "--scan-id", scanId,
+      "--after-stop",
+      ...optionalArg("--thread-id", threadId),
+      ...optionalArg("--claim-token", typeof scan?.handoffClaimToken === "string" ? scan.handoffClaimToken : undefined)
+    ]);
+    return workspaceResult(retained.workspace as unknown as WorkspaceState);
   };
 
   server.registerTool("cancel_codex_security_scan", {
@@ -915,10 +925,6 @@ export function createCodexSecurityServer(): McpServer {
       && threadId
       && scan?.handoffStatus === "delivered"
       && scan.handoffClaimToken === handoffClaimToken
-      && (
-        scan.continuationThreadId === threadId
-        || recoveryHandoffClaimTokenSchema.safeParse(handoffClaimToken).success
-      )
     ) {
       authenticatedArtifactClaims.set(scanId, {
         claimToken: handoffClaimToken,
@@ -1078,15 +1084,22 @@ export function createCodexSecurityServer(): McpServer {
     annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
     _meta: modelActionMeta
   }, async ({ scanId, message, handoffClaimToken }) => {
-    const failed = await runWorkbench([
+    await runWorkbench([
       "fail-scan",
       "--scan-id",
       scanId,
+      "--defer-publication",
       "--message",
       message,
       ...optionalArg("--claim-token", handoffClaimToken)
     ]);
     await nativeScans.cancel(scanId, message);
+    const failed = await runWorkbench([
+      "preserve-scan-results",
+      "--scan-id", scanId,
+      "--after-stop",
+      ...optionalArg("--claim-token", handoffClaimToken)
+    ]);
     return scanActionResult(failed, "Recorded the Codex Security scan failure.");
   });
 
@@ -1429,14 +1442,19 @@ function promptOnlyScanResult(promptOnly: JsonObject) {
       type: "text" as const,
       text: `${disposition} prompt-driven scan ${scanId}. Use the returned scanId and scanDir for every phase. Author scan-manifest.json as an unsealed draft: omit scan.sealedAt and scan.artifacts because completion supplies the exact workbench timestamps, seal, artifact digests, and derived finding identities. Then call complete_codex_security_scan once to index the completed findings.`
     }],
-    structuredContent: promptOnly
+    structuredContent: scanResponseContext(promptOnly)
   };
+}
+
+function scanResponseContext(result: JsonObject) {
+  const { recipe: _recipe, ...context } = result;
+  return context;
 }
 
 function scanActionResult(result: JsonObject, summary: string) {
   return {
     content: [{ type: "text" as const, text: summary }],
-    structuredContent: result
+    structuredContent: scanResponseContext(result)
   };
 }
 

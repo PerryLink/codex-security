@@ -20,7 +20,7 @@ afterEach(() => {
 const stoppedScanProbe = [
   "import argparse, hashlib, json, os, pathlib, shutil, sqlite3, subprocess, sys, uuid",
   "plugin = pathlib.Path(sys.argv[1])",
-  "root = pathlib.Path(sys.argv[2])",
+  "root = pathlib.Path(sys.argv[2]).resolve()",
   "source = sys.argv[3]",
   "terminal_status = sys.argv[4] if len(sys.argv) > 4 else 'failed'",
   "state = root / 'state'",

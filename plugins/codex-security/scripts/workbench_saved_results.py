@@ -1707,6 +1707,9 @@ def preserve_scan_results(db: Any, connection: Any, args: Any) -> dict[str, Any]
                 )
         if scan["status"] == "running":
             return db.scan_context(connection, scan_id)
+        if getattr(args, "after_stop", False):
+            preserve_stopped_results_after_transition(db, connection, scan_id)
+            return db.scan_context(connection, scan_id)
         published = preserve_scan_results_locked(db, connection, scan_id)
         if not published and scan["canceled_at"] is not None:
             raise SystemExit("Saved scan results could not be published or verified.")
@@ -1884,16 +1887,29 @@ def fail_scan_locked(db: Any, connection: Any, args: Any) -> dict[str, Any]:
     try:
         timestamp = db.now()
         scan = db.require_scan(connection, scan_id)
-        if scan["status"] == "failed":
-            connection.commit()
-            return db.scan_context(connection, scan["id"])
         if scan["status"] == "complete":
             raise SystemExit("A completed scan cannot be marked failed.")
-        db.handoff.require_current_continuation(
-            scan,
-            args.claim_token,
-            error_message="Scan failure is owned by another continuation.",
-        )
+        if (
+            scan["status"] != "failed"
+            or getattr(args, "defer_publication", False)
+            or cost_json is not None
+        ):
+            db.handoff.require_current_continuation(
+                scan,
+                args.claim_token,
+                error_message="Scan failure is owned by another continuation.",
+            )
+        if scan["status"] == "failed":
+            if cost_json is not None:
+                stored = stored_scan_cost_fields(scan["cost_json"])
+                incoming = json.loads(cost_json)
+                if "usage" in stored and "usage" not in incoming:
+                    cost_json = json.dumps({**stored, "cost": incoming})
+                connection.execute(
+                    "UPDATE scans SET cost_json = ? WHERE id = ?", (cost_json, scan_id)
+                )
+            connection.commit()
+            return db.scan_context(connection, scan["id"])
         message = db.optional_text(args.message, maximum=2400)
         updated = connection.execute(
             """
@@ -1916,7 +1932,8 @@ def fail_scan_locked(db: Any, connection: Any, args: Any) -> dict[str, Any]:
     except BaseException:
         connection.rollback()
         raise
-    preserve_stopped_results_after_transition(db, connection, scan["id"])
+    if not getattr(args, "defer_publication", False):
+        preserve_stopped_results_after_transition(db, connection, scan["id"])
     return db.scan_context(connection, scan["id"])
 
 
@@ -1965,7 +1982,8 @@ def cancel_scan_locked(db: Any, connection: Any, args: Any) -> dict[str, Any]:
     except BaseException:
         connection.rollback()
         raise
-    preserve_stopped_results_after_transition(db, connection, scan["id"])
+    if not getattr(args, "defer_publication", False):
+        preserve_stopped_results_after_transition(db, connection, scan["id"])
     return db.workspace_state(connection, scan["workspace_id"])
 
 
