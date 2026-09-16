@@ -84,6 +84,7 @@ const { cleanup, copyCompletedScan, temporaryDirectory } =
 afterEach(cleanup);
 
 test.each([
+  "default",
   "openrouter",
   "fireworks",
   "command-auth",
@@ -98,11 +99,14 @@ test.each([
     const configPath = join(root, "config-preflight.toml");
     await mkdir(repository);
     await mkdir(home);
-    const provider = name.startsWith("cloud")
-      ? "amazon-bedrock"
-      : name === "command-auth"
-        ? "openrouter"
-        : name;
+    const provider =
+      name === "default"
+        ? "openai"
+        : name.startsWith("cloud")
+          ? "amazon-bedrock"
+          : name === "command-auth"
+            ? "openrouter"
+            : name;
     const definition: JsonObject =
       provider === "amazon-bedrock"
         ? { aws: { region: "us-west-2", profile: "synthetic" } }
@@ -120,9 +124,19 @@ test.each([
                 }
               : { env_key: `${provider.toUpperCase()}_API_KEY` }),
           };
+    const auth = {
+      cli_auth_credentials_store: "file",
+      forced_login_method: "chatgpt",
+      forced_chatgpt_workspace_id: "synthetic-workspace",
+    };
     const config = {
-      model_provider: name.startsWith("cloud") ? "openai" : provider,
-      model_providers: { [provider]: definition },
+      ...auth,
+      ...(name === "default"
+        ? {}
+        : {
+            model_provider: name.startsWith("cloud") ? "openai" : provider,
+            model_providers: { [provider]: definition },
+          }),
       ...(name.startsWith("cloud")
         ? { profile: name, profiles: { [name]: { model_provider: provider } } }
         : {}),
@@ -146,14 +160,20 @@ test.each([
                 await readFile(`${configPath}.workers.toml`, "utf8"),
               ) as JsonObject;
               expect(runtime["model_provider"]).toBe(provider);
-              expect(runtime["model_providers"]).toEqual({
-                [provider]: definition,
-              });
+              expect(runtime["model_providers"]).toEqual(
+                name === "default"
+                  ? undefined
+                  : {
+                      [provider]: definition,
+                    },
+              );
+              for (const [key, value] of Object.entries(auth))
+                expect(runtime[key]).toBe(value);
               expect(runtime["profile"]).toBeUndefined();
               const preflight = parseToml(await readFile(configPath, "utf8"));
               if (name.startsWith("cloud"))
                 expect(preflight["model_provider"]).toBe("openai");
-              else
+              else if (name !== "default")
                 expect(preflight["model_providers"]).not.toEqual(
                   runtime["model_providers"],
                 );
