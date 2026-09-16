@@ -1404,7 +1404,7 @@ export class CodexSecurity {
       requireModelSafeOutputDir(scanDir);
       releaseExecution = await (
         this.#dependencies.acquireScanExecution ?? acquireScanExecution
-      )(stateDirectory, scanDir);
+      )(stateDirectory, scanDir, runtime.plugin.pluginRoot);
       notifyObserver(
         "onOutputDirReady",
         options.onOutputDirReady,

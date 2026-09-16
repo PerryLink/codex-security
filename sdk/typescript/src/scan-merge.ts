@@ -6,6 +6,7 @@ import Ajv2020 from "ajv/dist/2020.js";
 import { readScanFile } from "./contract.js";
 import type { ScanArtifactRestorer } from "./runtime.js";
 import type { ScanResult } from "./result.js";
+import { relativePathIsOutside } from "./targets.js";
 import {
   exactUnion,
   isObject,
@@ -36,10 +37,17 @@ export function scanMergeInput(
   parentScanId: string,
 ): ScanMergeInput {
   const scanId = result.manifest.scan.id;
+  const findings = result.findings.findings.filter((finding) =>
+    finding.locations.some((location) =>
+      result.manifest.scan.scope.includePaths.some(
+        (scope) => !relativePathIsOutside(relative(scope, location.path)),
+      ),
+    ),
+  );
   const draft = semanticScanDraft(
     parentScanId,
     result.manifest.scan,
-    result.findings.findings,
+    findings,
     result.coverage,
   );
   if (draft.complete === false)
@@ -54,7 +62,7 @@ export function scanMergeInput(
     scanId,
     scanDir: result.scanDir,
     draft,
-    sourceFindings: structuredClone(result.findings.findings),
+    sourceFindings: structuredClone(findings),
   };
 }
 

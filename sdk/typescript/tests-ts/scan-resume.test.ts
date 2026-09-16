@@ -65,7 +65,7 @@ async function interruptedScan(
   > = {},
   resolvedDeep = false,
   startedMerge = true,
-  childCost?: ScanCost,
+  ordinaryPass: { cost?: ScanCost } | null = {},
 ) {
   const root = await temporaryDirectory();
   const repository = bulk
@@ -213,7 +213,7 @@ async function interruptedScan(
   );
   let childId: string | undefined;
   let childDir: string | undefined;
-  if (mode === "deep") {
+  if (mode === "deep" && ordinaryPass !== null) {
     childDir = join(scanDir, "artifacts/deep-scan/passes/pass-1");
     await mkdir(childDir, { recursive: true, mode: 0o700 });
     const child = await command(
@@ -256,7 +256,9 @@ async function interruptedScan(
       "complete-scan",
       "--scan-id",
       childId,
-      ...(childCost ? ["--cost-json", JSON.stringify(childCost)] : []),
+      ...(ordinaryPass.cost
+        ? ["--cost-json", JSON.stringify(ordinaryPass.cost)]
+        : []),
     ]);
     const state: DeepScanCheckpoint = {
       version: 2,
@@ -529,7 +531,11 @@ test.each([
 ])(
   "resumed CLI seals the original scan (aggregate finished: %p, bulk: %p)",
   async (alreadyFinished, bulk) => {
-    const f = await interruptedScan("deep", bulk);
+    const cost = estimateScanCost("gpt-5.6-sol", {
+      input_tokens: 1000,
+      output_tokens: 100,
+    })!;
+    const f = await interruptedScan("deep", bulk, {}, false, true, { cost });
     if (alreadyFinished) await finishDiscovery(f);
     await appendFile(
       f.sessionPath,
@@ -589,7 +595,7 @@ test.each([
         attempt: 1,
         outputDir: f.scanDir,
         status: "completed_with_incomplete_coverage",
-        cost: { inputTokens: 10000, outputTokens: 2000 },
+        cost: { inputTokens: 11000, outputTokens: 2100 },
       });
       // Reconcile a crash after sealing but before the bulk receipt was appended.
       await writeFile(result.resultsPath, JSON.stringify(receipts[0]) + "\n");
@@ -619,7 +625,7 @@ test.each([
         .map((line) => JSON.parse(line));
       expect(reconciled[1]).toMatchObject({
         attempt: 1,
-        cost: { inputTokens: 10000, outputTokens: 2000 },
+        cost: { inputTokens: 11000, outputTokens: 2100 },
       });
       // A subsequent bulk recovery must skip the reconciled completion.
       const nextOutput = capture();
@@ -640,14 +646,15 @@ test.each([
       expect(result.coverage.completeness).toBe("partial");
       expect(result.manifest.scan.id).toBe(f.scanId);
       expect(result.manifest.scan.sealedAt).toBeString();
-      expect(result.cost.inputTokens).toBe(10000);
-      expect(result.cost.outputTokens).toBe(2000);
+      expect(result.cost.inputTokens).toBe(11000);
+      expect(result.cost.outputTokens).toBe(2100);
     }
     expect(
       (await f.command(["get-scan", "--scan-id", f.scanId]))["scan"],
     ).toMatchObject({
       progress: { status: "complete" },
       continuationThreadId: f.threadId,
+      cost: { inputTokens: 11000, outputTokens: 2100 },
     });
     expect(
       (await f.command(["list-scans", "--repository", f.repository]))["scans"],
@@ -670,6 +677,7 @@ test.each([false, true])(
       { maxCostUsd: 0.001 },
       true,
       false,
+      null,
     );
     const cost = estimateScanCost("gpt-5.6-sol", {
       input_tokens: 10000,
@@ -1057,7 +1065,7 @@ test.each([
       { postScanPrompt },
       false,
       true,
-      childCost,
+      { cost: childCost },
     );
     await appendFile(
       f.sessionPath,

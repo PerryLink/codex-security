@@ -211,6 +211,7 @@ const distFiles = new Set(
     "multiscan",
     "mock-scan",
     "patch-tui",
+    "permission-profile",
     "publication",
     "publication-events",
     "publication-store",

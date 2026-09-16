@@ -68,6 +68,7 @@ function child(
   scanId: string,
   findings: JsonObject[] = [finding()],
   coverage: JsonObject = {},
+  includePaths: readonly string[] = ["src"],
 ) {
   return scanMergeInput(
     {
@@ -75,7 +76,7 @@ function child(
       manifest: {
         scan: {
           id: scanId,
-          scope: { includePaths: ["src"], excludePaths: [] },
+          scope: { includePaths, excludePaths: [] },
         },
       },
       findings: {
@@ -119,6 +120,51 @@ function sources(
 }
 
 describe("local scan merging", () => {
+  test.each([
+    { includePaths: ["src"], expected: ["inside", "mixed"] },
+    { includePaths: ["src/render.js"], expected: ["inside", "mixed"] },
+    {
+      includePaths: ["."],
+      expected: ["outside", "prefix", "inside", "mixed"],
+    },
+    { includePaths: ["src", "docs"], expected: ["outside", "inside", "mixed"] },
+    { includePaths: ["other"], expected: [] },
+  ])(
+    "admits findings within $includePaths without changing their locations",
+    ({ includePaths, expected }) => {
+      const findings = [
+        { id: "outside", paths: ["docs/index.js"] },
+        { id: "prefix", paths: ["src-private/render.js"] },
+        { id: "inside", paths: ["src/render.js"] },
+        { id: "mixed", paths: ["docs/index.js", "./src/render.js"] },
+      ].map(({ id, paths }) =>
+        finding(id, {
+          locations: paths.map((path) => ({ path, startLine: 1 })),
+        }),
+      );
+      const original = structuredClone(findings);
+      const input = child("scoped", findings, {}, includePaths);
+      expect(input.draft.findings.map((value) => value["identity"])).toEqual(
+        expected.map((anchor) => ({ anchor })),
+      );
+      const retained = original.filter((value) =>
+        expected.some(
+          (anchor) => anchor === (value["identity"] as JsonObject)["anchor"],
+        ),
+      );
+      expect(input.draft.findings).toMatchObject(retained);
+      expect(input.sourceFindings).toMatchObject(retained);
+      const merged = merge(submission(input.draft.findings), [input], null);
+      expect(merged.newFindings).toBe(expected.length);
+      expect(
+        merged.aggregate.findings
+          .flatMap(sources)
+          .map(({ finding }) => finding),
+      ).toEqual(input.sourceFindings);
+      expect(findings).toEqual(original);
+    },
+  );
+
   test("rebinds semantic input while retaining exact sealed findings", () => {
     const input = child("first", [
       finding("shared", { extensions: { custom: { evidence: ["exact"] } } }),
