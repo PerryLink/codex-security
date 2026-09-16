@@ -527,30 +527,42 @@ def _remediation_section(finding: dict[str, Any]) -> list[str]:
     remediation = _text(finding.get("remediation"), "No canonical remediation was recorded.")
     lines = ["", "#### Remediation", "", remediation]
     seen = {remediation}
-    sources = finding.get("provenance", {}).get("sourceFindings", [])
-    originals = (
-        [
-            source
-            for source in sources
-            if isinstance(source, dict) and isinstance(source.get("finding"), dict)
-        ]
-        if isinstance(sources, list)
-        else []
-    )
-    for source in originals:
-        text = _text(source["finding"].get("remediation"), "")
+    originals: list[tuple[str, dict[str, Any]]] = []
+    pending = [("finding", finding)]
+    seen_findings: set[int] = set()
+    while pending:
+        source_id, original = pending.pop()
+        if id(original) in seen_findings:
+            continue
+        seen_findings.add(id(original))
+        originals.append((source_id, original))
+        provenance = original.get("provenance")
+        if not isinstance(provenance, dict):
+            continue
+        previous = provenance.get("previousFindings")
+        if isinstance(previous, list):
+            pending.extend(
+                (source_id, item) for item in reversed(previous) if isinstance(item, dict)
+            )
+        sources = provenance.get("sourceFindings")
+        if isinstance(sources, list):
+            pending.extend(
+                (_text(source.get("id"), "finding"), source["finding"])
+                for source in reversed(sources)
+                if isinstance(source, dict) and isinstance(source.get("finding"), dict)
+            )
+    for source_id, original in originals[1:]:
+        text = _text(original.get("remediation"), "")
         if text and text not in seen:
             seen.add(text)
-            lines.extend(["", f"Source {_text(source.get('id'), 'finding')}: {text}"])
+            lines.extend(["", f"Source {source_id}: {text}"])
     for field, label in (
         ("remediationTests", "Tests"),
         ("preventiveControls", "Preventive controls"),
     ):
         values = list(
             dict.fromkeys(
-                value
-                for original in [finding, *(source["finding"] for source in originals)]
-                for value in _strings(original.get(field))
+                value for _, original in originals for value in _strings(original.get(field))
             )
         )
         if values:
@@ -793,7 +805,9 @@ def _linked_finding_section(number: int, finding: dict[str, Any], report_path: s
     ]
     for heading in ("Summary", "Validation", "Dataflow", "Reachability", "Severity"):
         lines.extend(["", f"#### {heading}", "", f"See the {link}."])
-    if finding.get("provenance", {}).get("sourceFindings"):
+    if any(
+        finding.get("provenance", {}).get(field) for field in ("sourceFindings", "previousFindings")
+    ):
         lines.extend(_remediation_section(finding))
     else:
         lines.extend(["", "#### Remediation", "", f"See the {link}."])

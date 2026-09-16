@@ -174,15 +174,15 @@ def assert_published_aggregate(scan):
     assert (scan.scan_dir / "report.md").is_file()
 
 
-@pytest.mark.parametrize("mode", ["standard", "deep"])
+@pytest.mark.parametrize("mode", ["standard", "deep", "deep-nested"])
 @pytest.mark.parametrize("linked_writeup", [False, True], ids=["inline", "linked"])
 def test_publication_renders_each_source_remediation(
     workbench_api, workbench_db, publication_scan, mode, linked_writeup
 ):
-    scan = publication_scan(mode=mode)
+    scan = publication_scan(mode="deep" if mode == "deep-nested" else mode)
     finding = scan.findings[0]
     first = copy.deepcopy(finding)
-    first.pop("provenance")
+    first["provenance"] = {"source": "local_plugin"}
     first["remediation"] = "Check the destination before writing the archive entry."
     first["remediationTests"] = ["Reject an archive entry outside the destination."]
     second = copy.deepcopy(first)
@@ -191,15 +191,30 @@ def test_publication_renders_each_source_remediation(
     second["preventiveControls"] = ["Use a directory-relative file handle."]
     third = copy.deepcopy(second)
     third["remediationTests"].append("Reject a dangling symbolic link.")
+    third["preventiveControls"].append("Resolve links relative to the destination directory.")
     fourth = copy.deepcopy(first)
     fourth["remediation"] = "Create the output file exclusively."
     fourth["remediationTests"] = ["Preserve an existing destination file."]
     sources = [first, second, third, fourth]
     finding["remediation"] = first["remediation"]
     finding["remediationTests"] = first["remediationTests"]
-    finding["provenance"]["sourceFindings"] = [
-        {"id": f"review-{index}:0", "finding": source} for index, source in enumerate(sources, 1)
-    ]
+    if mode == "standard":
+        # Standard completion itself consolidates these duplicate logical findings.
+        scan.findings[:] = sources
+        finding = first
+    elif mode == "deep-nested":
+        nested = copy.deepcopy(second)
+        nested["provenance"]["previousFindings"] = [third]
+        nested["provenance"]["sourceFindings"] = [{"id": "review-4:0", "finding": fourth}]
+        finding["provenance"]["sourceFindings"] = [
+            {"id": "review-1:0", "finding": first},
+            {"id": "review-2:0", "finding": nested},
+        ]
+    else:
+        finding["provenance"]["sourceFindings"] = [
+            {"id": f"review-{index}:0", "finding": source}
+            for index, source in enumerate(sources, 1)
+        ]
     if linked_writeup:
         finding["writeup"] = {"reportPath": "findings/archive/archive.md"}
         writeup = scan.scan_dir / "findings" / "archive" / "archive.md"
@@ -211,7 +226,22 @@ def test_publication_renders_each_source_remediation(
     completed = complete(workbench_api, workbench_db, scan)
 
     assert completed["progress"]["status"] == "complete"
-    assert_published_aggregate(scan)
+    if mode == "standard":
+        published = json.loads((scan.scan_dir / "findings.json").read_text())["findings"]
+        assert len(published) == 1
+        canonical = published[0]
+        assert "sourceFindings" not in canonical["provenance"]
+        retained = [canonical, *canonical["provenance"].pop("previousFindings")]
+        for source in retained:
+            for field in ("findingId", "occurrenceId", "fingerprints"):
+                assert source.pop(field)
+        assert retained == sources
+        coverage = json.loads((scan.scan_dir / "coverage.json").read_text())
+        for field in ("documentType", "schemaVersion", "scanId"):
+            coverage.pop(field)
+        assert coverage == scan.coverage
+    else:
+        assert_published_aggregate(scan)
     report = (scan.scan_dir / "report.md").read_text()
     if linked_writeup:
         assert "findings/archive/archive.md" in report
@@ -220,7 +250,10 @@ def test_publication_renders_each_source_remediation(
         assert report.count(source["remediation"]) == 1
         for test in source["remediationTests"]:
             assert report.count(test) == 1
-    assert "Use a directory-relative file handle." in report
+        for control in source.get("preventiveControls", []):
+            assert report.count(control) == 1
+    positions = [report.index(text) for text in dict.fromkeys(s["remediation"] for s in sources)]
+    assert positions == sorted(positions)
 
 
 @pytest.mark.parametrize("scope", [".", "subdir"], ids=["repository", "scoped"])
