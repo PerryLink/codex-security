@@ -318,6 +318,95 @@ def test_parent_reads_completed_child_after_registration_checkpoint_crash(tmp_pa
     assert run_workbench(state, "list-repositories")["repositories"][0]["scanCount"] == 2
 
 
+def test_archiving_composition_preserves_children_and_reuses_pass_directories(
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "target"
+    target.mkdir()
+    (target / "app.py").write_text("print('fixture')\n")
+    state = tmp_path / "state"
+    directory = tmp_path / "scan"
+    parent = register(state, target, directory, mode="deep")
+    child_path = "artifacts/deep-scan/passes/pass-1"
+    child = register(state, target, directory / child_path, parent=parent["scanId"])
+    saved = checkpoint(state, parent, passes=[{"directory": child_path}])
+    unrelated = register(state, target, tmp_path / "rerun", parent=parent["scanId"])
+    for scan in (child, unrelated):
+        write_completed_contract(
+            Path(scan["scanDir"]),
+            scan["scanId"],
+            target,
+            relative_path="app.py",
+            identity_anchor=scan["scanId"],
+        )
+        run_workbench(state, "complete-scan", "--scan-id", scan["scanId"])
+    run_workbench(
+        state, "fail-scan", "--scan-id", parent["scanId"], "--message", "Synthetic interruption."
+    )
+    with sqlite3.connect(state / "workbench.sqlite3") as connection:
+        connection.row_factory = sqlite3.Row
+        old_scans = {row["id"]: dict(row) for row in connection.execute("SELECT * FROM scans")}
+        old_artifacts = [dict(row) for row in connection.execute("SELECT * FROM scan_artifacts")]
+        old_findings = connection.execute("SELECT * FROM finding_occurrences").fetchall()
+    child_manifest = (directory / child_path / "scan-manifest.json").read_bytes()
+    archived = tmp_path / "scan.previous-test"
+    directory.rename(archived)
+    directory.mkdir(mode=0o700)
+    current = run_workbench(
+        state,
+        "register-cli-scan",
+        "--repository",
+        str(target),
+        "--scan-dir",
+        str(directory),
+        "--recipe-json",
+        json.dumps(recipe(target, "deep")),
+        "--archive-existing",
+        "--archived-scan-dir",
+        str(archived),
+    )
+
+    archived_child = run_workbench(state, "get-scan", "--scan-id", child["scanId"])
+    assert archived_child["scan"]["scanDir"] == str(archived / child_path)
+    assert archived_child["scan"]["findingCount"] == 1
+    assert (archived / child_path / "scan-manifest.json").read_bytes() == child_manifest
+    context = run_workbench(state, "get-scan", "--scan-id", parent["scanId"])
+    assert context["compositionCheckpoint"] == saved
+    assert context["scan"]["progress"]["independentReviews"]["completed"] == 1
+    assert {scan["scanId"] for scan in run_workbench(state, "list-scans")["scans"]} == {
+        parent["scanId"],
+        current["scanId"],
+        unrelated["scanId"],
+    }
+    assert {
+        finding["scanId"] for finding in run_workbench(state, "list-global-findings")["findings"]
+    } == {parent["scanId"], unrelated["scanId"]}
+    assert run_workbench(state, "list-repositories")["repositories"][0]["scanCount"] == 3
+    with sqlite3.connect(state / "workbench.sqlite3") as connection:
+        connection.row_factory = sqlite3.Row
+        for scan_id, old in old_scans.items():
+            if scan_id != unrelated["scanId"]:
+                old["scan_dir"] = str(archived / Path(old["scan_dir"]).relative_to(directory))
+                old.pop("updated_at")
+            actual = dict(
+                connection.execute("SELECT * FROM scans WHERE id = ?", (scan_id,)).fetchone()
+            )
+            assert {key: actual[key] for key in old} == old
+        for artifact in old_artifacts:
+            if artifact["scan_id"] != unrelated["scanId"]:
+                artifact["path"] = str(archived / Path(artifact["path"]).relative_to(directory))
+            actual = connection.execute(
+                "SELECT * FROM scan_artifacts WHERE scan_id = ? AND kind = ?",
+                (artifact["scan_id"], artifact["kind"]),
+            ).fetchone()
+            assert dict(actual) == artifact
+            assert Path(actual["path"]).is_file()
+        assert connection.execute("SELECT * FROM finding_occurrences").fetchall() == old_findings
+    replacement = register(state, target, directory / child_path, parent=current["scanId"])
+    assert replacement["scanId"] != child["scanId"]
+    assert replacement["scanDir"] == str(directory / child_path)
+
+
 @pytest.mark.parametrize("action", ["fail-scan", "cancel-scan"])
 def test_stopped_standard_cannot_resume_and_preserves_checkpoint(
     tmp_path: Path, action: str

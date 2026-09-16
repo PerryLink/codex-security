@@ -13,7 +13,10 @@ import {
 } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import { runDeepScans } from "./deep-scan.js";
-import { acquireScanExecution } from "./scan-execution.js";
+import {
+  acquireScanExecution,
+  ScanTransportClosedError,
+} from "./scan-execution.js";
 import { prepareSemanticScanDraft } from "./scan-semantics.js";
 import { homedir, tmpdir } from "node:os";
 import {
@@ -1662,7 +1665,7 @@ export class CodexSecurity {
         signal,
         failureMessage: "Could not save the Codex Security scan",
       };
-      const registration =
+      let registration =
         options.resumeScanId !== undefined &&
         options.registeredScan === undefined
           ? await workbench(workbenchOptions, [
@@ -1705,6 +1708,13 @@ export class CodexSecurity {
                   : { workflowId: options.workflowId }),
               }),
             );
+      if (options.registeredScan !== undefined) {
+        registration = await workbench(workbenchOptions, [
+          "get-cli-scan-resume",
+          "--scan-id",
+          options.registeredScan.scanId,
+        ]);
+      }
       const scanId = registration["scanId"];
       let resumeThreadId =
         options.resumeScanId === undefined &&
@@ -1742,9 +1752,9 @@ export class CodexSecurity {
             `The original Codex session for scan ${scanId} is unavailable. Restore its session logs in the original Codex Security state directory before resuming.`,
           );
         }
-        if (typeof registration["sealedProducerVersion"] === "string") {
-          expectation.pluginVersion = registration["sealedProducerVersion"];
-        }
+      }
+      if (typeof registration["sealedProducerVersion"] === "string") {
+        expectation.pluginVersion = registration["sealedProducerVersion"];
       }
       const targetId = registration["targetId"];
       const contract = registration["contract"];
@@ -1958,12 +1968,14 @@ export class CodexSecurity {
           "01_context",
           "false_positive_feedback.json",
         );
-        await mkdir(dirname(feedbackPath), { recursive: true, mode: 0o700 });
-        await writeFile(
-          feedbackPath,
-          `${JSON.stringify(falsePositiveExamples)}\n`,
-          { flag: "wx", mode: 0o600, signal },
-        );
+        if (options.registeredScan === undefined) {
+          await mkdir(dirname(feedbackPath), { recursive: true, mode: 0o700 });
+          await writeFile(
+            feedbackPath,
+            `${JSON.stringify(falsePositiveExamples)}\n`,
+            { flag: "wx", mode: 0o600, signal },
+          );
+        }
         prompt = [
           prompt,
           "",
@@ -2718,7 +2730,8 @@ export class CodexSecurity {
               usage: passCosts.size > 0 ? scanCostUsage(cost) : tracked?.usage,
             };
       let failure =
-        signal.reason instanceof ScanCostLimitExceededError
+        signal.reason instanceof ScanCostLimitExceededError ||
+        signal.reason instanceof ScanTransportClosedError
           ? signal.reason
           : error;
       if (
@@ -2807,7 +2820,8 @@ export class CodexSecurity {
           return result;
         } catch {}
       }
-      if (activeScan !== null && options.deepScanPass) {
+      const transportClosed = signal.reason instanceof ScanTransportClosedError;
+      if (activeScan !== null && (options.deepScanPass || transportClosed)) {
         await workbench({ ...activeScan.options, signal: undefined }, [
           "preserve-scan-results",
           "--scan-id",
@@ -2818,7 +2832,7 @@ export class CodexSecurity {
         ]).catch(() => undefined);
       }
       // Registration and execution ownership have succeeded before activeScan is set.
-      if (activeScan !== null && !options.deepScanPass) {
+      if (activeScan !== null && !options.deepScanPass && !transportClosed) {
         if (
           options.validationPrompt !== undefined &&
           !customValidationComplete
@@ -5323,7 +5337,11 @@ export function scanPreflightCodexConfig(config: JsonObject): JsonObject {
 
 function throwIfAborted(signal?: AbortSignal, scanDir = ""): void {
   if (!signal?.aborted) return;
-  if (signal.reason instanceof ScanCostLimitExceededError) throw signal.reason;
+  if (
+    signal.reason instanceof ScanCostLimitExceededError ||
+    signal.reason instanceof ScanTransportClosedError
+  )
+    throw signal.reason;
   const message = scanDir
     ? `Codex Security scan was interrupted; partial output remains at ${scanDir}.`
     : "Codex Security scan was interrupted during preparation.";

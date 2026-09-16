@@ -1466,7 +1466,7 @@ Replacement files resolve from the invocation directory. Custom validation keeps
 | `scans list [REPOSITORY]`                             | List scans. Filter by artifact root with `--scan-root DIR`.                                                 |
 | `scans show [SCAN_ID]`                                | Show a scan; defaults to the latest completed one. `--show-linked-findings` includes earlier finding links. |
 | `scans logs [SCAN_ID]`                                | Show session events; defaults to the latest scan, including active scans.                                   |
-| `scans resume SCAN_ID`                                | Resume saved Deep Scan work in its original output directory.                               |
+| `scans resume SCAN_ID`                                | Resume saved Deep Scan work in its original output directory.                                               |
 | `scans rerun [SCAN_ID]`                               | Repeat a scan on the current checkout; defaults to the latest completed scan.                               |
 | `scans match BEFORE AFTER`                            | Link findings with the same root cause.                                                                     |
 | `scans match --all`                                   | Match completed scans across the repository's worktrees and clones.                                         |

@@ -100,6 +100,8 @@ test("native waiters join one ordinary scan and detaching leaves it running", as
 test("native cancellation drains only its parent; shutdown drains the rest", async () => {
   const started = new Map();
   const closed = [];
+  const closing = Promise.withResolvers();
+  const releaseClose = Promise.withResolvers();
   const host = new NativeScanHost(async ({ scan }) => ({
     options: { mode: "deep" },
     client: {
@@ -112,6 +114,10 @@ test("native cancellation drains only its parent; shutdown drains the rest", asy
         );
       },
       async close() {
+        if (scan.scanId === "second") {
+          closing.resolve();
+          await releaseClose.promise;
+        }
         closed.push(scan.scanId);
       },
     },
@@ -119,16 +125,83 @@ test("native cancellation drains only its parent; shutdown drains the rest", asy
   const first = host.run(input("first"));
   const second = host.run(input("second"));
   const firstRejected = assert.rejects(first, /user_canceled_scan/);
-  const secondRejected = assert.rejects(second, /mcp_transport_closed/);
+  const secondRejected = assert.rejects(second, (error) => {
+    assert.equal(error.constructor.name, "ScanTransportClosedError");
+    assert.equal(error.message, "mcp_transport_closed");
+    return true;
+  });
   await Promise.resolve();
   await Promise.resolve();
   await host.cancel("first");
   await firstRejected;
+  assert.equal(started.get("first").reason.constructor, Error);
   assert.equal(started.get("second").aborted, false);
   assert.deepEqual(closed, ["first"]);
-  await host.close();
+  let drained = false;
+  const shutdown = host.close().then(() => {
+    drained = true;
+  });
+  await closing.promise;
+  assert.equal(drained, false);
+  assert.deepEqual(closed, ["first"]);
+  releaseClose.resolve();
+  await shutdown;
   await secondRejected;
   assert.deepEqual(closed, ["first", "second"]);
+});
+
+test("native launches snapshot safety identifiers and prefer saved recipes", async () => {
+  const root = await mkdtemp(join(tmpdir(), "native-safety-identifier-"));
+  const keys = [
+    "CODEX_HOME",
+    "CODEX_CLI_PATH",
+    "CODEX_SECURITY_CONFIG_PATH",
+    "CODEX_SECURITY_DEEP_SCAN_CONFIG_PATH",
+    "CODEX_SAFETY_IDENTIFIER",
+  ];
+  const before = Object.fromEntries(keys.map((key) => [key, process.env[key]]));
+  try {
+    Object.assign(process.env, {
+      CODEX_HOME: root,
+      CODEX_CLI_PATH: process.execPath,
+    });
+    delete process.env.CODEX_SECURITY_CONFIG_PATH;
+    delete process.env.CODEX_SECURITY_DEEP_SCAN_CONFIG_PATH;
+    await writeFile(
+      join(root, "config.toml"),
+      'model_provider = "synthetic"\n[model_providers.synthetic]\nbase_url = "https://example.invalid"\n',
+    );
+    const launches = [
+      ["synthetic-fresh", undefined, "synthetic-fresh"],
+      ["synthetic-resumed", {}, "synthetic-resumed"],
+      [
+        "synthetic-current",
+        { safetyIdentifier: "synthetic-saved" },
+        "synthetic-saved",
+      ],
+      [undefined, undefined, undefined],
+    ].map(([ambient, recipe, expected], index) => {
+      if (ambient === undefined) delete process.env.CODEX_SAFETY_IDENTIFIER;
+      else process.env.CODEX_SAFETY_IDENTIFIER = ambient;
+      return prepareNativeScan({ ...input(`parent-${index}`), recipe }).then(
+        ({ client, options }) => {
+          assert.equal(options.safetyIdentifier, expected);
+          assert.equal(
+            client.dependencies.environment.CODEX_SAFETY_IDENTIFIER,
+            ambient,
+          );
+        },
+      );
+    });
+    await Promise.all(launches);
+    assert.equal(process.env.CODEX_SAFETY_IDENTIFIER, undefined);
+  } finally {
+    for (const key of keys) {
+      if (before[key] === undefined) delete process.env[key];
+      else process.env[key] = before[key];
+    }
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 test(

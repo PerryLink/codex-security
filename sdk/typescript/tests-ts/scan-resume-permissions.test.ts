@@ -46,7 +46,7 @@ async function fixture() {
   return { root, repository, codexHome, inheritedPermissions };
 }
 
-test("saved ordinary passes retain native permissions at the resumed Codex process boundary", async () => {
+test("saved ordinary passes retain native permissions and attribution at the resumed Codex process boundary", async () => {
   const { root, repository, codexHome, inheritedPermissions } = await fixture();
   const scanDir = join(root, "scan");
   const captures = join(root, "launches.jsonl");
@@ -60,6 +60,7 @@ import { join } from "node:path";
 appendFileSync(${JSON.stringify(captures)}, JSON.stringify({
   args: process.argv.slice(1),
   selected: process.env.SYNTHETIC_SCAN_SETTING,
+  safetyIdentifier: process.env.CODEX_SAFETY_IDENTIFIER,
 }) + "\\n");
 const directory = join(process.env.CODEX_HOME, "sessions", "2026", "01", "01");
 mkdirSync(directory, {recursive:true});
@@ -82,6 +83,7 @@ await new Promise(() => {});
     ...process.env,
     CODEX_SECURITY_STATE_DIR: join(root, "state"),
     SYNTHETIC_SCAN_SETTING: "selected-value",
+    CODEX_SAFETY_IDENTIFIER: "synthetic-ambient-identifier",
   };
   let registration: JsonObject | undefined;
   let workbenchOptions: WorkbenchCommandOptions | undefined;
@@ -136,6 +138,7 @@ await new Promise(() => {});
         mode: "standard",
         outputDir: scanDir,
         deepScanPass: true,
+        safetyIdentifier: "synthetic-saved-identifier",
       }),
     ).rejects.toThrow("Synthetic interrupted pass");
   } finally {
@@ -148,6 +151,8 @@ await new Promise(() => {});
   ]);
   const recipe = saved["recipe"] as JsonObject;
   expect(recipe["inheritedPermissions"]).toEqual(inheritedPermissions);
+  expect(recipe["safetyIdentifier"]).toBe("synthetic-saved-identifier");
+  environment.CODEX_SAFETY_IDENTIFIER = "synthetic-other-host-identifier";
   const resumed = makeClient(false, recipe["config"] as JsonObject);
   try {
     await expect(
@@ -156,6 +161,7 @@ await new Promise(() => {});
         outputDir: scanDir,
         resumeScanId: saved["scanId"] as string,
         deepScanPass: true,
+        safetyIdentifier: recipe["safetyIdentifier"] as string,
         inheritedPermissions: recipe[
           "inheritedPermissions"
         ] as ScanOptions["inheritedPermissions"],
@@ -167,7 +173,14 @@ await new Promise(() => {});
   const launches = (await readFile(captures, "utf8"))
     .trim()
     .split("\n")
-    .map((line) => JSON.parse(line) as { args: string[]; selected: string });
+    .map(
+      (line) =>
+        JSON.parse(line) as {
+          args: string[];
+          selected: string;
+          safetyIdentifier: string;
+        },
+    );
   expect(launches).toHaveLength(2);
   for (const launch of launches) {
     const permission = launch.args.find((value) =>
@@ -187,6 +200,7 @@ await new Promise(() => {});
       },
     });
     expect(launch.selected).toBe("selected-value");
+    expect(launch.safetyIdentifier).toBe("synthetic-saved-identifier");
   }
   expect(launches[1]!.args).toContain("resume");
   expect(launches[1]!.args).toContain(threadId);
@@ -218,10 +232,15 @@ test("CLI resume restores saved native permissions into the shared SDK operation
           mode: "deep",
           config: { model: "gpt-6-astra", model_reasoning_effort: "ultra" },
           inheritedPermissions,
+          safetyIdentifier: "synthetic-saved-identifier",
         },
       }),
     },
   );
   expect(result).toBe(0);
-  expect(selected).toMatchObject({ resumeScanId: id, inheritedPermissions });
+  expect(selected).toMatchObject({
+    resumeScanId: id,
+    inheritedPermissions,
+    safetyIdentifier: "synthetic-saved-identifier",
+  });
 });

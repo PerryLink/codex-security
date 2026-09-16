@@ -17,6 +17,7 @@ import {
 } from "./scan-merge.js";
 import type { ScanArtifactRestorer } from "./runtime.js";
 import type { SemanticScan } from "./scan-semantics.js";
+import { ScanTransportClosedError } from "./scan-execution.js";
 
 export const DEEP_SCAN_CHECKPOINT = "artifacts/deep-scan/checkpoint.json";
 
@@ -353,7 +354,11 @@ export async function runDeepScans(
         }
       }
     } catch (error) {
-      if (discoverySignal.aborted && pass.scanId !== undefined) {
+      if (
+        discoverySignal.aborted &&
+        !(discoverySignal.reason instanceof ScanTransportClosedError) &&
+        pass.scanId !== undefined
+      ) {
         await workbench([
           "fail-scan",
           "--scan-id",
@@ -436,6 +441,7 @@ export async function runDeepScans(
     await input.publish(state.aggregate);
     return state;
   } catch (error) {
+    if (signal.reason instanceof ScanTransportClosedError) throw error;
     state.terminalReason =
       signal.reason instanceof ScanCostLimitExceededError
         ? "capped"

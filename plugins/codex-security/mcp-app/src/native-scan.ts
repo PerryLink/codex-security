@@ -18,6 +18,7 @@ import { ScanSettingsSchema } from "../../../../sdk/typescript/src/scan-settings
 import { accountStatus } from "../../../../sdk/typescript/src/auth.js";
 import { CodexSecurityError } from "../../../../sdk/typescript/src/errors.js";
 import { resolveDeepScanConfig } from "../../../../sdk/typescript/src/deep-config.js";
+import { ScanTransportClosedError } from "../../../../sdk/typescript/src/scan-execution.js";
 import type { ScanResult } from "../../../../sdk/typescript/src/result.js";
 import {
   resolveCodexPath,
@@ -90,7 +91,9 @@ export class NativeScanHost {
   async close(): Promise<void> {
     const active = [...this.active.values()];
     for (const run of active)
-      run.controller.abort(new Error("mcp_transport_closed"));
+      run.controller.abort(
+        new ScanTransportClosedError("mcp_transport_closed"),
+      );
     await Promise.allSettled(active.map((run) => run.promise));
   }
 }
@@ -219,9 +222,10 @@ export async function prepareNativeScan(
           : input.scan.scope && input.scan.scope !== "."
             ? [input.scan.scope]
             : "repository",
-      ...(typeof recipe.safetyIdentifier === "string"
-        ? { safetyIdentifier: recipe.safetyIdentifier }
-        : {}),
+      safetyIdentifier:
+        typeof recipe.safetyIdentifier === "string"
+          ? recipe.safetyIdentifier
+          : environment.CODEX_SAFETY_IDENTIFIER,
       registeredScan: {
         scanId: input.scan.scanId,
         scanDir: input.scan.scanDir,

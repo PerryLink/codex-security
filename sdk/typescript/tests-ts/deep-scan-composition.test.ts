@@ -24,6 +24,7 @@ import {
   type DeepScanComposition,
 } from "../src/deep-scan.js";
 import { ScanResult } from "../src/result.js";
+import { ScanTransportClosedError } from "../src/scan-execution.js";
 import {
   scanFindingIdentity,
   type JsonObject,
@@ -615,4 +616,107 @@ describe("ordinary scan composition", () => {
     expect(h.published.at(-1)!.coverage["deferred"]).toHaveLength(1);
     expect(h.metrics().closed).toBe(2);
   });
+
+  test.each(["transport interruption", "explicit cancellation"] as const)(
+    "preserves saved discovery state across %s with the correct child lifecycle",
+    async (stop) => {
+      const h = await harness({ stopAfterNoNew: 3 });
+      const now = Date.parse("2026-01-02T12:00:00Z");
+      h.input.startedAt = new Date(now).toISOString();
+      const startedAt = new Date(now - 1_800_000).toISOString();
+      const scanId = randomUUID();
+      const directory = "artifacts/deep-scan/passes/pass-1";
+      const scanDir = join(h.input.scanDir, directory);
+      const childCheckpoint = join(scanDir, "checkpoint.json");
+      const childBytes = Buffer.from('{"completed":"inventory"}\n');
+      await mkdir(scanDir, { recursive: true, mode: 0o700 });
+      await writeFile(childCheckpoint, childBytes);
+      h.records.set(scanId, {
+        scanId,
+        scanDir,
+        parentScanId: h.input.scanId,
+        targetPath: h.input.repository,
+        progress: { status: "running" },
+      });
+      const coverage = { completeness: "partial", surfaces: [] };
+      const checkpoint: DeepScanCheckpoint = {
+        version: 2,
+        startedAt,
+        passes: [{ directory, scanId }],
+        mergedScanIds: [],
+        aggregate: { scanId: h.input.scanId, findings: [], coverage },
+        legacy: { discoveryRuns: 2, coverage },
+        noNewStreak: 2,
+        consecutiveErrors: 1,
+        mergeFailures: 1,
+      };
+      await h.seed(checkpoint);
+      const checkpointPath = join(h.input.scanDir, DEEP_SCAN_CHECKPOINT);
+      const checkpointBytes = await readFile(checkpointPath);
+      const reason =
+        stop === "transport interruption"
+          ? new ScanTransportClosedError("Native transport disconnected.")
+          : new Error("Canceled by the user.");
+      h.setRun(async () => {
+        h.controller.abort(reason);
+        throw reason;
+      });
+      const clock = spyOn(Date, "now").mockReturnValue(now);
+      try {
+        await expect(runDeepScans(h.input)).rejects.toThrow(reason.message);
+        expect(h.calls).toHaveLength(1);
+        expect(h.calls[0]).toMatchObject({
+          resumeScanId: scanId,
+          outputDir: scanDir,
+        });
+        expect(h.metrics()).toEqual({ closed: 1, maximumActive: 1 });
+        expect(await readFile(childCheckpoint)).toEqual(childBytes);
+        expect(await h.checkpoint()).toMatchObject({
+          startedAt,
+          passes: checkpoint.passes,
+          mergedScanIds: [],
+          noNewStreak: 2,
+          consecutiveErrors: 1,
+          mergeFailures: 1,
+        });
+        if (stop === "explicit cancellation") {
+          expect((await h.checkpoint()).terminalReason).toBe("canceled");
+          expect(h.records.get(scanId)!.progress.status).toBe("failed");
+          return;
+        }
+
+        expect(await readFile(checkpointPath)).toEqual(checkpointBytes);
+        expect((await h.checkpoint()).terminalReason).toBeUndefined();
+        expect(h.records.get(scanId)!.progress.status).toBe("running");
+        expect(h.published).toEqual([]);
+        h.input.signal = new AbortController().signal;
+        h.setRun(async (options) => {
+          clock.mockReturnValue(Date.parse(startedAt) + 3_600_001);
+          return result(options.resumeScanId!, options.outputDir!);
+        });
+        await runDeepScans(h.input);
+        expect(h.calls).toHaveLength(2);
+        expect(h.calls[1]).toMatchObject({
+          resumeScanId: scanId,
+          outputDir: scanDir,
+        });
+        expect(h.records.size).toBe(1);
+        expect(h.records.get(scanId)!.progress.status).toBe("complete");
+        expect(await h.checkpoint()).toMatchObject({
+          startedAt,
+          passes: checkpoint.passes,
+          mergedScanIds: [scanId],
+          noNewStreak: 3,
+          consecutiveErrors: 0,
+          mergeFailures: 0,
+          terminalReason: "capped",
+        });
+        expect(h.mergeInputs).toEqual([1]);
+        expect(h.metrics()).toEqual({ closed: 2, maximumActive: 1 });
+        expect(await readFile(childCheckpoint)).toEqual(childBytes);
+      } finally {
+        clock.mockRestore();
+      }
+    },
+  );
 });
