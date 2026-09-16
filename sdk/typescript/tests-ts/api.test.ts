@@ -83,30 +83,35 @@ const { cleanup, copyCompletedScan, temporaryDirectory } =
   createApiTestFixtures();
 afterEach(cleanup);
 
-test.each([
-  "default",
-  "openrouter",
-  "fireworks",
-  "command-auth",
-  "cloud.production",
-  "cloud production",
-])(
-  "writes isolated runtime worker settings for %s without changing preflight input",
-  async (name) => {
+test.each(
+  [
+    "default",
+    "default-configured",
+    "openai",
+    "openrouter",
+    "fireworks",
+    "command-auth",
+    "cloud.production",
+    "cloud production",
+  ].flatMap((name) =>
+    (["standard", "deep"] as const).map((mode) => [name, mode] as const),
+  ),
+)(
+  "writes isolated runtime worker settings for %s in %s without changing preflight input",
+  async (name, mode) => {
     const root = await temporaryDirectory();
     const repository = join(root, "repository");
     const home = join(root, "home");
     const configPath = join(root, "config-preflight.toml");
     await mkdir(repository);
     await mkdir(home);
-    const provider =
-      name === "default"
-        ? "openai"
-        : name.startsWith("cloud")
-          ? "amazon-bedrock"
-          : name === "command-auth"
-            ? "openrouter"
-            : name;
+    const provider = name.startsWith("default")
+      ? "openai"
+      : name.startsWith("cloud")
+        ? "amazon-bedrock"
+        : name === "command-auth"
+          ? "openrouter"
+          : name;
     const definition: JsonObject =
       provider === "amazon-bedrock"
         ? { aws: { region: "us-west-2", profile: "synthetic" } }
@@ -131,12 +136,15 @@ test.each([
     };
     const config = {
       ...auth,
-      ...(name === "default"
+      ...(name.startsWith("default")
         ? {}
-        : {
-            model_provider: name.startsWith("cloud") ? "openai" : provider,
-            model_providers: { [provider]: definition },
-          }),
+        : { model_provider: name.startsWith("cloud") ? "openai" : provider }),
+      model_providers: {
+        ...(name === "default" ? {} : { [provider]: definition }),
+        unrelated: {
+          experimental_bearer_token: "synthetic-unrelated-provider",
+        },
+      },
       ...(name.startsWith("cloud")
         ? { profile: name, profiles: { [name]: { model_provider: provider } } }
         : {}),
@@ -186,7 +194,7 @@ test.each([
     );
     try {
       await expect(
-        client.run(repository, { mode: "deep", outputDir: join(root, "scan") }),
+        client.run(repository, { mode, outputDir: join(root, "scan") }),
       ).rejects.toThrow("runtime snapshot captured");
       expect(captured).toBe(true);
     } finally {

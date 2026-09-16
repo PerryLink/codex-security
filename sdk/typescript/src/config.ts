@@ -225,11 +225,19 @@ export function codexWorkerConfig(config: JsonObject): JsonObject {
     "model_reasoning_effort",
     "model_reasoning_summary",
     "service_tier",
-    "model_providers",
     ...CODEX_AUTH_CONFIG_KEYS,
   ]) {
     const value = resolved[key];
     if (value !== undefined) result[key] = value;
+  }
+  const selected = result["model_provider"];
+  const providers = resolved["model_providers"];
+  if (
+    typeof selected === "string" &&
+    isObject(providers) &&
+    Object.hasOwn(providers, selected)
+  ) {
+    result["model_providers"] = { [selected]: providers[selected]! };
   }
   return result;
 }
