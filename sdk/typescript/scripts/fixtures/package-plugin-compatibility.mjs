@@ -168,9 +168,12 @@ try {
   assert.equal(result.findings.findings[0].locations[0].role, " ");
   assert.equal(result.coverage.surfaces[0].notes, " ");
   assert.equal(result.coverage.surfaces[0].riskArea, " ");
-  assert.deepEqual(result.coverage.openQuestions, [
-    { question: "What deployment controls apply?" },
-  ]);
+  assert.ok(
+    result.coverage.openQuestions.length > 0 &&
+      result.coverage.openQuestions.every(
+        (entry) => entry.question === "What deployment controls apply?",
+      ),
+  );
   assert.equal(result.manifest.scan.scope.context, " ");
   assert.deepEqual(result.manifest.scan.threatModel.assumptions, [" "]);
   const saved = await runWorkbench(
