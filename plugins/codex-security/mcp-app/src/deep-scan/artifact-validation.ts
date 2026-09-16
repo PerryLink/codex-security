@@ -1,3 +1,4 @@
+import { posix } from "node:path";
 import { isDeepStrictEqual } from "node:util";
 import {
   parsePersistedScanDraft,
@@ -241,6 +242,7 @@ export function projectDiscoveryCoverage(
   worker: { id: string; attempt?: number },
   artifactPrefix: string,
 ): ScanDraftInput["coverage"] {
+  const archivePrefix = `${posix.dirname(artifactPrefix)}/attempts/`;
   const provenance = { workerId: worker.id, ...(worker.attempt === undefined ? {} : { attempt: worker.attempt }) };
   const prefix = `${worker.id}-attempt-${worker.attempt ?? "unknown"}`;
   const surfaces = coverage.surfaces as Record<string, unknown>[];
@@ -259,7 +261,9 @@ export function projectDiscoveryCoverage(
     surfaces: surfaces.map((surface, index) => ({
       ...project(surface),
       id: `${prefix}-surface-${index + 1}`,
-      receiptRefs: ((surface.receiptRefs as string[] | undefined) ?? []).map((ref) => `${artifactPrefix}/${ref}`),
+      receiptRefs: ((surface.receiptRefs as string[] | undefined) ?? []).map((ref) => (
+        ref.startsWith(archivePrefix) ? ref : `${artifactPrefix}/${ref}`
+      )),
     })),
     explicitExclusions: (coverage.explicitExclusions as Record<string, unknown>[]).map(project),
     deferred: (coverage.deferred as Record<string, unknown>[]).map((item, index) => ({

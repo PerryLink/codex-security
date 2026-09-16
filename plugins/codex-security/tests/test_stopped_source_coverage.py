@@ -182,7 +182,9 @@ def test_stopped_recovery_preserves_accepted_coverage_without_worker_id_collisio
 
 
 @pytest.mark.parametrize("review_source", ["reducer", "parent"])
-@pytest.mark.parametrize("pending_state", ["canceled", "unreviewed", "new-attempt", "unmerged"])
+@pytest.mark.parametrize(
+    "pending_state", ["canceled", "unreviewed", "new-attempt", "unmerged", "merged"]
+)
 def test_stopped_recovery_keeps_unmerged_coverage_after_accepted_review(
     workbench_api, workbench_db, publication_scan, review_source, pending_state
 ):
@@ -343,3 +345,94 @@ def test_standard_recovery_resolves_local_candidates_with_uninterpreted_provenan
 
     coverage = json.loads((scan.scan_dir / "coverage.json").read_text())
     assert (deferred in coverage["deferred"]) is pending
+
+
+@pytest.mark.parametrize("retry_publication", [False, True])
+def test_partial_parent_projection_keeps_only_missing_worker_records(
+    workbench_api, workbench_db, publication_scan, monkeypatch, retry_publication
+):
+    scan = publication_scan()
+    result = add_worker(workbench_db, scan)
+    worker_id = result.parent.name
+    output = scan.scan_dir / "artifacts" / worker_id / "output"
+    output.mkdir(parents=True)
+    result = output / "result.json"
+    with workbench_db:
+        workbench_db.execute(
+            "UPDATE deep_scan_workers SET artifact_dir = ?, result_manifest_path = ? WHERE id = ?",
+            (str(output), str(result), worker_id),
+        )
+    receipt = output / "artifacts" / "evidence.txt"
+    receipt.parent.mkdir()
+    receipt.write_text("Retained source review evidence.\n")
+    surface = {
+        "id": "missing-review",
+        "label": "Missing source projection",
+        "disposition": "needs_follow_up",
+        "receiptRefs": ["artifacts/evidence.txt"],
+    }
+    pending = [
+        {"id": "one", "reason": "First proof remains unresolved."},
+        {"id": "two", "reason": "Second proof remains unresolved."},
+    ]
+    result.write_text(
+        json.dumps(
+            {
+                "scanId": scan.scan_id,
+                "complete": True,
+                "findings": [],
+                "coverage": {
+                    **scan.coverage,
+                    "completeness": "partial",
+                    "deferred": pending,
+                    "surfaces": [surface],
+                },
+            }
+        )
+    )
+    projected = {
+        **pending[0],
+        "id": f"{worker_id}-attempt-1-deferred-1",
+        "provenance": {"workerId": worker_id, "attempt": 1, "sourceId": "one"},
+    }
+    (scan.scan_dir / "coverage.json").write_text(
+        json.dumps(
+            {
+                **scan.coverage,
+                "completeness": "partial",
+                "deferred": [projected],
+                "reviews": [{"workerId": worker_id, "attempt": 1, "completeness": "partial"}],
+            }
+        )
+    )
+    original = result.read_bytes()
+    with monkeypatch.context() as interrupted:
+        if retry_publication:
+
+            def fail_publication(*args, **kwargs):
+                raise OSError("Synthetic publication interruption.")
+
+            interrupted.setattr(
+                workbench_api["saved_results"],
+                "_write_prepared_scan_finalization",
+                fail_publication,
+            )
+        workbench_api["fail_scan"](
+            workbench_db,
+            Namespace(scan_id=scan.scan_id, claim_token=None, cost_json=None, message="Stopped."),
+        )
+    recovered = workbench_api["recover_scan_results"](
+        workbench_db, Namespace(scan_id=scan.scan_id)
+    )["scan"]
+    assert recovered["resultsRecoveryNeeded"] is False
+    coverage = json.loads((scan.scan_dir / "coverage.json").read_text())
+    assert coverage["completeness"] == "partial"
+    assert sorted(
+        item["reason"] for item in coverage["deferred"] if item["id"] != "scan-stopped"
+    ) == sorted(item["reason"] for item in pending)
+    assert result.read_bytes() == original
+    retained_surface = next(
+        item for item in coverage["surfaces"] if item["label"] == surface["label"]
+    )
+    assert retained_surface["receiptRefs"] == [receipt.relative_to(scan.scan_dir).as_posix()]
+    assert receipt.read_text() == "Retained source review evidence.\n"

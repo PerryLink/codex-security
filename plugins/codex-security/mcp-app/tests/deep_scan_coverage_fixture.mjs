@@ -13,20 +13,21 @@ const bundled = await build({
   bundle: true,
   stdin: {
     contents: [
+      'export { archiveDirectory } from "./src/deep-scan/artifacts.ts";',
       'export { DeepScanCoordinator } from "./src/deep-scan/coordinator.ts";',
       'export { WorkbenchDeepScanStore } from "./src/deep-scan/store.ts";',
       'export { createScanArtifactContext } from "./src/artifact-context.ts";',
-      'export { recordCodexSecurityScanDraftViaWorkbench } from "./src/artifact-scan-draft.ts";',
+      'export { getCodexSecurityCompletedScan, recordCodexSecurityWorkerScanDraft, recordCodexSecurityScanDraftViaWorkbench } from "./src/artifact-scan-draft.ts";',
       'export { recordCodexSecurityDeepReduction } from "./src/artifact-deep-reducer.ts";',
     ].join("\n"),
     resolveDir: path.join(pluginRoot, "mcp-app"),
   },
   format: "esm", platform: "node", loader: { ".md": "text" }, write: false,
 });
-export async function publishCoverageFixture(root, completeness, { resume = false, continueAfterResume = false, stopAfterDraft = false } = {}) {
+export async function publishCoverageFixture(root, completeness, { resume = false, continueAfterResume = false, stopAfterDraft = false, receiptRetry = false } = {}) {
   const runtimePath = path.join(root, "fixture-runtime.mjs");
   await writeFile(runtimePath, bundled.outputFiles[0].contents);
-  const { DeepScanCoordinator, WorkbenchDeepScanStore, createScanArtifactContext, recordCodexSecurityScanDraftViaWorkbench, recordCodexSecurityDeepReduction } = await import(pathToFileURL(runtimePath).href);
+  const { archiveDirectory, getCodexSecurityCompletedScan, DeepScanCoordinator, WorkbenchDeepScanStore, createScanArtifactContext, recordCodexSecurityScanDraftViaWorkbench, recordCodexSecurityWorkerScanDraft, recordCodexSecurityDeepReduction } = await import(pathToFileURL(runtimePath).href);
   const targetPath = path.join(root, "target");
   const codexHome = path.join(root, "codex-home");
   const scanRoot = path.join(root, "scans");
@@ -49,6 +50,14 @@ export async function publishCoverageFixture(root, completeness, { resume = fals
   let { run } = await store.begin({ targetPath, scope: ".", threadId, scanRoot });
   const context = await createScanArtifactContext(run.scanId, runWorkbench, { requireRunning: true });
   const rawSources = new Map();
+  const writeReceiptAttempt = async (artifactDir) => {
+    await mkdir(path.join(artifactDir, "artifacts"), { recursive: true });
+    await writeFile(path.join(artifactDir, "artifacts", "prior.txt"), "Archived receipt.\n");
+    await recordCodexSecurityWorkerScanDraft({ root: artifactDir, layout: "worker", repoRoot: targetPath, scanId: run.scanId }, {
+      scanId: run.scanId, complete: false, findings: [],
+      coverage: { completeness: "complete", surfaces: [{ id: "prior", label: "Prior review", disposition: "no_issue_found", receiptRefs: ["artifacts/prior.txt"] }], explicitExclusions: [], deferred: [] },
+    });
+  };
   const writeDiscovery = async (artifactDir, index) => {
     const status = statuses[index];
     const pending = completeness === "partial" && status !== "complete";
@@ -63,8 +72,15 @@ export async function publishCoverageFixture(root, completeness, { resume = fals
     await writeFile(path.join(artifactDir, "artifacts", "review.md"), "Synthetic review evidence.\n");
     const resultPath = path.join(artifactDir, "result.json");
     const bytes = JSON.stringify({ scanId: run.scanId, complete: true, findings: [], coverage });
-    await writeFile(resultPath, bytes);
-    rawSources.set(resultPath, bytes);
+    if (receiptRetry) {
+      await recordCodexSecurityWorkerScanDraft({ root: artifactDir, repoRoot: targetPath, layout: "worker", scanId: run.scanId }, {
+        scanId: run.scanId, complete: true, findings: [],
+        coverage: { completeness: status, surfaces: [{ id: "current", label: "Current review", disposition: "no_issue_found", receiptRefs: ["artifacts/review.md"] }], explicitExclusions: [], deferred: [] },
+      });
+    } else {
+      await writeFile(resultPath, bytes);
+    }
+    rawSources.set(resultPath, await readFile(resultPath, "utf8"));
   };
   if (resume) {
     const workers = [];
@@ -73,6 +89,10 @@ export async function publishCoverageFixture(root, completeness, { resume = fals
       const workerRoot = path.join(run.scanDir, "artifacts", "deep_discovery", "workers", `discovery-${String(index + 1).padStart(4, "0")}`);
       const artifactDir = path.join(workerRoot, "output");
       const worker = { id: randomUUID(), scanId: run.scanId, kind: "discovery", promptPath: path.join(workerRoot, "prompt.md"), artifactDir, attempt: index === 0 ? 2 : 1 };
+      if (receiptRetry) {
+        await writeReceiptAttempt(artifactDir);
+        await archiveDirectory(artifactDir, path.join(workerRoot, "attempts", "attempt-01"));
+      }
       await writeDiscovery(artifactDir, index);
       await writeFile(worker.promptPath, "Synthetic discovery prompt.\n");
       for (const status of ["queued", "running", "succeeded"]) {
@@ -101,8 +121,13 @@ export async function publishCoverageFixture(root, completeness, { resume = fals
       await request.onThreadStarted?.(thread);
       if (request.kind === "discovery") {
         discoveryCalls++;
-        const index = Number(path.basename(path.dirname(request.promptPath)).split("-").at(-1)) - 1;
-        if (index === 0 && !request.resumeThreadId) return { threadId: thread, finalResponse: "Continue the unfinished audit." };
+        const index = Number(path.basename(path.dirname(request.artifactContext.root)).split("-").at(-1)) - 1;
+        if (index === 0 && discoveryCalls === 1) {
+          if (receiptRetry) {
+            await writeReceiptAttempt(request.artifactContext.root);
+          }
+          return { threadId: thread, finalResponse: "Continue the unfinished audit." };
+        }
         await writeDiscovery(request.artifactContext.root, index);
       } else {
         await recordCodexSecurityDeepReduction({ ...request.artifactContext, repoRoot: targetPath, scanId: run.scanId }, { scanId: run.scanId, findings: [] });
@@ -138,8 +163,24 @@ export async function publishCoverageFixture(root, completeness, { resume = fals
     assert.equal(recovered.scan.resultsRecoveryNeeded, false);
   } else {
     await runWorkbench(["complete-scan", "--scan-id", run.scanId]);
+    const completed = await getCodexSecurityCompletedScan(
+      await createScanArtifactContext(run.scanId, runWorkbench), { scanId: run.scanId },
+    );
+    assert.deepEqual(completed.coverage, JSON.parse(await readFile(path.join(run.scanDir, "coverage.json"), "utf8")));
   }
   for (const [file, bytes] of rawSources) assert.equal(await readFile(file, "utf8"), bytes);
+  if (receiptRetry) {
+    const coverage = JSON.parse(await readFile(path.join(run.scanDir, "coverage.json"), "utf8"));
+    const current = coverage.surfaces.filter((surface) => surface.label === "Current review");
+    assert.equal(current.length, 1);
+    assert.match(current[0].receiptRefs[0], /\/output\/artifacts\/review\.md$/);
+    assert.equal(await readFile(path.join(run.scanDir, current[0].receiptRefs[0]), "utf8"), "Synthetic review evidence.\n");
+    const prior = coverage.surfaces.filter((surface) => surface.label === "Prior review");
+    assert.equal(prior.length, 1);
+    assert.equal(prior[0].disposition, "no_issue_found");
+    assert.match(prior[0].receiptRefs[0], /\/attempts\/attempt-01\/artifacts\/prior\.txt$/);
+    assert.equal(await readFile(path.join(run.scanDir, prior[0].receiptRefs[0]), "utf8"), "Archived receipt.\n");
+  }
   return { scanDir: run.scanDir, threadId, terminal };
 }
 

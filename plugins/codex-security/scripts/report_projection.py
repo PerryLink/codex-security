@@ -1061,7 +1061,7 @@ def build_report_markdown(
             ]
         )
     reviews = coverage.get("reviews", [])
-    if reviews:
+    if isinstance(reviews, list) and reviews:
         lines.extend(
             [
                 "",

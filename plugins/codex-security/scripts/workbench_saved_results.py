@@ -628,20 +628,71 @@ def merge_saved_results(
         and relative.startswith("checkpoints/")
         and isinstance(draft["coverage"].get("reviews"), list)
     }
+    projected_coverages = [
+        accepted_coverage,
+        parent["coverage"] if parent else {},
+        *frozen_parent_projections.values(),
+    ]
     # V1 persists the review projection in the parent, without reducer sourceCoverage.
     reviewed_attempts = {
         (review.get("workerId"), review.get("attempt"))
-        for projected in [
-            accepted_coverage,
-            parent["coverage"] if parent else {},
-            *frozen_parent_projections.values(),
-        ]
+        for projected in projected_coverages
         if isinstance(reviews := projected.get("reviews"), list)
         for review in reviews
         if isinstance(review, dict)
         and isinstance(review.get("workerId"), str)
         and isinstance(review.get("attempt"), int)
     }
+
+    def coverage_receipts(item: dict[str, Any], worker: Any, relative: str) -> list[str]:
+        directory = Path(relative).parent
+        if directory.name == "checkpoints":
+            directory = directory.parent
+        output = Path(worker["artifact_dir"]).relative_to(scan_dir)
+        worker_root = output.parent if output.name == "output" else output
+        archive_prefix = (worker_root / "attempts").as_posix() + "/"
+        return [
+            ref if ref.startswith(archive_prefix) else f"{directory.as_posix()}/{ref}"
+            for ref in item.get("receiptRefs", [])
+        ]
+
+    def coverage_record_retained(field: str, item: Any, worker: Any, relative: str) -> bool:
+        if not isinstance(item, dict):
+            return False
+        source = {key: value for key, value in item.items() if key != "provenance"}
+        if field == "surfaces":
+            source["receiptRefs"] = coverage_receipts(item, worker, relative)
+        for projection in projected_coverages:
+            records = projection.get(field, [])
+            for record in records if isinstance(records, list) else []:
+                if not isinstance(record, dict):
+                    continue
+                provenance = record.get("provenance")
+                if not isinstance(provenance, dict) or (
+                    provenance.get("workerId"),
+                    provenance.get("attempt"),
+                ) != (worker["id"], worker["attempt"]):
+                    continue
+                original = {
+                    key: value for key, value in record.items() if key not in {"id", "provenance"}
+                }
+                if "sourceId" in provenance:
+                    original["id"] = provenance["sourceId"]
+                if "candidateId" in provenance:
+                    original["candidateId"] = provenance["candidateId"]
+                if field == "deferred" and "surfaceIds" in original:
+                    surface_ids = {
+                        surface.get("id"): surface["provenance"].get("sourceId")
+                        for surface in projection.get("surfaces", [])
+                        if isinstance(surface, dict) and isinstance(surface.get("provenance"), dict)
+                    }
+                    original["surfaceIds"] = [
+                        surface_ids.get(value, value) for value in original["surfaceIds"]
+                    ]
+                if original == source:
+                    return True
+        return False
+
     workers_by_id = {worker["id"]: worker for worker in workers}
     latest_reducer_key = (
         (reducer["completed_at"] or "", reducer["id"], int(reducer["attempt"] or 0))
@@ -1017,7 +1068,7 @@ def merge_saved_results(
             and worker["merge_state"] == "merged"
             and (worker_id, worker["attempt"]) in reviewed_attempts
         )
-        if reviewed or (
+        if (
             superseded
             and relative != accepted_reducer
             and relative not in frozen_parent_projections
@@ -1035,6 +1086,8 @@ def merge_saved_results(
             for item in items:
                 if field == "openQuestions" and isinstance(item, str):
                     item = {"question": item.strip()}
+                if reviewed and coverage_record_retained(field, item, worker, relative):
+                    continue
                 if (
                     field == "surfaces"
                     and isinstance(item, dict)
@@ -1060,6 +1113,9 @@ def merge_saved_results(
                     and (field == "deferred" or item.get("disposition") == "needs_follow_up")
                 ):
                     continue
+                if field == "surfaces" and worker is not None and isinstance(item, dict):
+                    item = copy.deepcopy(item)
+                    item["receiptRefs"] = coverage_receipts(item, worker, relative)
                 if isinstance(item, dict) and "id" not in item:
                     semantic_item = dict(item)
                     if field == "surfaces":
