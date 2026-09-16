@@ -620,10 +620,27 @@ def merge_saved_results(
     if "sourceCoverage" not in drafts_by_path.get(accepted_reducer, {}):
         accepted_reducer = None
     accepted_coverage = drafts_by_path.get(accepted_reducer, {}).get("coverage", {})
+    frozen_parent_projections = {
+        relative: draft["coverage"]
+        for relative, draft, _ in sources
+        if frozen_source_digests is not None
+        and accepted_reducer is None
+        and relative.startswith("checkpoints/")
+        and isinstance(draft["coverage"].get("reviews"), list)
+    }
+    # V1 persists the review projection in the parent, without reducer sourceCoverage.
     reviewed_attempts = {
         (review.get("workerId"), review.get("attempt"))
-        for review in accepted_coverage.get("reviews", [])
+        for projected in [
+            accepted_coverage,
+            parent["coverage"] if parent else {},
+            *frozen_parent_projections.values(),
+        ]
+        if isinstance(reviews := projected.get("reviews"), list)
+        for review in reviews
         if isinstance(review, dict)
+        and isinstance(review.get("workerId"), str)
+        and isinstance(review.get("attempt"), int)
     }
     workers_by_id = {worker["id"]: worker for worker in workers}
     latest_reducer_key = (
@@ -745,13 +762,21 @@ def merge_saved_results(
         if relative in current_results or relative == accepted_reducer
     ]
 
-    def coverage_candidate(owner: str | None, item: dict[str, Any]) -> tuple[str | None, Any]:
+    def coverage_candidate(
+        owner: str | None, item: dict[str, Any]
+    ) -> tuple[str | None, str] | None:
+        candidate_id = item.get("candidateId")
         provenance = item.get("provenance")
         if owner is None and isinstance(provenance, dict):
-            return provenance.get("workerId"), provenance.get(
-                "candidateId", item.get("candidateId")
-            )
-        return owner, item.get("candidateId")
+            source_owner = provenance.get("workerId")
+            source_candidate = provenance.get("candidateId", candidate_id)
+            if (source_owner is None or isinstance(source_owner, str)) and isinstance(
+                source_candidate, str
+            ):
+                return source_owner, source_candidate
+        if isinstance(candidate_id, str):
+            return owner, candidate_id
+        return None
 
     resolved: dict[tuple[str | None, str], str] = {}
     for owner, draft in current_drafts:
@@ -769,8 +794,9 @@ def merge_saved_results(
                     isinstance(item, dict)
                     and isinstance(item.get("candidateId"), str)
                     and item.get("disposition") in {"reported", "rejected", "not_applicable"}
+                    and (candidate := coverage_candidate(owner, item)) is not None
                 ):
-                    resolved.setdefault(coverage_candidate(owner, item), item["disposition"])
+                    resolved.setdefault(candidate, item["disposition"])
     # Only the current parent may claim that another worker finding was absorbed.
     # A superseded checkpoint must not suppress a newer independent result.
     for draft in [parent] if parent else []:
@@ -991,7 +1017,11 @@ def merge_saved_results(
             and worker["merge_state"] == "merged"
             and (worker_id, worker["attempt"]) in reviewed_attempts
         )
-        if reviewed or (superseded and relative != accepted_reducer):
+        if reviewed or (
+            superseded
+            and relative != accepted_reducer
+            and relative not in frozen_parent_projections
+        ):
             continue
         for field in ("surfaces", "explicitExclusions", "deferred", "openQuestions", "reviews"):
             items = draft["coverage"].get(field, [])

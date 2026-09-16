@@ -23,7 +23,7 @@ const bundled = await build({
   },
   format: "esm", platform: "node", loader: { ".md": "text" }, write: false,
 });
-export async function publishCoverageFixture(root, completeness, { resume = false, continueAfterResume = false } = {}) {
+export async function publishCoverageFixture(root, completeness, { resume = false, continueAfterResume = false, stopAfterDraft = false } = {}) {
   const runtimePath = path.join(root, "fixture-runtime.mjs");
   await writeFile(runtimePath, bundled.outputFiles[0].contents);
   const { DeepScanCoordinator, WorkbenchDeepScanStore, createScanArtifactContext, recordCodexSecurityScanDraftViaWorkbench, recordCodexSecurityDeepReduction } = await import(pathToFileURL(runtimePath).href);
@@ -132,7 +132,13 @@ export async function publishCoverageFixture(root, completeness, { resume = fals
       }
     }
   }
-  await runWorkbench(["complete-scan", "--scan-id", run.scanId]);
+  if (stopAfterDraft) {
+    await runWorkbench(["fail-scan", "--scan-id", run.scanId, "--message", "Synthetic stop after parent draft."]);
+    const recovered = await runWorkbench(["recover-scan-results", "--scan-id", run.scanId]);
+    assert.equal(recovered.scan.resultsRecoveryNeeded, false);
+  } else {
+    await runWorkbench(["complete-scan", "--scan-id", run.scanId]);
+  }
   for (const [file, bytes] of rawSources) assert.equal(await readFile(file, "utf8"), bytes);
   return { scanDir: run.scanDir, threadId, terminal };
 }
