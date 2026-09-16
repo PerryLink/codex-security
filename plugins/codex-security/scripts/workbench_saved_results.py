@@ -693,6 +693,42 @@ def merge_saved_results(
                     return True
         return False
 
+    def project_missing_record(
+        field: str, item: dict[str, Any], index: int, worker: Any, source: dict[str, Any]
+    ) -> dict[str, Any]:
+        # Match projectDiscoveryCoverage so recovered holes retain source ownership.
+        prefix = f"{worker['id']}-attempt-{worker['attempt']}"
+        result = copy.deepcopy(item)
+        result["provenance"] = {"workerId": worker["id"], "attempt": worker["attempt"]}
+        for key, name in (("id", "sourceId"), ("candidateId", "candidateId")):
+            if key in item:
+                result["provenance"][name] = item[key]
+        if field == "surfaces":
+            result["id"] = f"{prefix}-surface-{index}"
+        elif field == "deferred":
+            result["id"] = f"{prefix}-deferred-{index}"
+            if "candidateId" in item:
+                result["candidateId"] = f"{prefix}-candidate-{index}"
+            if "surfaceIds" in item:
+                surface_ids = {
+                    surface["id"]: f"{prefix}-surface-{offset}"
+                    for offset, surface in enumerate(source.get("surfaces", []), 1)
+                }
+                for projection in projected_coverages:
+                    for surface in projection.get("surfaces", []):
+                        provenance = surface.get("provenance", {})
+                        if (
+                            isinstance(provenance, dict)
+                            and provenance.get("workerId") == worker["id"]
+                            and provenance.get("attempt") == worker["attempt"]
+                            and isinstance(provenance.get("sourceId"), str)
+                        ):
+                            surface_ids[provenance["sourceId"]] = surface["id"]
+                result["surfaceIds"] = [
+                    surface_ids.get(value, value) for value in item["surfaceIds"]
+                ]
+        return result
+
     workers_by_id = {worker["id"]: worker for worker in workers}
     latest_reducer_key = (
         (reducer["completed_at"] or "", reducer["id"], int(reducer["attempt"] or 0))
@@ -1083,7 +1119,7 @@ def merge_saved_results(
                 # Keep malformed canonical collections for the existing finalizer's
                 # recovery and warnings rather than silently changing its contract.
                 continue
-            for item in items:
+            for index, item in enumerate(items, 1):
                 if field == "openQuestions" and isinstance(item, str):
                     item = {"question": item.strip()}
                 if reviewed and coverage_record_retained(field, item, worker, relative):
@@ -1113,6 +1149,8 @@ def merge_saved_results(
                     and (field == "deferred" or item.get("disposition") == "needs_follow_up")
                 ):
                     continue
+                if reviewed and isinstance(item, dict) and field != "reviews":
+                    item = project_missing_record(field, item, index, worker, draft["coverage"])
                 if field == "surfaces" and worker is not None and isinstance(item, dict):
                     item = copy.deepcopy(item)
                     item["receiptRefs"] = coverage_receipts(item, worker, relative)

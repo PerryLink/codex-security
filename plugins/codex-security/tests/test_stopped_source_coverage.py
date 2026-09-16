@@ -248,7 +248,17 @@ def test_stopped_recovery_keeps_unmerged_coverage_after_accepted_review(
     coverage = json.loads((scan.scan_dir / "coverage.json").read_text())
     assert coverage["completeness"] == "partial"
     assert coverage["reviews"] == reviews
-    assert deferred in coverage["deferred"]
+    if pending_state == "merged":
+        retained = next(
+            item for item in coverage["deferred"] if item.get("reason") == deferred["reason"]
+        )
+        assert retained["provenance"] == {
+            "workerId": pending.parent.name,
+            "attempt": 1,
+            "sourceId": deferred["id"],
+        }
+    else:
+        assert deferred in coverage["deferred"]
 
 
 @pytest.mark.parametrize("stopped", [False, True], ids=["completion", "recovery"])
