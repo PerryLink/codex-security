@@ -12,7 +12,7 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
-import { runDeepScans } from "./deep-scan.js";
+import { runDeepScans, ScanCostTrackingError } from "./deep-scan.js";
 import {
   acquireScanExecution,
   ScanTransportClosedError,
@@ -1486,7 +1486,13 @@ export class CodexSecurity {
       };
       const reportTrackingError = (error: unknown): void => {
         if (options.maxCostUsd !== undefined || options.requireCost) {
-          costAbortController.abort(error);
+          costAbortController.abort(
+            new ScanCostTrackingError(
+              `Scan interrupted because required cost tracking failed: ${errorMessage(error)}`,
+              scanDir,
+              { cause: error },
+            ),
+          );
           return;
         }
         notifyObserver(
@@ -1495,6 +1501,19 @@ export class CodexSecurity {
           options.onObserverError,
           `Could not track scan activity: ${errorMessage(error)}`,
         );
+      };
+      const stopTracking = async (
+        activeTracker: ScanCostTracker,
+        usage?: unknown,
+      ) => {
+        const snapshot = await activeTracker
+          .stop(usage)
+          .catch((error: unknown) => {
+            reportTrackingError(error);
+            return { usage, cost: estimateScanCost(model, usage) };
+          });
+        throwIfAborted(signal, scanDir);
+        return snapshot;
       };
       const reportCost = (cost: Readonly<ScanCost>): void => {
         latestCost = cost;
@@ -1644,8 +1663,20 @@ export class CodexSecurity {
         auth: options.auth,
       });
       if (session.inheritedPermissions !== undefined) {
+        const savedConfig = structuredClone(effectiveConfig);
+        const profiles = savedConfig["profiles"];
+        for (const config of [
+          savedConfig,
+          ...(isRecord(profiles) ? Object.values(profiles) : []),
+        ]) {
+          if (!isRecord(config)) continue;
+          delete config["plugins"];
+          delete config["marketplaces"];
+          if (isRecord(config["features"]))
+            delete config["features"]["plugins"];
+        }
         recipe["config"] = {
-          ...structuredClone(effectiveConfig),
+          ...savedConfig,
           approval_policy: approvalPolicy,
         };
         recipe["inheritedPermissions"] = session.inheritedPermissions;
@@ -1887,7 +1918,7 @@ export class CodexSecurity {
             scanDirectory: scanDir,
           });
           historical.start(sealedThreadId);
-          completionCost = (await historical.stop()).cost;
+          completionCost = (await stopTracking(historical)).cost;
         }
         completionCost ??=
           (savedScan["cost"] as unknown as ScanCost | undefined) ?? null;
@@ -2180,12 +2211,7 @@ export class CodexSecurity {
           customValidationComplete = true;
         }
         budgetAbortController.abort();
-        const snapshot = await tracker.stop(usage).catch((error: unknown) => {
-          if (options.maxCostUsd !== undefined) throw error;
-          reportTrackingError(error);
-          return { usage, cost: estimateScanCost(model, usage) };
-        });
-        throwIfAborted(signal, scanDir);
+        const snapshot = await stopTracking(tracker, usage);
         if (options.maxCostUsd !== undefined && snapshot.cost === null) {
           notifyObserver(
             "onWarning",
@@ -2250,7 +2276,7 @@ export class CodexSecurity {
       const result = sealed
         ? await (async () => {
             budgetAbortController.abort();
-            const snapshot = await tracker.stop();
+            const snapshot = await stopTracking(tracker);
             const measuredCost = combinedCost(snapshot.cost);
             if (
               measuredCost &&
@@ -2345,7 +2371,7 @@ export class CodexSecurity {
                     scanDirectory: scanDir,
                   });
                   historical.start(threadId);
-                  return (await historical.stop()).cost;
+                  return (await stopTracking(historical)).cost;
                 },
                 onCost: (key, cost) => {
                   passCosts.set(key, cost);
@@ -2742,6 +2768,8 @@ export class CodexSecurity {
       // Recorded first: everything below can throw a different error for this same failed
       // scan, and cleanup must treat all of those as a failure it is not allowed to mask.
       scanFailure = true;
+      if (error instanceof ScanCostTrackingError)
+        costAbortController.abort(error);
       const tracked = await costTracker?.stop().catch(() => null);
       const cost = combinedCost(tracked?.cost ?? mergeCost);
       const snapshot =
@@ -2753,6 +2781,7 @@ export class CodexSecurity {
             };
       let failure =
         signal.reason instanceof ScanCostLimitExceededError ||
+        signal.reason instanceof ScanCostTrackingError ||
         signal.reason instanceof ScanTransportClosedError
           ? signal.reason
           : error;
@@ -5362,6 +5391,7 @@ function throwIfAborted(signal?: AbortSignal, scanDir = ""): void {
   if (!signal?.aborted) return;
   if (
     signal.reason instanceof ScanCostLimitExceededError ||
+    signal.reason instanceof ScanCostTrackingError ||
     signal.reason instanceof ScanTransportClosedError
   )
     throw signal.reason;

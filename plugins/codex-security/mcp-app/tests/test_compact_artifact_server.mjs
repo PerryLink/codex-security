@@ -26,6 +26,7 @@ try {
   await testParentToolList(runtimeBundle);
   await testClaimedParentArtifactOperations(runtimeBundle, "source");
   await testPromptDrivenPrivateRecipe(runtimeBundle, "source");
+  await testCompletedNativeDeepRejoin(runtimeBundle, "source");
   await testSemanticScanDraftCompletion(runtimeBundle, "source");
   await testCompactDiffScanCompletion(runtimeBundle, "source");
 
@@ -33,6 +34,7 @@ try {
   await testParentToolList(shippedRuntime);
   await testClaimedParentArtifactOperations(shippedRuntime, "shipped");
   await testPromptDrivenPrivateRecipe(shippedRuntime, "shipped");
+  await testCompletedNativeDeepRejoin(shippedRuntime, "shipped");
   await testSemanticScanDraftCompletion(shippedRuntime, "shipped");
   await testCompactDiffScanCompletion(shippedRuntime, "shipped");
 } finally {
@@ -1031,6 +1033,132 @@ async function testPromptDrivenPrivateRecipe(bundle, runtimeLabel) {
     } finally {
       await client.close();
     }
+  }
+}
+
+async function testCompletedNativeDeepRejoin(bundle, runtimeLabel) {
+  const fixtureRoot = path.join(temporaryRoot, `completed-native-${runtimeLabel}`);
+  const repoRoot = path.join(fixtureRoot, "repository");
+  const invocationPath = path.join(fixtureRoot, "unexpected-codex-invocation");
+  const environment = {
+    CODEX_SECURITY_SCAN_ROOT: path.join(fixtureRoot, "scans"),
+    CODEX_SECURITY_STATE_DIR: path.join(fixtureRoot, "state"),
+    CODEX_HOME: path.join(fixtureRoot, "codex-home"),
+    CODEX_CLI_PATH: path.join(fixtureRoot, "codex-stub"),
+    CODEX_API_KEY: "",
+    OPENAI_API_KEY: ""
+  };
+  await mkdir(repoRoot, { recursive: true });
+  await mkdir(environment.CODEX_SECURITY_SCAN_ROOT, { mode: 0o700 });
+  await mkdir(environment.CODEX_HOME, { mode: 0o700 });
+  await writeFile(path.join(repoRoot, "fixture.py"), "print('fixture')\n");
+  await writeFile(environment.CODEX_CLI_PATH, `#!${process.execPath}
+require("node:fs").writeFileSync(${JSON.stringify(invocationPath)}, "unexpected launch");
+process.exit(1);
+`, { mode: 0o700 });
+
+  const ownerThread = `completed-native-owner-${runtimeLabel}`;
+  const begun = runWorkbenchFixture(runtimeLabel, environment, [
+    "begin-deep-scan", "--target-path", repoRoot, "--scope", ".", "--thread-id", ownerThread
+  ]);
+  const { scanId, scanDir, handoffClaimToken } = begun.scan;
+  runWorkbenchFixture(runtimeLabel, environment, [
+    "register-cli-scan", "--repository", repoRoot, "--scan-dir", scanDir,
+    "--registration-json-stdin"
+  ], {
+    scanId, threadId: ownerThread, claimToken: handoffClaimToken,
+    recipe: { repository: repoRoot, mode: "deep", target: { kind: "repository", paths: [] }, config: {} }
+  });
+  runWorkbenchFixture(runtimeLabel, environment, [
+    "set-scan-thread", "--scan-id", scanId, "--claim-token", handoffClaimToken,
+    "--thread-id", `completed-native-merge-${runtimeLabel}`
+  ]);
+  runWorkbenchFixture(runtimeLabel, environment, [
+    "save-scan-artifact", "--scan-id", scanId, "--claim-token", handoffClaimToken,
+    "--artifact-path", "artifacts/deep-scan/checkpoint.json"
+  ], { version: 2, passes: [], mergedScanIds: [], aggregate: null, terminalReason: "capped" });
+
+  const client = await startClient(bundle, environment);
+  const call = (name, arguments_) => client.callTool({
+    name,
+    arguments: arguments_,
+    _meta: {
+      "openai/threadId": ownerThread,
+      "codex/sandbox-state-meta": {
+        permissionProfile: {
+          type: "managed",
+          file_system: {
+            type: "restricted",
+            entries: [{ path: { type: "special", value: { kind: "root" } }, access: "read" }]
+          },
+          network: "restricted"
+        },
+        sandboxCwd: pathToFileURL(repoRoot).href
+      }
+    }
+  });
+  const rejoin = () => call("start_codex_security_deep_scan", { scanId, handoffClaimToken });
+  const expectedResult = {
+    scanId,
+    manifestPath: path.join(scanDir, "scan-manifest.json"),
+    reportPath: path.join(scanDir, "report.md")
+  };
+
+  try {
+    requireSuccessfulTool(await call("record_codex_security_scan_draft", {
+      scanId,
+      handoffClaimToken,
+      findings: [],
+      coverage: {
+        completeness: "complete",
+        surfaces: [{ label: "Synthetic fixture", disposition: "rejected" }],
+        explicitExclusions: [],
+        deferred: []
+      }
+    }), `${runtimeLabel}: write native parent aggregate`);
+    const completed = runWorkbenchFixture(runtimeLabel, environment, [
+      "complete-scan", "--scan-id", scanId, "--claim-token", handoffClaimToken
+    ]);
+    assert.equal(completed.scan.progress.status, "complete");
+    const originalDraft = await snapshotScanDraft(scanDir);
+
+    for (let repeat = 0; repeat < 2; repeat += 1) {
+      assert.deepEqual(
+        requireSuccessfulTool(await rejoin(), `${runtimeLabel}: rejoin intact completed native parent`),
+        expectedResult
+      );
+    }
+    await rm(expectedResult.reportPath);
+    assert.deepEqual(
+      requireSuccessfulTool(await rejoin(), `${runtimeLabel}: regenerate missing report before native success`),
+      expectedResult
+    );
+    assert.ok((await readFile(expectedResult.reportPath, "utf8")).length > 0);
+    assert.deepEqual(await snapshotScanDraft(scanDir), originalDraft);
+
+    for (const artifact of ["scan-manifest.json", "findings.json", "coverage.json"]) {
+      const artifactPath = path.join(scanDir, artifact);
+      const original = await readFile(artifactPath);
+      for (const change of ["modified", "missing"]) {
+        try {
+          if (change === "modified") await writeFile(artifactPath, Buffer.concat([original, Buffer.from("\n")]));
+          else await rm(artifactPath);
+          const rejected = await rejoin();
+          assert.equal(rejected.isError, true, `${runtimeLabel}: reject ${change} completed ${artifact}`);
+          assert.equal(rejected.structuredContent, undefined);
+          assert.equal(runWorkbenchFixture(runtimeLabel, environment, [
+            "get-scan", "--scan-id", scanId
+          ]).scan.progress.status, "complete");
+        } finally {
+          await writeFile(artifactPath, original);
+        }
+      }
+    }
+    assert.deepEqual(await snapshotScanDraft(scanDir), originalDraft);
+    await assert.rejects(readFile(invocationPath), { code: "ENOENT" });
+    assert.equal(runWorkbenchFixture(runtimeLabel, environment, ["list-scans"]).scans.length, 1);
+  } finally {
+    await client.close();
   }
 }
 

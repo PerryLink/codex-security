@@ -1007,6 +1007,7 @@ def test_deferred_stop_retains_drained_child_and_cost_before_freezing(
     parent_dir = Path(parent["scanDir"])
     child_dir = parent_dir / "artifacts/deep-scan/passes/pass-1"
     child = register(state, target, child_dir, parent=parent["scanId"])
+    rerun = register(state, target, tmp_path / "rerun", parent=parent["scanId"])
     checkpoint(state, parent, passes=[{"directory": child_dir.relative_to(parent_dir).as_posix()}])
     run_workbench(
         state, "set-scan-thread", "--scan-id", parent["scanId"], "--thread-id", "native-owner"
@@ -1041,7 +1042,18 @@ def test_deferred_stop_retains_drained_child_and_cost_before_freezing(
         "reasoningOutputTokens": 0,
         "totalTokens": 15,
     }
+    child_cost = {
+        "model": "synthetic-model",
+        "inputTokens": 10,
+        "cachedInputTokens": 0,
+        "cacheWriteInputTokens": 0,
+        "outputTokens": 5,
+        "estimatedUsd": 0.01,
+    }
     with sqlite3.connect(state / "workbench.sqlite3") as connection:
+        rerun_before = connection.execute(
+            "SELECT * FROM scans WHERE id = ?", (rerun["scanId"],)
+        ).fetchone()
         stopped = connection.execute(
             "SELECT status, completed_at, canceled_at, retained_source_digests_json FROM scans WHERE id = ?",
             (parent["scanId"],),
@@ -1052,6 +1064,10 @@ def test_deferred_stop_retains_drained_child_and_cost_before_freezing(
         connection.execute(
             "UPDATE scans SET cost_json = ? WHERE id = ?",
             (json.dumps({"usage": usage}), parent["scanId"]),
+        )
+        connection.execute(
+            "UPDATE scans SET cost_json = ? WHERE id = ?",
+            (json.dumps({"usage": usage, "cost": child_cost}), child["scanId"]),
         )
     write_completed_contract(child_dir, child["scanId"], target, relative_path="app.py")
     payload = {
@@ -1105,21 +1121,50 @@ def test_deferred_stop_retains_drained_child_and_cost_before_freezing(
         run_workbench(state, *preserve, "--thread-id", "other-owner", check=False)["returncode"]
         != 0
     )
+    assert (
+        run_workbench(state, "get-scan", "--scan-id", child["scanId"])["scan"]["progress"]["status"]
+        == "running"
+    )
     retained = run_workbench(state, *preserve)
     assert retained["scan"]["findingCount"] == 1
     assert retained["scan"]["cost"] == cost
+    assert retained["scan"]["progress"]["independentReviews"]["active"] == 0
+    retained_child = run_workbench(state, "get-scan", "--scan-id", child["scanId"])["scan"]
+    assert retained_child["progress"]["status"] == "failed"
+    assert retained_child["cost"] == child_cost
+    assert retained_child["usage"] == usage
     published = {
         name: (parent_dir / name).read_bytes()
         for name in ("scan-manifest.json", "findings.json", "coverage.json", "report.md")
     }
     frozen = json.loads(published["scan-manifest.json"])["scan"]["preservedSources"]
     assert frozen
+    child_published = {name: (child_dir / name).read_bytes() for name in published}
+    with sqlite3.connect(state / "workbench.sqlite3") as connection:
+        child_stopped = connection.execute(
+            "SELECT status, completed_at, canceled_at, cost_json, retained_source_digests_json FROM scans WHERE id = ?",
+            (child["scanId"],),
+        ).fetchone()
+    assert child_stopped[1] is not None
+    assert child_stopped[4] is not None
     payload["findings"][0]["summary"] = "A later checkpoint must not replace retained evidence."
     write_checkpoint(child_dir / "checkpoints", payload)
     run_workbench(state, *stop)
     assert run_workbench(state, *preserve)["scan"]["findingCount"] == 1
     assert {name: (parent_dir / name).read_bytes() for name in published} == published
+    assert {name: (child_dir / name).read_bytes() for name in published} == child_published
     with sqlite3.connect(state / "workbench.sqlite3") as connection:
+        assert (
+            connection.execute("SELECT * FROM scans WHERE id = ?", (rerun["scanId"],)).fetchone()
+            == rerun_before
+        )
+        assert (
+            connection.execute(
+                "SELECT status, completed_at, canceled_at, cost_json, retained_source_digests_json FROM scans WHERE id = ?",
+                (child["scanId"],),
+            ).fetchone()
+            == child_stopped
+        )
         row = connection.execute(
             "SELECT completed_at, canceled_at, retained_source_digests_json FROM scans WHERE id = ?",
             (parent["scanId"],),

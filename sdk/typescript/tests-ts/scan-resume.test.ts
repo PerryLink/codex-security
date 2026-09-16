@@ -20,6 +20,7 @@ import type { JsonObject } from "../src/config.js";
 import { estimateScanCost, type ScanCost } from "../src/cost.js";
 import {
   DEEP_SCAN_CHECKPOINT,
+  ScanCostTrackingError,
   type DeepScanCheckpoint,
 } from "../src/deep-scan.js";
 import {
@@ -785,17 +786,31 @@ test.each([false, true])(
 );
 
 test.each([
-  ["null", null],
-  ["undefined", undefined],
-])(
-  "sealed legacy discovery recovers historical worker costs with a %s composition checkpoint",
-  async (_label, checkpoint) => {
+  [null, false, false],
+  [undefined, false, false],
+  [null, true, false],
+  [null, true, true],
+  ["v2", true, false],
+  ["v2", true, true],
+] as const)(
+  "sealed resume with a %p checkpoint (tracking failure: %p, cost limit: %p)",
+  async (checkpoint, trackingFailure, requiredCost) => {
     const f = await interruptedScan();
+    const cost = estimateScanCost("gpt-5.6-sol", {
+      input_tokens: 1375,
+      output_tokens: 13,
+    })!;
+    const expectedCost = {
+      inputTokens: 1375,
+      outputTokens: 13,
+      estimatedUsd: cost.estimatedUsd,
+    };
     await finishDiscovery(f);
-    await rm(join(f.scanDir, DEEP_SCAN_CHECKPOINT));
-    execFileSync(f.python, [
-      "-c",
-      `import sqlite3, sys
+    if (checkpoint !== "v2") {
+      await rm(join(f.scanDir, DEEP_SCAN_CHECKPOINT));
+      execFileSync(f.python, [
+        "-c",
+        `import sqlite3, sys
 with sqlite3.connect(sys.argv[1]) as connection:
     timestamp = connection.execute("SELECT started_at FROM scans WHERE id = ?", (sys.argv[2],)).fetchone()[0]
     connection.execute(
@@ -807,25 +822,36 @@ with sqlite3.connect(sys.argv[1]) as connection:
         (sys.argv[2], sys.argv[3], timestamp, timestamp, timestamp),
     )
 `,
-      join(f.environment.CODEX_SECURITY_STATE_DIR, "workbench.sqlite3"),
-      f.scanId,
-      join(f.scanDir, "scan-manifest.json"),
-    ]);
+        join(f.environment.CODEX_SECURITY_STATE_DIR, "workbench.sqlite3"),
+        f.scanId,
+        join(f.scanDir, "scan-manifest.json"),
+      ]);
+    }
+    if (trackingFailure)
+      await f.command([
+        "preserve-scan-results",
+        "--scan-id",
+        f.scanId,
+        "--cost-json",
+        JSON.stringify(cost),
+      ]);
     await f.command(["prepare-scan-completion", "--scan-id", f.scanId]);
     const artifactNames = [
       "scan-manifest.json",
       "findings.json",
       "coverage.json",
       "report.md",
+      ...(checkpoint === "v2" ? [DEEP_SCAN_CHECKPOINT] : []),
     ];
     const artifacts = await Promise.all(
       artifactNames.map((name) => readFile(join(f.scanDir, name))),
     );
-    expect(
-      (await f.command(["get-scan", "--scan-id", f.scanId]))[
-        "compositionCheckpoint"
-      ],
-    ).toBeNull();
+    const savedCheckpoint = (
+      await f.command(["get-scan", "--scan-id", f.scanId])
+    )["compositionCheckpoint"];
+    if (checkpoint === "v2")
+      expect(savedCheckpoint).toMatchObject({ version: 2 });
+    else expect(savedCheckpoint).toBeNull();
     for (const [threadId, cwd, inputTokens, outputTokens, timestamp] of [
       [f.threadId, f.scanDir, 1000, 10, "2026-07-26T12:00:00.900Z"],
       [
@@ -867,6 +893,9 @@ with sqlite3.connect(sys.argv[1]) as connection:
       );
     }
     let turns = 0;
+    let brokenTracking = false;
+    const warnings: string[] = [];
+    const commands: string[] = [];
     const client = resumeClient(
       f,
       () => ({
@@ -887,34 +916,52 @@ with sqlite3.connect(sys.argv[1]) as connection:
         },
       }),
       async (options, args, input) => {
+        commands.push(args[0]!);
         const result = await runWorkbench(options, args, input);
         if (args[0] === "get-scan" && checkpoint === undefined)
           delete result["compositionCheckpoint"];
+        if (args[0] === "get-scan" && trackingFailure && !brokenTracking) {
+          // Session identity was already checked; fail subsequent usage reads.
+          brokenTracking = true;
+          await rename(
+            join(f.codexHome, "sessions"),
+            join(f.codexHome, "saved-sessions"),
+          );
+          await writeFile(join(f.codexHome, "sessions"), "not a directory");
+        }
         return result;
       },
     )({ codexOverrides: f.recipe.config });
     try {
-      const result = await client.run(f.repository, {
+      const pending = client.run(f.repository, {
         mode: "deep",
         outputDir: f.scanDir,
         resumeScanId: f.scanId,
         ...f.recipe.deepScan,
+        ...(requiredCost ? { maxCostUsd: 1 } : {}),
+        onWarning: (warning) => warnings.push(warning),
       });
-      const cost = estimateScanCost("gpt-5.6-sol", {
-        input_tokens: 1375,
-        output_tokens: 13,
-      })!;
-      const expectedCost = {
-        inputTokens: 1375,
-        outputTokens: 13,
-        estimatedUsd: cost.estimatedUsd,
-      };
-      expect(result.threadId).toBe(f.threadId);
-      expect(result.cost).toMatchObject(expectedCost);
+      if (requiredCost) {
+        await expect(pending).rejects.toBeInstanceOf(ScanCostTrackingError);
+        expect(commands).not.toContain("complete-scan");
+      } else {
+        const result = await pending;
+        expect(result.threadId).toBe(f.threadId);
+        expect(result.cost).toMatchObject(expectedCost);
+        if (trackingFailure)
+          expect(warnings).toContainEqual(
+            expect.stringContaining("Could not track scan activity:"),
+          );
+        expect(commands).toContain("complete-scan");
+      }
+      expect(brokenTracking).toBe(trackingFailure);
       expect(turns).toBe(0);
       expect(
         (await f.command(["get-scan", "--scan-id", f.scanId]))["scan"],
-      ).toMatchObject({ progress: { status: "complete" }, cost: expectedCost });
+      ).toMatchObject({
+        progress: { status: requiredCost ? "running" : "complete" },
+        cost: expectedCost,
+      });
       expect(
         await Promise.all(
           artifactNames.map((name) => readFile(join(f.scanDir, name))),

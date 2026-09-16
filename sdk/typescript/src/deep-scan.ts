@@ -5,7 +5,11 @@ import type { CodexSecurity, ScanOptions } from "./api.js";
 import type { JsonObject } from "./config.js";
 import { loadContract, readScanFile } from "./contract.js";
 import type { ScanCost } from "./cost.js";
-import { ScanCostLimitExceededError, safeErrorMessage } from "./errors.js";
+import {
+  ScanCostLimitExceededError,
+  ScanInterruptedError,
+  safeErrorMessage,
+} from "./errors.js";
 import type { DeepScanOptions } from "./scan-settings.js";
 import {
   combineScanCoverage,
@@ -20,6 +24,9 @@ import type { SemanticScan } from "./scan-semantics.js";
 import { ScanTransportClosedError } from "./scan-execution.js";
 
 export const DEEP_SCAN_CHECKPOINT = "artifacts/deep-scan/checkpoint.json";
+
+/** Required usage tracking must stop the entire composition before another pass. */
+export class ScanCostTrackingError extends ScanInterruptedError {}
 
 export interface DeepScanCheckpoint {
   version: 2;
@@ -333,6 +340,7 @@ export async function runDeepScans(
           await save();
           return;
         } catch (error) {
+          if (error instanceof ScanCostTrackingError) externalStop.abort(error);
           if (discoverySignal.aborted) throw error;
           if (attempt >= retries.length) {
             if (pass.scanId !== undefined) {
@@ -455,7 +463,8 @@ export async function runDeepScans(
     state.terminalReason =
       signal.reason instanceof ScanCostLimitExceededError
         ? "capped"
-        : executionSignal.aborted
+        : executionSignal.aborted &&
+            !(executionSignal.reason instanceof ScanCostTrackingError)
           ? "canceled"
           : "failed";
     if (state.aggregate !== null) {

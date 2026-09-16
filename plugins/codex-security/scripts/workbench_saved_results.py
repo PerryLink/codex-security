@@ -1708,7 +1708,7 @@ def preserve_scan_results(db: Any, connection: Any, args: Any) -> dict[str, Any]
         if scan["status"] == "running":
             return db.scan_context(connection, scan_id)
         if getattr(args, "after_stop", False):
-            preserve_stopped_results_after_transition(db, connection, scan_id)
+            preserve_stopped_results_after_transition(db, connection, scan_id, stop_children=True)
             return db.scan_context(connection, scan_id)
         published = preserve_scan_results_locked(db, connection, scan_id)
         if not published and scan["canceled_at"] is not None:
@@ -1993,8 +1993,25 @@ def cancel_scan_locked(db: Any, connection: Any, args: Any) -> dict[str, Any]:
     return db.workspace_state(connection, scan["workspace_id"])
 
 
-def preserve_stopped_results_after_transition(db: Any, connection: Any, scan_id: str) -> None:
+def preserve_stopped_results_after_transition(
+    db: Any, connection: Any, scan_id: str, *, stop_children: bool = False
+) -> None:
     try:
+        if stop_children:
+            scan = db.require_scan(connection, scan_id)
+            children = composition_children(connection, scan) if scan["mode"] == "deep" else []
+            for child in children:
+                if child["status"] == "running":
+                    fail_scan(
+                        db,
+                        connection,
+                        argparse.Namespace(
+                            scan_id=child["id"],
+                            claim_token=child["handoff_claim_token"],
+                            cost_json=None,
+                            message="Parent Deep Scan stopped.",
+                        ),
+                    )
         if preserve_scan_results_locked(db, connection, scan_id):
             clear_legacy_publication_error(connection, scan_id)
     except (ContractError, OSError, SystemExit, ValueError) as exc:

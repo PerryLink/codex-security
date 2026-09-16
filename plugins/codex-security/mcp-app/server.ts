@@ -736,7 +736,7 @@ export function createCodexSecurityServer(): McpServer {
           threadId
         });
       }
-      const terminal = nativeScanTerminalResult(scan);
+      const terminal = await nativeScanTerminalResult(scan);
       if (terminal) return terminal;
       await nativeScans.run({
         scan,
@@ -754,7 +754,7 @@ export function createCodexSecurityServer(): McpServer {
       if (startedScan) {
         const current = await runWorkbench(["get-scan", "--scan-id", startedScan.scanId]).catch(() => undefined);
         if (isJsonObject(current?.scan)) {
-          const terminal = nativeScanTerminalResult(current.scan as unknown as ScanResults);
+          const terminal = await nativeScanTerminalResult(current.scan as unknown as ScanResults);
           if (terminal) return terminal;
         }
       }
@@ -1544,7 +1544,16 @@ function boundedErrorData(error: unknown): { message: string; name: string } {
   };
 }
 
-function nativeScanCompletedResult(scan: ScanResults) {
+async function nativeScanCompletedResult(scan: ScanResults) {
+  try {
+    await runWorkbench([
+      "complete-scan",
+      "--scan-id", scan.scanId,
+      ...optionalArg("--claim-token", scan.handoffClaimToken)
+    ]);
+  } catch (error) {
+    return toolErrorResult(completionFailureMessage(error));
+  }
   return {
     content: [{
       type: "text" as const,
@@ -1558,7 +1567,7 @@ function nativeScanCompletedResult(scan: ScanResults) {
   };
 }
 
-function nativeScanTerminalResult(scan: ScanResults) {
+async function nativeScanTerminalResult(scan: ScanResults) {
   const status = scan.progress?.status;
   if (status === "complete") return nativeScanCompletedResult(scan);
   if (status === "canceled") {

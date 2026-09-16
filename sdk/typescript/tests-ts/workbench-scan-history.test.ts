@@ -314,7 +314,7 @@ test("loads each scan once and scopes saved links to uncached history", async ()
     "connection.row_factory = sqlite3.Row",
     "connection.executescript('''",
     "CREATE TABLE security_targets (id TEXT, current_path TEXT);",
-    "CREATE TABLE scans (id TEXT, target_path TEXT, target_id TEXT, status TEXT, started_at TEXT, mode TEXT DEFAULT 'standard', parent_scan_id TEXT);",
+    "CREATE TABLE scans (id TEXT, target_path TEXT, target_id TEXT, status TEXT, started_at TEXT, mode TEXT DEFAULT 'standard', parent_scan_id TEXT, scan_dir TEXT);",
     "CREATE TABLE scan_comparisons (before_scan_id TEXT, after_scan_id TEXT);",
     "CREATE TABLE scan_comparison_matches (before_scan_id TEXT, after_scan_id TEXT, before_occurrence_id TEXT, after_occurrence_id TEXT);",
     "CREATE TABLE finding_occurrences (id TEXT, finding_id TEXT, scan_id TEXT, details_json TEXT, remediation TEXT, severity TEXT, summary TEXT, title TEXT);",
@@ -654,7 +654,7 @@ from workbench_scan_history import finding_matches
 connection = sqlite3.connect(':memory:')
 connection.row_factory = sqlite3.Row
 connection.executescript('''
-CREATE TABLE scans (id TEXT PRIMARY KEY, started_at TEXT, mode TEXT DEFAULT 'standard', parent_scan_id TEXT);
+CREATE TABLE scans (id TEXT PRIMARY KEY, started_at TEXT, mode TEXT DEFAULT 'standard', parent_scan_id TEXT, scan_dir TEXT);
 CREATE TABLE finding_occurrences (id TEXT PRIMARY KEY, finding_id TEXT, scan_id TEXT, title TEXT);
 CREATE TABLE scan_comparison_matches (
     before_scan_id TEXT, after_scan_id TEXT, before_occurrence_id TEXT, after_occurrence_id TEXT, reason TEXT

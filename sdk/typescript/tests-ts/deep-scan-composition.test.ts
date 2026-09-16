@@ -19,6 +19,7 @@ import { estimateScanCost } from "../src/cost.js";
 import type { JsonObject as WorkbenchJsonObject } from "../src/config.js";
 import {
   runDeepScans,
+  ScanCostTrackingError,
   DEEP_SCAN_CHECKPOINT,
   type DeepScanCheckpoint,
   type DeepScanComposition,
@@ -633,6 +634,48 @@ describe("ordinary scan composition", () => {
       });
     },
   );
+
+  test("required child metering failure stops sibling discovery without retries or merging", async () => {
+    const h = await harness({ workers: 2, maxDiscoveryRuns: 4 });
+    h.input.scanOptions.requireCost = true;
+    const failure = new ScanCostTrackingError(
+      "Required usage unavailable.",
+      h.input.scanDir,
+    );
+    let secondStarted!: () => void;
+    const started = new Promise<void>((resolve) => {
+      secondStarted = resolve;
+    });
+    const retries: string[] = [];
+    h.input.onRetry = (message) => retries.push(message);
+    h.setRun(async (options) => {
+      if (options.outputDir!.endsWith("pass-1")) {
+        await started;
+        throw failure;
+      }
+      secondStarted();
+      return await new Promise<ScanResult>((_resolve, reject) => {
+        options.signal!.addEventListener(
+          "abort",
+          () => reject(options.signal!.reason),
+          { once: true },
+        );
+      });
+    });
+    await expect(runDeepScans(h.input)).rejects.toBe(failure);
+    expect(h.calls).toHaveLength(2);
+    expect(h.metrics().closed).toBe(2);
+    expect(retries).toEqual([]);
+    expect(h.mergeInputs).toEqual([]);
+    expect(
+      [...h.records.values()].map((record) => record.progress.status),
+    ).toEqual(["failed", "failed"]);
+    expect(await h.checkpoint()).toMatchObject({
+      terminalReason: "failed",
+      consecutiveErrors: 0,
+      mergedScanIds: [],
+    });
+  });
 
   test("surfaces failed child persistence instead of restarting its retries", async () => {
     retryDelay = spyOn(timers, "setTimeout").mockImplementation(

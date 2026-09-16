@@ -286,6 +286,7 @@ console.log(JSON.stringify({ type: "turn.completed", usage: { input_tokens: 0, c
         const config = {
           model: "saved-model",
           model_reasoning_effort: "ultra",
+          approval_policy: "on-request",
           ...(selected
             ? {
                 ...(modelProvider === undefined
@@ -298,9 +299,10 @@ console.log(JSON.stringify({ type: "turn.completed", usage: { input_tokens: 0, c
         await writeFile(
           join(root, "config.toml"),
           selected
-            ? (modelProvider === undefined
-                ? ""
-                : `model_provider = "${modelProvider}"\n`) +
+            ? 'approval_policy = "on-request"\n' +
+                (modelProvider === undefined
+                  ? ""
+                  : `model_provider = "${modelProvider}"\n`) +
                 `[model_providers.${providerName}]\n` +
                 (provider.auth
                   ? `[model_providers.${providerName}.auth]\ntype = "command"\ncommand = "synthetic-auth-provider"\n`
@@ -336,6 +338,7 @@ console.log(JSON.stringify({ type: "turn.completed", usage: { input_tokens: 0, c
             .startThread({ workingDirectory: root, skipGitRepoCheck: true })
             .run("Synthetic credential launch only.");
           const observed = JSON.parse(await readFile(capture, "utf8"));
+          assert.ok(observed.argv.includes('approval_policy="never"'));
           assert.equal(observed.codex, "synthetic-native-selected");
           assert.equal(
             observed.openai,
@@ -354,6 +357,20 @@ console.log(JSON.stringify({ type: "turn.completed", usage: { input_tokens: 0, c
           assert.equal(observed.executable, process.execPath);
           assert.equal(process.env.CODEX_API_KEY, "synthetic-native-selected");
           assert.equal(process.env.OPENAI_API_KEY, "synthetic-competing-key");
+          if (!selected) {
+            await sdk
+              .resumeThread("synthetic-auth-thread", {
+                workingDirectory: root,
+                skipGitRepoCheck: true,
+              })
+              .run("Synthetic resumed launch only.");
+            const resumed = JSON.parse(await readFile(capture, "utf8"));
+            assert.ok(resumed.argv.includes('approval_policy="never"'));
+            assert.equal(
+              resumed.argv.includes('approval_policy="on-request"'),
+              false,
+            );
+          }
         }
       }
       const prepared = await prepareNativeScan(input());

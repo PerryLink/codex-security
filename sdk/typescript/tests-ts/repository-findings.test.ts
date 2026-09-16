@@ -15,7 +15,7 @@ connection = sqlite3.connect(":memory:")
 connection.row_factory = sqlite3.Row
 connection.executescript("""
 CREATE TABLE security_targets(id TEXT, current_path TEXT, display_name TEXT);
-CREATE TABLE scans(id TEXT, target_id TEXT, scope TEXT, updated_at TEXT, status TEXT, started_at TEXT, mode TEXT DEFAULT 'standard', parent_scan_id TEXT);
+CREATE TABLE scans(id TEXT, target_id TEXT, scope TEXT, updated_at TEXT, status TEXT, started_at TEXT, mode TEXT DEFAULT 'standard', parent_scan_id TEXT, scan_dir TEXT);
 CREATE TABLE finding_occurrences(id TEXT, finding_id TEXT, severity TEXT, created_at TEXT, scan_id TEXT, title TEXT, summary TEXT);
 CREATE TABLE finding_triage(occurrence_id TEXT, status TEXT, updated_at TEXT, close_reason TEXT);
 CREATE TABLE finding_locations(occurrence_id TEXT, relative_path TEXT, role TEXT, sort_order INTEGER);

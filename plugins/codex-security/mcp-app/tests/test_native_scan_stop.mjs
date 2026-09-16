@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { createRequire } from "node:module";
 import { dirname } from "node:path";
 import { test } from "node:test";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { build } from "esbuild";
 
 const entrypoint = fileURLToPath(new URL("../server.ts", import.meta.url));
@@ -27,6 +27,7 @@ const bundle = await build({
           }`,
           "./src/native-scan.js": `
           export class NativeScanHost {
+            run(...args) { return fixture.run(...args); }
             cancel(...args) { return fixture.cancel(...args); }
             async close() {}
           }`,
@@ -61,6 +62,68 @@ function serverFor(fixture) {
     bundle.outputFiles[0].text,
   )(createRequire(import.meta.url), module, module.exports, fixture);
   return module.exports.createCodexSecurityServer();
+}
+
+for (const entry of ["completed", "run-success", "run-error"]) {
+  test(`native ${entry} validates completion before reporting success`, async () => {
+    const scan = {
+      scanId: "synthetic-parent",
+      scanDir: "/synthetic/scan",
+      handoffClaimToken: "synthetic-claim",
+      progress: { status: entry === "completed" ? "complete" : "running" },
+      reportAvailable: false,
+    };
+    let runs = 0;
+    let validations = 0;
+    const server = serverFor({
+      async workbench([command, ...args]) {
+        if (command === "list-scans") return {};
+        if (command === "resolve-scan-root")
+          return { scanRoot: "/synthetic/scans" };
+        if (command === "begin-deep-scan") return { scan };
+        assert.equal(args[args.indexOf("--scan-id") + 1], scan.scanId);
+        if (command === "get-scan") {
+          return { scan: { ...scan, progress: { status: "complete" } } };
+        }
+        assert.equal(command, "complete-scan");
+        assert.equal(
+          args[args.indexOf("--claim-token") + 1],
+          scan.handoffClaimToken,
+        );
+        validations++;
+        throw new Error("synthetic sealed artifact mismatch");
+      },
+      async run() {
+        runs++;
+        if (entry === "run-error") throw new Error("synthetic transport error");
+        return {};
+      },
+    });
+    const result = await server.tools.get("start_codex_security_deep_scan")(
+      {
+        scanId: scan.scanId,
+        handoffClaimToken: scan.handoffClaimToken,
+      },
+      {
+        _meta: {
+          "openai/threadId": "synthetic-owner",
+          "codex/sandbox-state-meta": {
+            sandboxCwd: pathToFileURL(dirname(entrypoint)).href,
+            permissionProfile: {
+              type: "managed",
+              file_system: { type: "unrestricted" },
+              network: "restricted",
+            },
+          },
+        },
+      },
+    );
+    assert.equal(result.isError, true);
+    assert.match(result.content[0].text, /synthetic sealed artifact mismatch/);
+    assert.equal(result.structuredContent, undefined);
+    assert.equal(runs, entry === "completed" ? 0 : 1);
+    assert.equal(validations, 1);
+  });
 }
 
 for (const operation of ["cancel", "fail"]) {

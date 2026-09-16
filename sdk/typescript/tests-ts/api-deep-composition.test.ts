@@ -23,7 +23,10 @@ import { CodexSecurity, type ScanOptions } from "../src/api.js";
 import type { JsonObject } from "../src/config.js";
 import { runWorkbench, type WorkbenchCommandOptions } from "../src/runtime.js";
 import { prepareSemanticScanDraft } from "../src/scan-semantics.js";
-import { DEEP_SCAN_CHECKPOINT } from "../src/deep-scan.js";
+import {
+  DEEP_SCAN_CHECKPOINT,
+  ScanCostTrackingError,
+} from "../src/deep-scan.js";
 import { ScanTransportClosedError } from "../src/scan-execution.js";
 import type { ScanProgress } from "../src/worker-progress.js";
 import { PLUGIN_ROOT } from "./plugin-root.js";
@@ -102,14 +105,16 @@ test.each([
   { workers: 1, budget: false, native: "feedback" },
   { workers: 1, budget: false, native: "discovery" },
   { workers: 1, budget: false, native: "sealed" },
+  { workers: 1, budget: false, trackingFailure: true },
 ] as {
   workers: number;
   budget: boolean;
+  trackingFailure?: boolean;
   provider?: JsonObject;
   native?: "feedback" | "discovery" | "sealed";
 }[])(
   "Deep composes sealed ordinary scans and preserves a budgeted parent: %j",
-  async ({ workers, budget, provider, native }) => {
+  async ({ workers, budget, provider, native, trackingFailure }) => {
     const python = Bun.which("python3") ?? Bun.which("python");
     if (python === null) throw new Error("Python is required for this test.");
     const root = await realpath(
@@ -420,7 +425,10 @@ run_workbench(state, 'set-finding-triage', '--occurrence-id', completed['finding
             ) => {
               const thread = {
                 id: savedThreadId,
-                async runStreamed(prompt: string) {
+                async runStreamed(
+                  prompt: string,
+                  turnOptions?: { signal?: AbortSignal },
+                ) {
                   const record = registrations.get(id)!;
                   const mode = record["mode"] as string;
                   if (
@@ -500,6 +508,22 @@ run_workbench(state, 'set-finding-triage', '--occurrence-id', completed['finding
                   async function* events(): AsyncGenerator<ThreadEvent> {
                     thread.id ??= randomUUID();
                     const sessionHome = env["CODEX_HOME"]!;
+                    if (trackingFailure) {
+                      expect(mode).toBe("standard");
+                      await writeFile(
+                        join(sessionHome, "sessions"),
+                        "not a directory",
+                      );
+                      yield { type: "thread.started", thread_id: thread.id };
+                      const signal = turnOptions!.signal!;
+                      if (!signal.aborted)
+                        await new Promise<void>((resolve) =>
+                          signal.addEventListener("abort", () => resolve(), {
+                            once: true,
+                          }),
+                        );
+                      throw signal.reason;
+                    }
                     await mkdir(join(sessionHome, "sessions"), {
                       recursive: true,
                     });
@@ -705,10 +729,20 @@ run_workbench(state, 'set-finding-triage', '--occurrence-id', completed['finding
           ? { safetyIdentifier: "saved-native-identifier" }
           : {}),
         scanPrompt: "Inspect the synthetic source.",
-        ...(budget ? { maxCostUsd: 0.001 } : {}),
+        ...(budget
+          ? { maxCostUsd: 0.001 }
+          : trackingFailure
+            ? { maxCostUsd: 1 }
+            : {}),
         postScanPrompt: "Post-scan instructions once.",
         onProgress: (update) => progress.push(update),
-        onWarning: (message) => console.error(message),
+        onWarning: (message) => {
+          if (trackingFailure && message.startsWith("Deep Scan pass "))
+            controller.abort(
+              new Error("Unexpected retry after required metering failure."),
+            );
+          else console.error(message);
+        },
       };
       const run = () => {
         progress = [];
@@ -722,6 +756,33 @@ run_workbench(state, 'set-finding-triage', '--occurrence-id', completed['finding
           ]),
         });
       };
+      if (trackingFailure) {
+        await expect(run()).rejects.toBeInstanceOf(ScanCostTrackingError);
+        expect(turns).toHaveLength(1);
+        expect(
+          [...registrations.values()].map((record) => record["mode"]).sort(),
+        ).toEqual(["deep", "standard"]);
+        expect(
+          JSON.parse(
+            await readFile(join(scanDir, DEEP_SCAN_CHECKPOINT), "utf8"),
+          ),
+        ).toMatchObject({
+          terminalReason: "failed",
+          mergedScanIds: [],
+          consecutiveErrors: 0,
+        });
+        for (const scanId of registrations.keys()) {
+          const saved = await runWorkbench(commandOptions, [
+            "get-scan",
+            "--scan-id",
+            scanId,
+          ]);
+          expect(saved["scan"]).toMatchObject({
+            progress: { status: "failed" },
+          });
+        }
+        return;
+      }
       if (native === "discovery" || native === "sealed") {
         await expect(run()).rejects.toBeInstanceOf(ScanTransportClosedError);
         const saved = await runWorkbench(commandOptions, [

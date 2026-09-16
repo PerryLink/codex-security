@@ -170,6 +170,7 @@ export async function prepareNativeScan(
     input,
     deep.settings.subagents,
   );
+  config.approval_policy = "never";
   let modelProvider = scanModelProvider(config);
   const providers = config.model_providers as JsonObject | undefined;
   if (modelProvider === undefined && providers?.openai !== undefined) {

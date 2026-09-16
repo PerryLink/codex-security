@@ -61,6 +61,7 @@ appendFileSync(${JSON.stringify(captures)}, JSON.stringify({
   args: process.argv.slice(1),
   selected: process.env.SYNTHETIC_SCAN_SETTING,
   safetyIdentifier: process.env.CODEX_SAFETY_IDENTIFIER,
+  providerKey: process.env.SYNTHETIC_PROVIDER_KEY,
 }) + "\\n");
 const directory = join(process.env.CODEX_HOME, "sessions", "2026", "01", "01");
 mkdirSync(directory, {recursive:true});
@@ -84,6 +85,8 @@ await new Promise(() => {});
     CODEX_SECURITY_STATE_DIR: join(root, "state"),
     SYNTHETIC_SCAN_SETTING: "selected-value",
     CODEX_SAFETY_IDENTIFIER: "synthetic-ambient-identifier",
+    OPENAI_API_KEY: "synthetic-fixture-key",
+    SYNTHETIC_PROVIDER_KEY: "synthetic-provider-key",
   };
   let registration: JsonObject | undefined;
   let workbenchOptions: WorkbenchCommandOptions | undefined;
@@ -128,16 +131,40 @@ await new Promise(() => {});
       },
       { surface: "sdk" },
     );
-  const first = makeClient(true, {
+  const savedSettings = {
     model: "gpt-6-astra",
     model_reasoning_effort: "ultra",
-  });
+    model_provider: "synthetic",
+    model_providers: {
+      synthetic: {
+        name: "Synthetic provider",
+        base_url: "https://provider.example.test/v1",
+        env_key: "SYNTHETIC_PROVIDER_KEY",
+        http_headers: { X_SYNTHETIC_TOKEN: "saved-provider-header" },
+        wire_api: "responses",
+      },
+    },
+    mcp_servers: {
+      synthetic: {
+        command: "synthetic-mcp",
+        env: { FIXTURE_TOKEN: "saved-mcp-setting" },
+      },
+    },
+    shell_environment_policy: {
+      inherit: "core",
+      set: { FIXTURE_SETTING: "saved-shell-setting" },
+    },
+    cli_auth_credentials_store: "file",
+    forced_login_method: "api",
+  };
+  const first = makeClient(true, savedSettings);
   try {
     await expect(
       first.run(repository, {
         mode: "standard",
         outputDir: scanDir,
         deepScanPass: true,
+        preserveProviderEnvironment: true,
         safetyIdentifier: "synthetic-saved-identifier",
       }),
     ).rejects.toThrow("Synthetic interrupted pass");
@@ -152,6 +179,11 @@ await new Promise(() => {});
   const recipe = saved["recipe"] as JsonObject;
   expect(recipe["inheritedPermissions"]).toEqual(inheritedPermissions);
   expect(recipe["safetyIdentifier"]).toBe("synthetic-saved-identifier");
+  expect(recipe["preserveProviderEnvironment"]).toBe(true);
+  expect(recipe["config"]).toMatchObject(savedSettings);
+  expect(recipe["config"]).not.toHaveProperty("plugins");
+  expect(recipe["config"]).not.toHaveProperty("marketplaces");
+  expect(recipe["config"]).not.toHaveProperty("features.plugins");
   environment.CODEX_SAFETY_IDENTIFIER = "synthetic-other-host-identifier";
   const resumed = makeClient(false, recipe["config"] as JsonObject);
   try {
@@ -161,6 +193,8 @@ await new Promise(() => {});
         outputDir: scanDir,
         resumeScanId: saved["scanId"] as string,
         deepScanPass: true,
+        preserveProviderEnvironment:
+          recipe["preserveProviderEnvironment"] === true,
         safetyIdentifier: recipe["safetyIdentifier"] as string,
         inheritedPermissions: recipe[
           "inheritedPermissions"
@@ -179,6 +213,7 @@ await new Promise(() => {});
           args: string[];
           selected: string;
           safetyIdentifier: string;
+          providerKey: string;
         },
     );
   expect(launches).toHaveLength(2);
@@ -201,6 +236,13 @@ await new Promise(() => {});
     });
     expect(launch.selected).toBe("selected-value");
     expect(launch.safetyIdentifier).toBe("synthetic-saved-identifier");
+    expect(launch.providerKey).toBe("synthetic-provider-key");
+    const settings = launch.args.filter((value) =>
+      Object.keys(savedSettings).some(
+        (key) => value.startsWith(`${key}=`) || value.startsWith(`${key}.`),
+      ),
+    );
+    expect(parseToml(settings.join("\n"))).toMatchObject(savedSettings);
   }
   expect(launches[1]!.args).toContain("resume");
   expect(launches[1]!.args).toContain(threadId);
