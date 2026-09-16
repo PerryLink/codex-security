@@ -5,6 +5,10 @@ import {
   readCodexSessionTurn
 } from "../../../../../sdk/typescript/src/codex-session.js";
 import { Codex, type CodexOptions } from "@openai/codex-sdk";
+import {
+  codexWorkerConfig, codexWorkerConfigPath, inlineToml, modelProviderConfigOverride,
+  type JsonObject
+} from "../../../../../sdk/typescript/src/config.js";
 import { parse as parseToml } from "smol-toml";
 import { executablePathForSpawn } from "./executable-path.js";
 import {
@@ -73,7 +77,9 @@ export class CodexSdkWorkerExecutor implements CodexWorkerExecutor {
           ? { model_reasoning_effort: this.modelSettings.reasoningEffort }
           : {})
       };
+      const { model_providers: _providers, ...sdkModelConfig } = modelConfig;
       const configOverrides = [
+        ...modelProviderConfigOverride(modelConfig as JsonObject),
         ...(resolved?.configOverrides ?? []),
         ...workerPermissionProfileConfigOverrides(workerProfile)
       ];
@@ -92,8 +98,9 @@ export class CodexSdkWorkerExecutor implements CodexWorkerExecutor {
         cwd: request.workingDirectory,
         profileId: DEEP_SCAN_WORKER_PERMISSION_PROFILE_ID,
         configOverrides: [
-          ...Object.entries(workerModelSelection(modelConfig))
-            .map(([key, value]) => `${key}=${tomlInlineValue(value)}`),
+          ...Object.entries(codexWorkerConfig(modelConfig as JsonObject))
+            .filter(([key]) => key !== "model_providers")
+            .map(([key, value]) => `${key}=${inlineToml(value)}`),
           ...configOverrides,
           ...(resolved?.baseUrl ? [`openai_base_url=${tomlString(resolved.baseUrl)}`] : [])
         ],
@@ -111,7 +118,7 @@ export class CodexSdkWorkerExecutor implements CodexWorkerExecutor {
         // Keep native credentials unless the worker has no configured account.
         ...(useOpenAiApiKey ? { apiKey: openAiApiKey } : {}),
         config: {
-          ...modelConfig,
+          ...sdkModelConfig,
           mcp_servers: {
             ...(isRecord(modelConfig.mcp_servers) ? modelConfig.mcp_servers : {}),
             // Discovery workers use the bundled skills and artifacts, not the parent workbench MCP.
@@ -403,26 +410,17 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
 }
 
-// These are the existing non-secret selections written by the SDK preflight
-// adapter. Reading only summary left provider selection in a shared home.
-function workerModelSelection(config: NonNullable<CodexOptions["config"]>): TomlObject {
-  const result: TomlObject = {};
-  for (const key of ["model", "model_provider", "model_reasoning_effort", "model_reasoning_summary", "service_tier", "model_providers"]) {
-    const value = config[key];
-    if (value !== undefined) result[key] = value;
-  }
-  return result;
-}
-
 async function workerModelConfig(environment: Record<string, string>): Promise<NonNullable<CodexOptions["config"]>> {
   const configPath = environmentVariable(environment, "CODEX_SECURITY_CONFIG_PATH", process.platform);
   if (!configPath) return {};
-  const config = parseToml(await fs.readFile(configPath, "utf8"));
-  const profiles = config.profiles;
-  const profile = typeof config.profile === "string" && isRecord(profiles)
-    ? profiles[config.profile]
-    : undefined;
-  return workerModelSelection({ ...config, ...(isRecord(profile) ? profile : {}) } as NonNullable<CodexOptions["config"]>);
+  try {
+    return codexWorkerConfig(parseToml(await fs.readFile(codexWorkerConfigPath(configPath), "utf8")) as JsonObject) as NonNullable<CodexOptions["config"]>;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  }
+  // Older SDKs only provide preflight input. Keep their home-selected provider.
+  const config = codexWorkerConfig(parseToml(await fs.readFile(configPath, "utf8")) as JsonObject) as NonNullable<CodexOptions["config"]>;
+  return config.model_reasoning_summary === undefined ? {} : { model_reasoning_summary: config.model_reasoning_summary };
 }
 
 async function snapshotWorkerEnvironment(source: NodeJS.ProcessEnv = process.env): Promise<Record<string, string>> {

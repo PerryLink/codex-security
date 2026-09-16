@@ -52,6 +52,8 @@ import {
 } from "./codex-prompt.js";
 import {
   DEFAULT_CODEX_CONFIG,
+  codexWorkerConfig,
+  codexWorkerConfigPath,
   EXTERNAL_CODEX_PROVIDERS,
   inlineToml,
   isExternalModelProvider,
@@ -2794,6 +2796,10 @@ export class CodexSecurity {
       const preflightConfig = scanPreflightCodexConfig(effectiveConfig);
       if (runtime.configPath !== undefined) {
         await writeCodexConfig(runtime.configPath, preflightConfig);
+        await writeCodexConfig(
+          codexWorkerConfigPath(runtime.configPath),
+          codexWorkerConfig(effectiveConfig),
+        );
       }
       const runtimeHome = await realpath(runtime.codexHome);
       requireOutputOutsideRepositories(protectedRoots, runtimeHome, "runtime");

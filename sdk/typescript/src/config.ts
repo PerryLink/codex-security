@@ -202,6 +202,29 @@ export function resolveCodexProfile(config: JsonObject): JsonObject {
   return resolved;
 }
 
+/** @internal Per-session runtime selections are separate from preflight input. */
+export function codexWorkerConfigPath(preflightPath: string): string {
+  return `${preflightPath}.workers.toml`;
+}
+
+/** @internal Preserve the selected profile and provider definition for workers. */
+export function codexWorkerConfig(config: JsonObject): JsonObject {
+  const resolved = resolveCodexProfile(config);
+  const result: JsonObject = {};
+  for (const key of [
+    "model",
+    "model_provider",
+    "model_reasoning_effort",
+    "model_reasoning_summary",
+    "service_tier",
+    "model_providers",
+  ]) {
+    const value = resolved[key];
+    if (value !== undefined) result[key] = value;
+  }
+  return result;
+}
+
 export async function mergedCodexConfig(
   config: CodexSecurityConfig,
 ): Promise<JsonObject> {
