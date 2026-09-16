@@ -1501,6 +1501,28 @@ def write_scan_draft(db: Any, connection: Any, args: Any) -> dict[str, Any]:
                 filename,
                 (json.dumps(document, allow_nan=False, indent=2) + "\n").encode(),
             )
+        if (
+            scan["mode"] == "deep"
+            and draft.get("deepScanPublication") is not None
+            and db.deep_scan.require_deep_scan_run(connection, scan_id)["workflow_version"]
+            in {"deep-scan-mcp/v1", "deep-security-scan/v1"}
+        ):
+            # Acknowledge this staged operation only after validation and all canonical writes.
+            acceptance = {
+                "status": "draft_written",
+                "input": {
+                    **draft,
+                    "checkpoint": checkpoint if args.checkpoint_path is not None else None,
+                },
+            }
+            write_scan_local_bytes(
+                scan_dir,
+                Path(args.draft_path)
+                .with_suffix(".accepted.json")
+                .relative_to(scan_dir)
+                .as_posix(),
+                (json.dumps(acceptance, allow_nan=False, indent=2) + "\n").encode(),
+            )
         # Accepted Standard drafts are evidence of review or report assembly,
         # even when the parent omitted its explicit progress call.
         if scan["mode"] == "standard":

@@ -141,3 +141,45 @@ def test_current_publication_replays_without_changing_checkpoint_or_worker_state
     assert dict(workbench_db.execute("SELECT * FROM deep_scan_workers").fetchone()) == worker_before
     findings = json.loads((scan.scan_dir / "findings.json").read_text())["findings"]
     assert findings[0]["title"] == "Accepted aggregate"
+
+
+@pytest.mark.parametrize(
+    "failure", ["validation", "findings.json", "coverage.json", "scan-manifest.json"]
+)
+def test_failed_publication_does_not_acknowledge_staged_input(
+    workbench_api, workbench_db, publication_scan, monkeypatch, failure
+):
+    scan = publication_scan()
+    result = add_worker(workbench_db, scan)
+    with workbench_db:
+        workbench_db.execute(
+            "UPDATE deep_scan_runs SET workflow_version = 'deep-scan-mcp/v1', "
+            "coordinator_generation = 2 WHERE scan_id = ?",
+            (scan.scan_id,),
+        )
+        workbench_db.execute(
+            "UPDATE deep_scan_workers SET kind = 'dedup', merge_state = 'none' WHERE scan_id = ?",
+            (scan.scan_id,),
+        )
+    args = stage_publication(scan, generation=2, result_path=result, title="Accepted aggregate")
+    staged = {path: path.read_bytes() for path in (scan.scan_dir / "drafts").iterdir()}
+    saved_results = workbench_api["saved_results"]
+    original_write = saved_results.write_scan_local_bytes
+
+    def fail_validation(*args):
+        raise OSError("Synthetic validation failure")
+
+    def fail_write(scan_dir, filename, contents):
+        if filename == failure:
+            raise OSError("Synthetic canonical write failure")
+        original_write(scan_dir, filename, contents)
+
+    if failure == "validation":
+        monkeypatch.setattr(saved_results, "_validate_completion_binding", fail_validation)
+    else:
+        monkeypatch.setattr(saved_results, "write_scan_local_bytes", fail_write)
+
+    with pytest.raises(OSError, match="Synthetic"):
+        workbench_api["write_scan_draft"](workbench_db, args)
+
+    assert {path: path.read_bytes() for path in (scan.scan_dir / "drafts").iterdir()} == staged
