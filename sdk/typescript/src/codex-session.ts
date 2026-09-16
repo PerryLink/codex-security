@@ -1,9 +1,4 @@
-import {
-  Codex,
-  type CodexOptions,
-  type ThreadOptions,
-  type TurnOptions,
-} from "@openai/codex-sdk";
+import type { ThreadOptions, TurnOptions } from "@openai/codex-sdk";
 
 export interface CodexSessionEvent {
   readonly type: string;
@@ -22,9 +17,6 @@ export interface CodexSessionClient {
   startThread(options: ThreadOptions): CodexSessionThread;
   resumeThread?(threadId: string, options: ThreadOptions): CodexSessionThread;
 }
-
-export const createCodexClient = (options: CodexOptions): CodexSessionClient =>
-  new Codex(options);
 
 /** Reduce a single stream; callers retain error, retry and acceptance policy. */
 export async function readCodexSessionTurn(options: {
