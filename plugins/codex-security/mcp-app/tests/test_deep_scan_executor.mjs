@@ -870,15 +870,19 @@ async function testRuntimeProviderSnapshots() {
   const previousMarker = process.env.FAKE_CODEX_MARKER;
   const scans = [];
   try {
-    for (const name of ["openrouter", "fireworks", "command-auth", "cloud.production", "cloud production", "shared-default", "shared-external"]) {
+    for (const name of ["openrouter", "fireworks", "command-auth", "cloud.production", "cloud production", "shared-default", "shared-default-configured", "openai", "shared-external"]) {
       const fixture = await fakeCodexFixture(deniedWorkerPermissionProfile);
       const configPath = path.join(fixture.root, "config-preflight.toml");
       const promptPath = path.join(fixture.root, "prompt.md");
-      const provider = name === "shared-default" ? "openai" : name === "shared-external" ? "openrouter" : name.startsWith("cloud") ? "amazon-bedrock" : name === "command-auth" ? "openrouter" : name;
+      const provider = name.startsWith("shared-default") ? "openai" : name === "shared-external" ? "openrouter" : name.startsWith("cloud") ? "amazon-bedrock" : name === "command-auth" ? "openrouter" : name;
       const definition = provider === "amazon-bedrock"
         ? { aws: { region: "us-west-2", profile: "synthetic" } }
         : {
           name: "Synthetic provider", base_url: `https://${provider}.example.test/v1`, wire_api: "responses",
+          experimental_bearer_token: `synthetic-${name}-selected-token`,
+          http_headers: { Authorization: `synthetic-${name}-selected-header` },
+          env_http_headers: { "X-Synthetic-Auth": "SYNTHETIC_PROVIDER_HEADER" },
+          query_params: { "api-version": "synthetic-version" },
           ...(name === "command-auth"
             ? { auth: { command: "synthetic-auth-helper", args: [], cwd: fixture.root } }
             : { env_key: `${provider.toUpperCase()}_API_KEY` })
@@ -889,8 +893,22 @@ async function testRuntimeProviderSnapshots() {
         forced_chatgpt_workspace_id: `synthetic-${name}`
       } : {};
       const config = { model: "inherited-model", model_provider: provider, ...(name === "shared-default" ? {} : { model_providers: { [provider]: definition } }), model_reasoning_summary: "concise", service_tier: "flex", ...auth };
-      const input = { ...config };
-      if (name === "shared-default") delete input.model_provider;
+      const input = {
+        ...config,
+        model_providers: {
+          ...config.model_providers,
+          unrelated: { experimental_bearer_token: `synthetic-${name}-unrelated-token` }
+        }
+      };
+      if (name.startsWith("shared-default")) delete input.model_provider;
+      if (name.startsWith("cloud")) {
+        input.model_provider = "openai";
+        input.profile = name;
+        input.profiles = {
+          [name]: { model_provider: provider },
+          inactive: { model_provider: "unrelated" }
+        };
+      }
       // These preflight projections intentionally differ from the runtime snapshot.
       const preflight = name.startsWith("cloud")
         ? { model_provider: "openai", model_reasoning_summary: "concise" }
@@ -903,7 +921,7 @@ async function testRuntimeProviderSnapshots() {
       // Simulate a later session replacing the shared home configuration.
       await writeFile(path.join(codexHome, "config.toml"), stringifyToml(config));
       const settings = {
-        codexOptions: { codexPathOverride: process.execPath, env: { CODEX_HOME: codexHome, CODEX_SECURITY_CONFIG_PATH: configPath, FAKE_CODEX_MARKER: fixture.markerPath } },
+        codexOptions: { codexPathOverride: process.execPath, env: { CODEX_HOME: codexHome, CODEX_SECURITY_CONFIG_PATH: configPath, FAKE_CODEX_MARKER: fixture.markerPath, FAKE_CODEX_WORKER_CONFIG: `${configPath}.workers.toml`, SYNTHETIC_PROVIDER_HEADER: `synthetic-${name}-header-env`, ...(definition.env_key ? { [definition.env_key]: `synthetic-${name}-env-key` } : {}), FAKE_CODEX_PROVIDER_ENV_KEYS: JSON.stringify(["SYNTHETIC_PROVIDER_HEADER", ...(definition.env_key ? [definition.env_key] : [])]) } },
         model: "worker-model", reasoningEffort: "ultra", parentSandbox: trustedParentSandboxWithDenials
       };
       scans.push({ name, fixture, configPath, promptPath, config, input, auth, settings, executor: new CodexSdkWorkerExecutor(settings) });
@@ -931,6 +949,12 @@ async function testRuntimeProviderSnapshots() {
               if (["-c", "--config"].includes(child.argv[i])) Object.assign(overrides, parseToml(child.argv[++i]));
             }
             assert.equal(overrides.model_provider, scan.config.model_provider, `${scan.name} ${phase} ${kind}`);
+            assert.equal(JSON.stringify(child).includes(`synthetic-${scan.name}-unrelated-token`), false);
+            assert.deepEqual(parseToml(child.workerConfig), phase === "resume" ? { model_provider: "changed-after-launch" } : scan.config);
+            assert.deepEqual(child.providerAuthentication, Object.fromEntries(
+              JSON.parse(scan.settings.codexOptions.env.FAKE_CODEX_PROVIDER_ENV_KEYS)
+                .map((key) => [key, scan.settings.codexOptions.env[key]])
+            ));
             assert.deepEqual(overrides.model_providers, scan.config.model_providers, `${scan.name} ${phase} ${kind}`);
             for (const [key, value] of Object.entries(scan.auth)) {
               assert.equal(overrides[key], value, `${scan.name} ${phase} ${kind} ${key}`);
@@ -1786,13 +1810,15 @@ async function fakeCodexFixture(
   const scriptPath = path.join(root, "fake-codex.mjs");
   await writeFile(scriptPath, [
     "#!/usr/bin/env node",
-    'import { writeFileSync } from "node:fs";',
+    'import { readFileSync, writeFileSync } from "node:fs";',
     `const preflightProfile = ${JSON.stringify(preflightProfile)};`,
     `const preflightAllowed = ${JSON.stringify(preflightAllowed)};`,
     `const accountResult = ${JSON.stringify(accountResult)};`,
     `const preflightMarkerPath = ${JSON.stringify(preflightMarkerPath)};`,
+    "const workerConfig = process.env.FAKE_CODEX_WORKER_CONFIG ? readFileSync(process.env.FAKE_CODEX_WORKER_CONFIG, 'utf8') : undefined;",
+    "const providerAuthentication = process.env.FAKE_CODEX_PROVIDER_ENV_KEYS ? Object.fromEntries(JSON.parse(process.env.FAKE_CODEX_PROVIDER_ENV_KEYS).map((name) => [name, process.env[name]])) : undefined;",
     "if (process.argv.includes('app-server')) {",
-    "  const preflight = { argv: process.argv.slice(2), cwd: process.cwd(), codexHome: process.env.CODEX_HOME, requests: [] };",
+    "  const preflight = { workerConfig, providerAuthentication, argv: process.argv.slice(2), cwd: process.cwd(), codexHome: process.env.CODEX_HOME, requests: [] };",
     "  writeFileSync(preflightMarkerPath, JSON.stringify(preflight));",
     "  let buffer = '';",
     "  process.stdin.setEncoding('utf8');",
@@ -1834,7 +1860,7 @@ async function fakeCodexFixture(
     "for await (const chunk of process.stdin) stdin += chunk;",
     "const openaiAuthentication = stdin.includes('CAPTURE_SYNTHETIC_OPENAI_AUTH') ? { OPENAI_API_KEY: process.env.OPENAI_API_KEY, CODEX_API_KEY: process.env.CODEX_API_KEY } : undefined;",
     "const bedrockAuthentication = stdin.includes('CAPTURE_SYNTHETIC_BEDROCK_AUTH') ? Object.fromEntries(JSON.parse(process.env.FAKE_CODEX_BEDROCK_ENV_KEYS).map((name) => [name, process.env[name]])) : undefined;",
-    "writeFileSync(process.env.FAKE_CODEX_MARKER, JSON.stringify({ executable: process.execPath, argv: process.argv.slice(2), stdin, cwd: process.cwd(), codexHome: process.env.CODEX_HOME, configPath: process.env.CODEX_SECURITY_CONFIG_PATH, scanValue: process.env.FAKE_CODEX_SCAN_VALUE, deepConfigPath: process.env.CODEX_SECURITY_DEEP_SCAN_CONFIG_PATH, originator: process.env.CODEX_INTERNAL_ORIGINATOR_OVERRIDE, ...(openaiAuthentication ? { openaiAuthentication } : {}), ...(bedrockAuthentication ? { bedrockAuthentication } : {}) }));",
+    "writeFileSync(process.env.FAKE_CODEX_MARKER, JSON.stringify({ workerConfig, providerAuthentication, executable: process.execPath, argv: process.argv.slice(2), stdin, cwd: process.cwd(), codexHome: process.env.CODEX_HOME, configPath: process.env.CODEX_SECURITY_CONFIG_PATH, scanValue: process.env.FAKE_CODEX_SCAN_VALUE, deepConfigPath: process.env.CODEX_SECURITY_DEEP_SCAN_CONFIG_PATH, originator: process.env.CODEX_INTERNAL_ORIGINATOR_OVERRIDE, ...(openaiAuthentication ? { openaiAuthentication } : {}), ...(bedrockAuthentication ? { bedrockAuthentication } : {}) }));",
     "if (stdin.includes('THREAD_START_CONFIG_ERROR')) { console.error('Error: thread/start: thread/start failed: agents.max_threads cannot be set when features.multi_agent_v2 is enabled (code -32600)'); process.exit(1); }",
     "if (stdin.includes('CONFIG_ERROR')) { console.error('failed to load configuration: invalid value'); process.exit(2); }",
     "if (stdin.includes('MCP_STARTUP_TIMEOUT') || stdin.includes('CATALOG_AUTH_ONLY') || stdin.includes('SYNC_AUTH_ONLY')) {",
