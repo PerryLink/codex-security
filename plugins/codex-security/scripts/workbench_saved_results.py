@@ -21,6 +21,7 @@ from typing import Any
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from finalize_scan_contract import (
     ContractError,
+    ScanLocalIOError,
     _finding_strength,
     _populate_unsealed_artifact_envelope,
     _populate_unsealed_manifest_envelope,
@@ -1524,7 +1525,7 @@ def write_scan_draft(db: Any, connection: Any, args: Any) -> dict[str, Any]:
                     .as_posix(),
                     (json.dumps(acceptance, allow_nan=False, indent=2) + "\n").encode(),
                 )
-            except OSError:
+            except (OSError, ScanLocalIOError):
                 # Publication succeeded; a missing receipt still prevents lost-response replay.
                 pass
         # Accepted Standard drafts are evidence of review or report assembly,
