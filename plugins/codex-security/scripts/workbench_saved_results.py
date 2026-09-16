@@ -1396,6 +1396,8 @@ def _require_current_deep_publication(
     db: Any, connection: Any, scan_id: str, draft: dict[str, Any]
 ) -> None:
     publication = draft.get("deepScanPublication")
+    if publication is None and draft["manifest"]["scan"].get("complete") is False:
+        return
     run = db.deep_scan.require_deep_scan_run(connection, scan_id)
     db.deep_scan.require_current_coordinator(
         run,
@@ -1407,10 +1409,24 @@ def _require_current_deep_publication(
     # draft path; adopted coordinators must carry their generation and selection.
     if publication is None:
         return
-    reducer = _latest_successful_reducer(
-        connection.execute(
-            "SELECT * FROM deep_scan_workers WHERE scan_id = ?", (scan_id,)
-        ).fetchall()
+
+    # Match the durable reducer sequence used by coordinator recovery.
+    def reducer_order(worker: Any) -> tuple[int, str]:
+        match = re.search(r"dedup-(\d+)", worker["prompt_path"])
+        return (int(match[1]) if match else 0, worker["id"])
+
+    reducer = max(
+        (
+            worker
+            for worker in connection.execute(
+                "SELECT * FROM deep_scan_workers WHERE scan_id = ?", (scan_id,)
+            )
+            if worker["kind"] == "dedup"
+            and worker["status"] == "succeeded"
+            and worker["result_manifest_path"]
+        ),
+        key=reducer_order,
+        default=None,
     )
     selected_result = reducer["result_manifest_path"] if reducer is not None else None
     if publication["resultPath"] != selected_result:

@@ -10,7 +10,7 @@ from test_deep_scan_successful_publication import add_worker
 from test_deep_scan_successful_publication import publication_scan as publication_scan
 
 
-def stage_publication(scan, *, generation, result_path, title):
+def stage_publication(scan, *, generation, result_path, title, complete=True):
     draft_dir = scan.scan_dir / "drafts"
     draft_dir.mkdir(exist_ok=True)
     draft_path = draft_dir / f"{uuid.uuid4()}.json"
@@ -22,6 +22,8 @@ def stage_publication(scan, *, generation, result_path, title):
         "findings": {"findings": findings},
         "coverage": scan.coverage,
     }
+    if not complete:
+        draft["manifest"]["scan"]["complete"] = False
     if generation is not None:
         draft["deepScanPublication"] = {
             "coordinatorGeneration": generation,
@@ -40,9 +42,18 @@ def stage_publication(scan, *, generation, result_path, title):
     )
 
 
-@pytest.mark.parametrize("stale", ["generation", "aggregate", "unfenced"])
+@pytest.mark.parametrize(
+    ("stale", "complete"),
+    [
+        ("generation", True),
+        ("generation", False),
+        ("aggregate", True),
+        ("aggregate", False),
+        ("unfenced", True),
+    ],
+)
 def test_stale_coordinator_cannot_replace_newer_canonical_publication(
-    workbench_api, workbench_db, publication_scan, stale
+    workbench_api, workbench_db, publication_scan, stale, complete
 ):
     scan = publication_scan()
     old_result = add_worker(workbench_db, scan)
@@ -52,11 +63,16 @@ def test_stale_coordinator_cannot_replace_newer_canonical_publication(
             "UPDATE deep_scan_runs SET coordinator_generation = 3 WHERE scan_id = ?",
             (scan.scan_id,),
         )
-        for result, completed_at in ((old_result, "2026-01-01"), (new_result, "2026-01-02")):
+        for sequence, result in enumerate((old_result, new_result), start=1):
             workbench_db.execute(
-                "UPDATE deep_scan_workers SET kind = 'dedup', merge_state = 'none', completed_at = ? "
+                "UPDATE deep_scan_workers SET kind = 'dedup', merge_state = 'none', "
+                "prompt_path = ?, completed_at = ? "
                 "WHERE result_manifest_path = ?",
-                (completed_at, str(result)),
+                (
+                    str(scan.scan_dir / f"dedup-{sequence:04d}" / "prompt.md"),
+                    f"2026-01-0{sequence}",
+                    str(result),
+                ),
             )
     current = stage_publication(
         scan, generation=3, result_path=new_result, title="Current accepted aggregate"
@@ -72,6 +88,7 @@ def test_stale_coordinator_cannot_replace_newer_canonical_publication(
         generation=None if stale == "unfenced" else 2 if stale == "generation" else 3,
         result_path=old_result if stale == "aggregate" else new_result,
         title="Superseded aggregate",
+        complete=complete,
     )
 
     with pytest.raises(SystemExit, match="coordinator|aggregate"):
