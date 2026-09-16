@@ -83,6 +83,98 @@ const { cleanup, copyCompletedScan, temporaryDirectory } =
   createApiTestFixtures();
 afterEach(cleanup);
 
+test.each([
+  "openrouter",
+  "fireworks",
+  "command-auth",
+  "cloud.production",
+  "cloud production",
+])(
+  "writes isolated runtime worker settings for %s without changing preflight input",
+  async (name) => {
+    const root = await temporaryDirectory();
+    const repository = join(root, "repository");
+    const home = join(root, "home");
+    const configPath = join(root, "config-preflight.toml");
+    await mkdir(repository);
+    await mkdir(home);
+    const provider = name.startsWith("cloud")
+      ? "amazon-bedrock"
+      : name === "command-auth"
+        ? "openrouter"
+        : name;
+    const definition: JsonObject =
+      provider === "amazon-bedrock"
+        ? { aws: { region: "us-west-2", profile: "synthetic" } }
+        : {
+            name: "Synthetic provider",
+            base_url: `https://${provider}.example.test/v1`,
+            wire_api: "responses",
+            ...(name === "command-auth"
+              ? {
+                  auth: {
+                    command: "synthetic-auth-helper",
+                    args: [],
+                    cwd: home,
+                  },
+                }
+              : { env_key: `${provider.toUpperCase()}_API_KEY` }),
+          };
+    const config = {
+      model_provider: name.startsWith("cloud") ? "openai" : provider,
+      model_providers: { [provider]: definition },
+      ...(name.startsWith("cloud")
+        ? { profile: name, profiles: { [name]: { model_provider: provider } } }
+        : {}),
+    };
+    let captured = false;
+    const client = new TestClient(
+      { codexOverrides: config },
+      {
+        environment: {
+          OPENROUTER_API_KEY: "synthetic-router",
+          FIREWORKS_API_KEY: "synthetic-fireworks",
+          CODEX_SECURITY_STATE_DIR: join(root, "state"),
+        },
+        prepareRuntime: async () => ({ ...preparedRuntime(home), configPath }),
+        resolvePluginPython: async () => "/managed/python",
+        createCodex: () => ({
+          startThread: () => ({
+            id: null,
+            async runStreamed() {
+              const runtime = parseToml(
+                await readFile(`${configPath}.workers.toml`, "utf8"),
+              ) as JsonObject;
+              expect(runtime["model_provider"]).toBe(provider);
+              expect(runtime["model_providers"]).toEqual({
+                [provider]: definition,
+              });
+              expect(runtime["profile"]).toBeUndefined();
+              const preflight = parseToml(await readFile(configPath, "utf8"));
+              if (name.startsWith("cloud"))
+                expect(preflight["model_provider"]).toBe("openai");
+              else
+                expect(preflight["model_providers"]).not.toEqual(
+                  runtime["model_providers"],
+                );
+              captured = true;
+              throw new Error("runtime snapshot captured");
+            },
+          }),
+        }),
+      },
+    );
+    try {
+      await expect(
+        client.run(repository, { mode: "deep", outputDir: join(root, "scan") }),
+      ).rejects.toThrow("runtime snapshot captured");
+      expect(captured).toBe(true);
+    } finally {
+      await client.close();
+    }
+  },
+);
+
 test.each(["completed", "receipt-lost", "scan-interrupted", "prompt-files"])(
   "durable scan workflow resumes after %s without rerunning completed work",
   async (scenario) => {

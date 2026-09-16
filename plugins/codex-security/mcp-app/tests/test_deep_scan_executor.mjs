@@ -6,6 +6,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { build } from "esbuild";
+import { parse as parseToml, stringify as stringifyToml } from "smol-toml";
 
 const executorSource = new URL("../src/deep-scan/executor.ts", import.meta.url);
 const bundle = await build({
@@ -77,6 +78,7 @@ try {
   await testWorkerReasoningSummaries();
   await testWorkerProviderSelection();
   await testIsolatedReconstructedWorkers();
+  await testRuntimeProviderSnapshots();
   await testWorkerCancellation();
   await testDisallowedWorkerProfileFailsBeforeWorkerLaunch();
   if (process.platform !== "win32") await testNullUsageCompletion();
@@ -758,7 +760,8 @@ async function testIsolatedReconstructedWorkers() {
         model_reasoning_summary: name === "first" ? "none" : "concise",
         service_tier: name === "first" ? "flex" : "fast"
       };
-      await writeFile(configPath, Object.entries(config).map(([key, value]) => `${key} = ${JSON.stringify(value)}\n`).join(""));
+      await writeFile(configPath, stringifyToml(config));
+      await writeFile(`${configPath}.workers.toml`, stringifyToml(config));
       await writeFile(promptPath, "CAPTURE_SYNTHETIC_OPENAI_AUTH NULL_USAGE\n");
       const executable = path.join(fixture.root, process.platform === "win32" ? "node.exe" : "node");
       if (process.platform === "win32") {
@@ -860,6 +863,89 @@ async function testIsolatedReconstructedWorkers() {
   }
 }
 
+async function testRuntimeProviderSnapshots() {
+  const originalSpawn = childProcess.spawn;
+  const previousMarker = process.env.FAKE_CODEX_MARKER;
+  const scans = [];
+  try {
+    for (const name of ["openrouter", "fireworks", "command-auth", "cloud.production", "cloud production"]) {
+      const fixture = await fakeCodexFixture(deniedWorkerPermissionProfile);
+      const configPath = path.join(fixture.root, "config-preflight.toml");
+      const promptPath = path.join(fixture.root, "prompt.md");
+      const provider = name.startsWith("cloud") ? "amazon-bedrock" : name === "command-auth" ? "openrouter" : name;
+      const definition = provider === "amazon-bedrock"
+        ? { aws: { region: "us-west-2", profile: "synthetic" } }
+        : {
+          name: "Synthetic provider", base_url: `https://${provider}.example.test/v1`, wire_api: "responses",
+          ...(name === "command-auth"
+            ? { auth: { command: "synthetic-auth-helper", args: [], cwd: fixture.root } }
+            : { env_key: `${provider.toUpperCase()}_API_KEY` })
+        };
+      const config = { model: "inherited-model", model_provider: provider, model_providers: { [provider]: definition }, model_reasoning_summary: "concise", service_tier: "flex" };
+      // These preflight projections intentionally differ from the runtime snapshot.
+      const preflight = name.startsWith("cloud")
+        ? { model_provider: "openai", model_reasoning_summary: "concise" }
+        : { model_provider: provider, model_providers: { [provider]: { base_url: "https://default.example.test/v1", env_key: `${provider.toUpperCase()}_API_KEY` } } };
+      await writeFile(configPath, stringifyToml(preflight));
+      await writeFile(`${configPath}.workers.toml`, stringifyToml(config));
+      await writeFile(promptPath, "NULL_USAGE");
+      const codexHome = path.join(fixture.root, "home");
+      await mkdir(codexHome);
+      const settings = {
+        codexOptions: { codexPathOverride: process.execPath, env: { CODEX_HOME: codexHome, CODEX_SECURITY_CONFIG_PATH: configPath, FAKE_CODEX_MARKER: fixture.markerPath } },
+        model: "worker-model", reasoningEffort: "ultra", parentSandbox: trustedParentSandboxWithDenials
+      };
+      scans.push({ name, fixture, configPath, promptPath, config, settings, executor: new CodexSdkWorkerExecutor(settings) });
+    }
+    childProcess.spawn = (command, args, options) => {
+      const scan = scans.find((scan) => options?.env?.FAKE_CODEX_MARKER === scan.fixture.markerPath);
+      return originalSpawn(command, scan ? [scan.fixture.executablePath, ...args] : args, options);
+    };
+    syncBuiltinESMExports();
+    for (const phase of ["fresh", "resume", "reconstructed"]) {
+      if (phase === "reconstructed") {
+        for (const scan of scans) {
+          await writeFile(`${scan.configPath}.workers.toml`, stringifyToml(scan.config));
+          scan.executor = new CodexSdkWorkerExecutor(scan.settings);
+        }
+      }
+      for (const kind of ["discovery", "dedup"]) {
+        const outcomes = await Promise.allSettled(scans.map(async (scan) => {
+          const resumeThreadId = phase === "fresh" ? undefined : "resumed-worker";
+          await scan.executor.run({ kind, promptPath: scan.promptPath, workingDirectory: scan.fixture.root, subagents: 0, resumeThreadId, signal: new AbortController().signal });
+          for (const file of [scan.fixture.markerPath, scan.fixture.preflightMarkerPath]) {
+            const child = JSON.parse(await readFile(file, "utf8"));
+            const overrides = {};
+            for (let i = 0; i < child.argv.length; i++) {
+              if (["-c", "--config"].includes(child.argv[i])) Object.assign(overrides, parseToml(child.argv[++i]));
+            }
+            assert.equal(overrides.model_provider, scan.config.model_provider, `${scan.name} ${phase} ${kind}`);
+            assert.deepEqual(overrides.model_providers, scan.config.model_providers, `${scan.name} ${phase} ${kind}`);
+            assert.equal(overrides.model_reasoning_effort, "ultra");
+            assert.equal(overrides.model_reasoning_summary, "concise");
+            assert.equal(overrides.service_tier, "flex");
+            assert.equal(child.codexHome, scan.settings.codexOptions.env.CODEX_HOME);
+          }
+          const child = JSON.parse(await readFile(scan.fixture.markerPath, "utf8"));
+          assertFlagPair(child.argv, "--model", "worker-model");
+          assertReadOnlyWorkerPolicy(child.argv);
+          assertWorkerSubagentPolicy(child.argv, 0);
+          assert.equal(child.argv.includes("resume"), resumeThreadId !== undefined);
+        }));
+        const failures = outcomes.filter((outcome) => outcome.status === "rejected");
+        if (failures.length) throw new AggregateError(failures.map((outcome) => outcome.reason), "Worker runtime provider controls failed");
+      }
+      if (phase === "fresh") {
+        for (const scan of scans) await writeFile(`${scan.configPath}.workers.toml`, 'model_provider = "changed-after-launch"\n');
+      }
+    }
+  } finally {
+    childProcess.spawn = originalSpawn;
+    syncBuiltinESMExports();
+    restoreEnv("FAKE_CODEX_MARKER", previousMarker);
+  }
+}
+
 async function testWorkerProviderSelection() {
   const fixture = await fakeCodexFixture();
   const saved = Object.fromEntries(
@@ -872,6 +958,7 @@ async function testWorkerProviderSelection() {
     const configPath = path.join(fixture.root, "scan config.toml");
     const promptPath = path.join(fixture.root, "prompt.md");
     await writeFile(configPath, 'model_provider = "fixture-provider"\n');
+    await writeFile(`${configPath}.workers.toml`, 'model_provider = "fixture-provider"\n');
     await writeFile(promptPath, "fixture provider selection");
     process.env.CODEX_CLI_PATH = process.execPath;
     process.env.CODEX_SECURITY_CONFIG_PATH = configPath;
