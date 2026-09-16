@@ -6,7 +6,8 @@
     "moduleResolution": "Bundler",
     "noEmit": true,
     "paths": {
-      "@openai/codex-sdk": ["./node_modules/@openai/codex-sdk"]
+      "@openai/codex-sdk": ["./node_modules/@openai/codex-sdk"],
+      "smol-toml": ["./node_modules/smol-toml/dist/index"]
     },
     "resolveJsonModule": true,
     "skipLibCheck": true,
