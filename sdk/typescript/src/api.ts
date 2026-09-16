@@ -1,9 +1,6 @@
 /// <reference lib="esnext.disposable" preserve="true" />
 
-import {
-  runAcceptedAudit,
-  type ScanDraftInput,
-} from "./accepted-audit.js";
+import { runAcceptedAudit, type ScanDraftInput } from "./accepted-audit.js";
 import { pathToFileURL } from "node:url";
 import { statSync } from "node:fs";
 import {

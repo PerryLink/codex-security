@@ -13,8 +13,7 @@ export type AuditOutcome<Execution> = {
   execution: Execution;
   checkpoint?: ScanDraftInput;
 } & (
-  | { status: "accepted"; accepted: ScanDraftInput }
-  | { status: "checkpoint" }
+  { status: "accepted"; accepted: ScanDraftInput } | { status: "checkpoint" }
 );
 
 /** One attempt; enclosing callers own retries and public completion. */
