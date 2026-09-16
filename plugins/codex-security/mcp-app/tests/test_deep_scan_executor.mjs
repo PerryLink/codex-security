@@ -17,7 +17,7 @@ const bundle = await build({
   },
   stdin: {
     // Test the environment snapshot without adding a production export.
-    contents: `${await readFile(executorSource, "utf8")}\nexport { snapshotWorkerEnvironment };`,
+    contents: `${await readFile(executorSource, "utf8")}\nexport { snapshotWorkerEnvironment, codexWorkerConfig };`,
     loader: "ts",
     resolveDir: path.dirname(fileURLToPath(executorSource)),
     sourcefile: fileURLToPath(executorSource)
@@ -26,7 +26,7 @@ const bundle = await build({
   platform: "node",
   write: false
 });
-const { CodexSdkWorkerExecutor, resolveCodexPath, snapshotWorkerEnvironment } = await import(
+const { CodexSdkWorkerExecutor, resolveCodexPath, snapshotWorkerEnvironment, codexWorkerConfig } = await import(
   `data:text/javascript;base64,${Buffer.from(bundle.outputFiles[0].contents).toString("base64")}`
 );
 const errorsBundle = await build({
@@ -864,15 +864,17 @@ async function testIsolatedReconstructedWorkers() {
 }
 
 async function testRuntimeProviderSnapshots() {
+  const sharedHome = await mkdtemp(path.join(tmpdir(), "shared-worker-home-"));
+  temporaryRoots.push(sharedHome);
   const originalSpawn = childProcess.spawn;
   const previousMarker = process.env.FAKE_CODEX_MARKER;
   const scans = [];
   try {
-    for (const name of ["openrouter", "fireworks", "command-auth", "cloud.production", "cloud production"]) {
+    for (const name of ["openrouter", "fireworks", "command-auth", "cloud.production", "cloud production", "shared-default", "shared-external"]) {
       const fixture = await fakeCodexFixture(deniedWorkerPermissionProfile);
       const configPath = path.join(fixture.root, "config-preflight.toml");
       const promptPath = path.join(fixture.root, "prompt.md");
-      const provider = name.startsWith("cloud") ? "amazon-bedrock" : name === "command-auth" ? "openrouter" : name;
+      const provider = name === "shared-default" ? "openai" : name === "shared-external" ? "openrouter" : name.startsWith("cloud") ? "amazon-bedrock" : name === "command-auth" ? "openrouter" : name;
       const definition = provider === "amazon-bedrock"
         ? { aws: { region: "us-west-2", profile: "synthetic" } }
         : {
@@ -881,21 +883,30 @@ async function testRuntimeProviderSnapshots() {
             ? { auth: { command: "synthetic-auth-helper", args: [], cwd: fixture.root } }
             : { env_key: `${provider.toUpperCase()}_API_KEY` })
         };
-      const config = { model: "inherited-model", model_provider: provider, model_providers: { [provider]: definition }, model_reasoning_summary: "concise", service_tier: "flex" };
+      const auth = name.startsWith("shared-") ? {
+        cli_auth_credentials_store: name === "shared-default" ? "file" : "keyring",
+        forced_login_method: name === "shared-default" ? "chatgpt" : "api",
+        forced_chatgpt_workspace_id: `synthetic-${name}`
+      } : {};
+      const config = { model: "inherited-model", model_provider: provider, ...(name === "shared-default" ? {} : { model_providers: { [provider]: definition } }), model_reasoning_summary: "concise", service_tier: "flex", ...auth };
+      const input = { ...config };
+      if (name === "shared-default") delete input.model_provider;
       // These preflight projections intentionally differ from the runtime snapshot.
       const preflight = name.startsWith("cloud")
         ? { model_provider: "openai", model_reasoning_summary: "concise" }
         : { model_provider: provider, model_providers: { [provider]: { base_url: "https://default.example.test/v1", env_key: `${provider.toUpperCase()}_API_KEY` } } };
       await writeFile(configPath, stringifyToml(preflight));
-      await writeFile(`${configPath}.workers.toml`, stringifyToml(config));
+      await writeFile(`${configPath}.workers.toml`, stringifyToml(codexWorkerConfig(input)));
       await writeFile(promptPath, "NULL_USAGE");
-      const codexHome = path.join(fixture.root, "home");
-      await mkdir(codexHome);
+      const codexHome = name.startsWith("shared-") ? sharedHome : path.join(fixture.root, "home");
+      await mkdir(codexHome, { recursive: true });
+      // Simulate a later session replacing the shared home configuration.
+      await writeFile(path.join(codexHome, "config.toml"), stringifyToml(config));
       const settings = {
         codexOptions: { codexPathOverride: process.execPath, env: { CODEX_HOME: codexHome, CODEX_SECURITY_CONFIG_PATH: configPath, FAKE_CODEX_MARKER: fixture.markerPath } },
         model: "worker-model", reasoningEffort: "ultra", parentSandbox: trustedParentSandboxWithDenials
       };
-      scans.push({ name, fixture, configPath, promptPath, config, settings, executor: new CodexSdkWorkerExecutor(settings) });
+      scans.push({ name, fixture, configPath, promptPath, config, input, auth, settings, executor: new CodexSdkWorkerExecutor(settings) });
     }
     childProcess.spawn = (command, args, options) => {
       const scan = scans.find((scan) => options?.env?.FAKE_CODEX_MARKER === scan.fixture.markerPath);
@@ -905,7 +916,7 @@ async function testRuntimeProviderSnapshots() {
     for (const phase of ["fresh", "resume", "reconstructed"]) {
       if (phase === "reconstructed") {
         for (const scan of scans) {
-          await writeFile(`${scan.configPath}.workers.toml`, stringifyToml(scan.config));
+          await writeFile(`${scan.configPath}.workers.toml`, stringifyToml(codexWorkerConfig(scan.input)));
           scan.executor = new CodexSdkWorkerExecutor(scan.settings);
         }
       }
@@ -921,6 +932,9 @@ async function testRuntimeProviderSnapshots() {
             }
             assert.equal(overrides.model_provider, scan.config.model_provider, `${scan.name} ${phase} ${kind}`);
             assert.deepEqual(overrides.model_providers, scan.config.model_providers, `${scan.name} ${phase} ${kind}`);
+            for (const [key, value] of Object.entries(scan.auth)) {
+              assert.equal(overrides[key], value, `${scan.name} ${phase} ${kind} ${key}`);
+            }
             assert.equal(overrides.model_reasoning_effort, "ultra");
             assert.equal(overrides.model_reasoning_summary, "concise");
             assert.equal(overrides.service_tier, "flex");
@@ -1063,6 +1077,10 @@ async function testWorkerReasoningSummaries() {
           assert.equal(invocation.argv.includes('model_reasoning_effort="xhigh"'), true);
           assert.equal(invocation.configPath, configPath);
           assert.equal(invocation.deepConfigPath, process.env.CODEX_SECURITY_DEEP_SCAN_CONFIG_PATH);
+          for (const file of [fixture.markerPath, fixture.preflightMarkerPath]) {
+            const child = JSON.parse(await readFile(file, "utf8"));
+            assert.equal(child.argv.some((arg) => arg.startsWith("model_provider=")), false);
+          }
           assertReadOnlyWorkerPolicy(invocation.argv);
           assertWorkerSubagentPolicy(invocation.argv, 0);
           await writeFile(configPath, 'model_reasoning_summary = "detailed"\n');

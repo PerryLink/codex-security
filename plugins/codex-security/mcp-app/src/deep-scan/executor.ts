@@ -99,7 +99,8 @@ export class CodexSdkWorkerExecutor implements CodexWorkerExecutor {
         profileId: DEEP_SCAN_WORKER_PERMISSION_PROFILE_ID,
         configOverrides: [
           ...Object.entries(codexWorkerConfig(modelConfig as JsonObject))
-            .filter(([key]) => key !== "model_providers")
+            // Older SDK/direct-plugin workers keep their home-selected provider.
+            .filter(([key]) => key !== "model_providers" && modelConfig[key] !== undefined)
             .map(([key, value]) => `${key}=${inlineToml(value)}`),
           ...configOverrides,
           ...(resolved?.baseUrl ? [`openai_base_url=${tomlString(resolved.baseUrl)}`] : [])
