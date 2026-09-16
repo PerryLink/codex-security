@@ -1209,6 +1209,8 @@ def merge_saved_results(
                     used.add(item["id"])
                 continue
             item.setdefault("id", item.get("candidateId") or f"saved-{_digest(item)[:16]}")
+            if not isinstance(item["id"], str):
+                continue
             if item["id"] in used:
                 item["id"] = f"{item['id']}-{_digest(item)[:16]}"
             used.add(item["id"])
