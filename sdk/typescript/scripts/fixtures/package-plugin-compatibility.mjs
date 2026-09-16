@@ -78,6 +78,11 @@ const client = new CodexSecurity(
                     manifest.scan.producer.version = metadata.version;
                     delete manifest.scan.sealedAt;
                     delete manifest.scan.artifacts;
+                    manifest.scan.scope.context = " ";
+                    manifest.scan.threatModel = {
+                      summary: "Archive input",
+                      assumptions: [" "],
+                    };
                     manifest.scan.target = {
                       kind: env.CODEX_SECURITY_TARGET_KIND,
                       targetId: env.CODEX_SECURITY_TARGET_ID,
@@ -92,12 +97,16 @@ const client = new CodexSecurity(
                         delete finding.findingId;
                         delete finding.occurrenceId;
                         delete finding.fingerprints;
+                        finding.locations[0].path = "src/./extract.py";
+                        finding.locations[0].role = " ";
                       }
                       if (name === "coverage.json") {
                         document.surfaces = ["HTTP API", "ArchiveSurface"].map(
                           (id) => ({
                             ...document.surfaces[0],
                             id,
+                            notes: " ",
+                            riskArea: " ",
                           }),
                         );
                       }
@@ -149,6 +158,15 @@ try {
   );
   assert.equal(turns.length, 2);
   assert.equal(result.findings.findings.length, 1);
+  assert.equal(
+    result.findings.findings[0].locations[0].path,
+    "src/./extract.py",
+  );
+  assert.equal(result.findings.findings[0].locations[0].role, " ");
+  assert.equal(result.coverage.surfaces[0].notes, " ");
+  assert.equal(result.coverage.surfaces[0].riskArea, " ");
+  assert.equal(result.manifest.scan.scope.context, " ");
+  assert.deepEqual(result.manifest.scan.threatModel.assumptions, [" "]);
   const saved = await runWorkbench(
     {
       python: scanEnvironment.PYTHON,

@@ -146,7 +146,14 @@ for (const scenario of cases) {
       ],
       coverage: {
         completeness: scenario.coverage,
-        surfaces: [{ label: "Archive extraction", disposition: "reported" }],
+        surfaces: [
+          {
+            id: "archive-extraction",
+            label: "Archive extraction",
+            disposition: "reported",
+            receiptRefs: [],
+          },
+        ],
         explicitExclusions: [],
         deferred:
           scenario.coverage === "complete"
@@ -341,6 +348,95 @@ test.each(["HTTP API", "ArchiveSurface", "", 17])(
       const live = structuredClone(draft);
       for (const surface of live.coverage.surfaces) surface.id = "http-api";
       expect(() => parseScanDraft({ ...live, scanId })).not.toThrow();
+    } else {
+      expect(() => parseCanonicalScanDraft(canonical)).toThrow();
+      expect(standard.error).toBeInstanceOf(Error);
+      expect(standard.error).not.toBe(standard.finalization);
+      expect(standard.finalizations).toBe(0);
+    }
+  },
+);
+
+test.each([
+  { path: "src/./extract.py", notes: " ", accepted: true },
+  { path: "src//extract.py", notes: " ", accepted: true },
+  { path: "src/extract.py/", notes: " ", accepted: true },
+  { path: "../extract.py", notes: "Checked", accepted: false },
+  { path: "/src/extract.py", notes: "Checked", accepted: false },
+  { path: "C:/extract.py", notes: "Checked", accepted: false },
+  { path: "src\\extract.py", notes: "Checked", accepted: false },
+  { path: "src/\u0000extract.py", notes: "Checked", accepted: false },
+  { path: "src/\ud800extract.py", notes: "Checked", accepted: false },
+  { path: ".", notes: "Checked", accepted: false },
+  { path: "src/extract.py", notes: "", accepted: false },
+  { path: "src/extract.py", notes: 17, accepted: false },
+])(
+  "canonical fields retain their rules: %j",
+  async ({ path, notes, accepted }) => {
+    const root = await temporaryDirectory();
+    const repository = join(root, "repository");
+    await mkdir(repository);
+    const scanDir = await copyCompletedScan(root);
+    const [manifest, findings, coverage] = await Promise.all(
+      ["scan-manifest.json", "findings.json", "coverage.json"].map(
+        async (name) => JSON.parse(await readFile(join(scanDir, name), "utf8")),
+      ),
+    );
+    manifest.scan.scope.context = " ";
+    manifest.scan.threatModel = {
+      summary: "Archive input",
+      assumptions: [" "],
+    };
+    const finding = findings.findings[0];
+    finding.locations[0].path = path;
+    finding.locations[0].role = " ";
+    finding.severity.vector = " ";
+    finding.codeEvidence = [
+      {
+        id: "archive-write",
+        label: "Filesystem write",
+        path,
+        startLine: 41,
+        code: "write(entry)",
+        explanation: "Archive entry reaches a write.",
+      },
+    ];
+    coverage.surfaces[0].notes = notes;
+    coverage.surfaces[0].riskArea = " ";
+    await Promise.all([
+      writeFile(join(scanDir, "scan-manifest.json"), JSON.stringify(manifest)),
+      writeFile(join(scanDir, "findings.json"), JSON.stringify(findings)),
+      writeFile(join(scanDir, "coverage.json"), JSON.stringify(coverage)),
+    ]);
+    const canonical = {
+      scanId: manifest.scan.id,
+      manifest,
+      findings,
+      coverage,
+    };
+    const standard = await observeStandardAdmission(repository, scanDir);
+    if (accepted) {
+      const draft = parseCanonicalScanDraft(canonical);
+      expect(draft.findings[0].locations[0].path).toBe(path);
+      expect(draft.coverage.surfaces[0].notes).toBe(notes);
+      expect(draft.scope.context).toBe(" ");
+      expect(draft.threatModel.assumptions).toEqual([" "]);
+      expect(standard.error).toBe(standard.finalization);
+      expect(standard.finalizations).toBe(1);
+      expect(() => parseScanDraft({ ...draft, scanId })).toThrow();
+      const live = structuredClone(draft);
+      delete live.scope.context;
+      delete live.threatModel;
+      delete live.findings[0].severity.vector;
+      live.findings[0].locations[0] = { path: "src/extract.py", startLine: 41 };
+      live.findings[0].codeEvidence[0].path = "src/extract.py";
+      live.coverage.surfaces[0].notes = "Checked";
+      delete live.coverage.surfaces[0].riskArea;
+      expect(() => parseScanDraft({ ...live, scanId })).not.toThrow();
+      const unsafeEvidence = structuredClone(canonical);
+      unsafeEvidence.findings.findings[0].codeEvidence[0].path =
+        "../outside.py";
+      expect(() => parseCanonicalScanDraft(unsafeEvidence)).toThrow();
     } else {
       expect(() => parseCanonicalScanDraft(canonical)).toThrow();
       expect(standard.error).toBeInstanceOf(Error);

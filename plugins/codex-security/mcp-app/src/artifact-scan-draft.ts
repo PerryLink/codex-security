@@ -6,6 +6,8 @@ import commonSchema from "../../schemas/definitions/artifact-common.schema.json"
 import scanDraftDocument from "../../schemas/tools/scan-draft.schema.json";
 import scanManifestDocument from "../../schemas/scan-manifest.schema.json";
 import coverageDocument from "../../schemas/coverage.schema.json";
+import findingsDocument from "../../schemas/findings.schema.json";
+import { safeRelativePath } from "../../../../sdk/typescript/src/contract-path.js";
 import type { ArtifactContext } from "./artifact-context.js";
 import type { RunArtifactWorkbench } from "./artifact-context.js";
 import {
@@ -64,19 +66,25 @@ export const scanDraftInputSchema = loadArtifactZodSchema(
   "scanDraftInput",
 ) as z.ZodType<ScanDraftInput>;
 
-// Canonical documents retain their public IDs; live drafts use UUIDs and slugs.
+// Keep draft completion/host-field handling, using canonical persisted field rules.
 const canonicalScanDraftInputSchema = loadArtifactZodSchema(
   [commonSchema, {
     ...scanDraftDocument,
     $defs: {
       ...scanDraftDocument.$defs,
       scanId: scanManifestDocument.properties.scan.properties.id,
-      surface: {
-        ...scanDraftDocument.$defs.surface,
-        properties: {
-          ...scanDraftDocument.$defs.surface.properties,
-          id: coverageDocument.properties.surfaces.items.properties.id,
-        },
+      scope: {
+        ...scanDraftDocument.$defs.scope,
+        properties: scanManifestDocument.properties.scan.properties.scope.properties,
+      },
+      threatModel: scanManifestDocument.properties.scan.properties.threatModel,
+      finding: {
+        ...scanDraftDocument.$defs.finding,
+        properties: findingsDocument.properties.findings.items.properties,
+      },
+      coverage: {
+        ...scanDraftDocument.$defs.coverage,
+        properties: coverageDocument.properties,
       },
     },
   }] as SchemaDocument[],
@@ -965,7 +973,7 @@ export async function getCodexSecurityCompletedScan(
   return { scanId: parsed.scanId, manifest, findings, coverage };
 }
 
-/** Project canonical documents through the same semantic parser as worker drafts. */
+/** Admit canonical fields while retaining shared audit semantics and path safety. */
 export function parseCanonicalScanDraft(input: {
   scanId?: string;
   manifest: JsonObject;
@@ -978,7 +986,7 @@ export function parseCanonicalScanDraft(input: {
       throw new Error("scan draft: canonical documents belong to a different scan.");
     }
   }
-  return parsePersistedCheckpoint({
+  const parsed = parsePersistedCheckpoint({
     scanId: input.scanId,
     ...(scan.complete === undefined ? {} : { complete: scan.complete }),
     ...(scan.scope === undefined ? {} : { scope: scan.scope }),
@@ -986,6 +994,14 @@ export function parseCanonicalScanDraft(input: {
     findings: input.findings.findings,
     coverage: input.coverage,
   }, canonicalScanDraftInputSchema);
+  for (const [index, finding] of parsed.findings.entries()) {
+    for (const field of ["locations", "codeEvidence"] as const) {
+      for (const [locationIndex, location] of ((finding[field] as JsonObject[] | undefined) ?? []).entries()) {
+        safeRelativePath(location.path as string, `findings[${index}].${field}[${locationIndex}].path`);
+      }
+    }
+  }
+  return parsed;
 }
 
 export function parseScanDraft(input: ScanDraftInput): ScanDraftInput {
