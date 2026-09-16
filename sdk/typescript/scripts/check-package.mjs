@@ -183,6 +183,7 @@ const distFiles = new Set(
     "config",
     "config-path",
     "contract",
+    "contract-path",
     "cost",
     "cost-model",
     "custom-validation",
