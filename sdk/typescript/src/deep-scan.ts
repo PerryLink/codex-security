@@ -72,6 +72,7 @@ export interface DeepScanComposition {
   workbench(args: readonly string[], input?: string): Promise<JsonObject>;
   merge(prompt: string, signal: AbortSignal): Promise<unknown>;
   onRetry?(message: string): void;
+  onCleanupError?(error: unknown): void;
   writer: ScanArtifactRestorer;
   publish(draft: SemanticScan): Promise<void>;
   onCost(key: string, cost: Readonly<ScanCost> | null): void;
@@ -293,7 +294,11 @@ export async function runDeepScans(
         );
         break;
       } catch (error) {
-        if (executionSignal.aborted || error instanceof ScanPermissionError)
+        if (
+          executionSignal.aborted ||
+          error instanceof ScanPermissionError ||
+          isCodexCybersecurityPolicyRefusal(error)
+        )
           throw error;
         state.mergeFailures = (state.mergeFailures ?? 0) + 1;
         await save();
@@ -363,7 +368,8 @@ export async function runDeepScans(
         } catch (error) {
           if (
             error instanceof ScanCostTrackingError ||
-            error instanceof ScanPermissionError
+            error instanceof ScanPermissionError ||
+            isCodexCybersecurityPolicyRefusal(error)
           )
             externalStop.abort(error);
           if (discoverySignal.aborted) throw error;
@@ -410,7 +416,11 @@ export async function runDeepScans(
       }
       throw error;
     } finally {
-      await client.close();
+      try {
+        await client.close();
+      } catch (error) {
+        input.onCleanupError?.(error);
+      }
     }
   };
   try {
@@ -492,7 +502,8 @@ export async function runDeepScans(
         : executionSignal.aborted &&
             executionSignal.reason !== consecutiveErrorLimit &&
             !(executionSignal.reason instanceof ScanCostTrackingError) &&
-            !(executionSignal.reason instanceof ScanPermissionError)
+            !(executionSignal.reason instanceof ScanPermissionError) &&
+            !isCodexCybersecurityPolicyRefusal(executionSignal.reason)
           ? "canceled"
           : "failed";
     if (state.aggregate !== null) {
@@ -521,4 +532,21 @@ export async function runDeepScans(
     if (deadlineTimer !== undefined) clearTimeout(deadlineTimer);
     clearInterval(cancellationTimer);
   }
+}
+
+function isCodexCybersecurityPolicyRefusal(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  if (
+    /\b(?:429|rate[ _-]*limit(?:ed|ing)?|too many requests)\b/iu.test(message)
+  )
+    return false;
+  return [
+    /\bflagged for possible cybersecurity risk\b/iu,
+    /\bflagged for potentially high-risk cyber activity\b/iu,
+    /\bcyber[_\s-]?policy\b/iu,
+    /\b(?:cybersecurity|cyber)[ _-]*policy[ _-]*(?:violation|refusal|refused)\b/iu,
+    /\b(?:content|safety)[ _-]*policy[ _-]*(?:violation|refusal|refused)\b/iu,
+    /\b(?:refusal|refused)\b[^\n]*\b(?:cybersecurity|cyber|safety policy)\b/iu,
+    /\b(?:cybersecurity|cyber|safety policy)\b[^\n]*\b(?:refusal|refused)\b/iu,
+  ].some((pattern) => pattern.test(message));
 }

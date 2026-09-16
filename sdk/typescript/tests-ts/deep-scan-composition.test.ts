@@ -319,6 +319,8 @@ describe("ordinary scan composition", () => {
     [2, 1, "merge"],
     [3, 0, "merge"],
     [2, 1, "permission"],
+    [2, 1, "refusal"],
+    [0, 1, "rate limit"],
     [1, 0, "discovery"],
     [1, 0, "failed discovery"],
     [0, 0, "cost"],
@@ -327,6 +329,7 @@ describe("ordinary scan composition", () => {
     async (priorFailures, failures, kind) => {
       const h = await harness({ stopAfterNoNew: 1, maxDiscoveryRuns: 1 });
       const permissionFailure = kind === "permission";
+      const fatalMergeFailure = permissionFailure || kind === "refusal";
       const discoveryLimit =
         kind === "discovery" || kind === "failed discovery";
       const consecutiveErrors = discoveryLimit ? 3 : 2;
@@ -361,7 +364,13 @@ describe("ordinary scan composition", () => {
       const merge = h.input.merge;
       const failure = permissionFailure
         ? new ScanPermissionError("Merge permissions rejected.")
-        : new Error("Merge failed.");
+        : new Error(
+            kind === "refusal"
+              ? "Request blocked by cyberPolicy."
+              : kind === "rate limit"
+                ? "429: request blocked by cyberPolicy."
+                : "Merge failed.",
+          );
       let attempts = 0;
       h.input.merge = async (...args) => {
         if (++attempts <= failures) throw failure;
@@ -380,25 +389,28 @@ describe("ordinary scan composition", () => {
       }
       if (
         discoveryLimit ||
-        permissionFailure ||
+        fatalMergeFailure ||
         priorFailures + failures >= 3
       ) {
-        await expect(runDeepScans(h.input)).rejects.toThrow(
-          discoveryLimit
-            ? "consecutive error limit"
-            : priorFailures === 3
-              ? "consecutive merge error limit"
-              : failure.message,
-        );
+        const execution = runDeepScans(h.input);
+        if (fatalMergeFailure) await expect(execution).rejects.toBe(failure);
+        else
+          await expect(execution).rejects.toThrow(
+            discoveryLimit
+              ? "consecutive error limit"
+              : priorFailures === 3
+                ? "consecutive merge error limit"
+                : failure.message,
+          );
         expect(attempts).toBe(
-          discoveryLimit ? 0 : permissionFailure ? 1 : 3 - priorFailures,
+          discoveryLimit ? 0 : fatalMergeFailure ? 1 : 3 - priorFailures,
         );
         expect(h.calls).toEqual([]);
         expect(h.published).toEqual([]);
         expect(await h.checkpoint()).toMatchObject({
           consecutiveErrors,
           mergeFailures:
-            discoveryLimit || permissionFailure ? priorFailures : 3,
+            discoveryLimit || fatalMergeFailure ? priorFailures : 3,
           noNewStreak: 0,
           mergedScanIds: [],
           terminalReason: "failed",
@@ -565,26 +577,33 @@ describe("ordinary scan composition", () => {
     expect(h.calls).toEqual([]);
   });
 
-  test("retries the same ordinary scan without counting another logical input", async () => {
-    retryDelay = spyOn(timers, "setTimeout").mockImplementation(
-      async <T>(_delay?: number, value?: T): Promise<T> => value as T,
-    );
-    const h = await harness({ stopAfterNoNew: 1 });
-    let attempts = 0;
-    h.setRun(async (options) => {
-      if (++attempts === 1) throw new Error("Transient scan interruption");
-      return result(options.resumeScanId!, options.outputDir!);
-    });
-    await runDeepScans(h.input);
-    const state = await h.checkpoint();
-    expect(h.calls).toHaveLength(2);
-    expect(h.calls[0]!.outputDir).toBe(h.calls[1]!.outputDir);
-    expect(h.calls[1]!.resumeScanId).toBe(state.passes[0]!.scanId);
-    expect(state.passes).toHaveLength(1);
-    expect(state.noNewStreak).toBe(1);
-    expect(state.mergedScanIds).toHaveLength(1);
-    expect(h.mergeInputs).toEqual([1]);
-  });
+  test.each([
+    "Transient scan interruption",
+    "429: request flagged for possible cybersecurity risk.",
+    "Rate-limited: request refused under safety policy.",
+  ])(
+    "retries the same ordinary scan after %s without counting another logical input",
+    async (message) => {
+      retryDelay = spyOn(timers, "setTimeout").mockImplementation(
+        async <T>(_delay?: number, value?: T): Promise<T> => value as T,
+      );
+      const h = await harness({ stopAfterNoNew: 1 });
+      let attempts = 0;
+      h.setRun(async (options) => {
+        if (++attempts === 1) throw new Error(message);
+        return result(options.resumeScanId!, options.outputDir!);
+      });
+      await runDeepScans(h.input);
+      const state = await h.checkpoint();
+      expect(h.calls).toHaveLength(2);
+      expect(h.calls[0]!.outputDir).toBe(h.calls[1]!.outputDir);
+      expect(h.calls[1]!.resumeScanId).toBe(state.passes[0]!.scanId);
+      expect(state.passes).toHaveLength(1);
+      expect(state.noNewStreak).toBe(1);
+      expect(state.mergedScanIds).toHaveLength(1);
+      expect(h.mergeInputs).toEqual([1]);
+    },
+  );
 
   test.each([
     ["short", "Discovery failed."],
@@ -760,6 +779,13 @@ describe("ordinary scan composition", () => {
     "metering",
     "permission before registration",
     "permission after registration",
+    "This content was flagged for possible cybersecurity risk.",
+    "This content was flagged for potentially high-risk cyber activity.",
+    "Request blocked by cyberPolicy.",
+    "Request blocked by a cybersecurity_policy_violation.",
+    "Request blocked by a safety policy violation.",
+    "Request refused under cybersecurity policy.",
+    "Cybersecurity policy has refused the request.",
   ])(
     "required child %s failure stops sibling discovery without retries or merging",
     async (kind) => {
@@ -772,13 +798,18 @@ describe("ordinary scan composition", () => {
               "Required usage unavailable.",
               h.input.scanDir,
             )
-          : new ScanPermissionError("Read-only permissions rejected.");
+          : kind.startsWith("permission")
+            ? new ScanPermissionError("Read-only permissions rejected.")
+            : new Error(kind);
       let secondStarted!: () => void;
       const started = new Promise<void>((resolve) => {
         secondStarted = resolve;
       });
       const retries: string[] = [];
-      h.input.onRetry = (message) => retries.push(message);
+      h.input.onRetry = (message) => {
+        retries.push(message);
+        h.controller.abort(new Error("A fatal child failure was retried."));
+      };
       if (beforeRegistration) {
         const createClient = h.input.createClient;
         h.input.createClient = () => {
@@ -825,6 +856,48 @@ describe("ordinary scan composition", () => {
         mergedScanIds: [],
       });
       if (beforeRegistration) expect(state.passes[0]!.scanId).toBeUndefined();
+    },
+  );
+
+  test.each(["accepted", "fatal"])(
+    "preserves the %s child outcome when cleanup fails",
+    async (outcome) => {
+      const h = await harness({ stopAfterNoNew: 1 });
+      const cleanupFailure = Object.assign(new Error("Cleanup denied."), {
+        code: "EPERM",
+      });
+      const cleanupErrors: unknown[] = [];
+      h.input.onCleanupError = (error) => cleanupErrors.push(error);
+      const createClient = h.input.createClient;
+      h.input.createClient = () => {
+        const client = createClient();
+        return {
+          ...client,
+          async close() {
+            await client.close();
+            throw cleanupFailure;
+          },
+        };
+      };
+      if (outcome === "fatal") {
+        const failure = new ScanPermissionError(
+          "Read-only permissions rejected.",
+        );
+        h.setRun(async () => {
+          throw failure;
+        });
+        await expect(runDeepScans(h.input)).rejects.toBe(failure);
+        expect(h.mergeInputs).toEqual([]);
+        expect((await h.checkpoint()).terminalReason).toBe("failed");
+      } else {
+        const state = await runDeepScans(h.input);
+        expect(state.terminalReason).toBe("saturated");
+        expect(state.mergedScanIds).toHaveLength(1);
+        expect(h.published.at(-1)).toEqual(state.aggregate!);
+      }
+      expect(h.calls).toHaveLength(1);
+      expect(h.metrics().closed).toBe(1);
+      expect(cleanupErrors).toEqual([cleanupFailure]);
     },
   );
 

@@ -75,6 +75,8 @@ def create_scan_directory(directory: Path) -> None:
     current = directory
     while not current.exists():
         missing.append(current)
+        if current == current.parent:
+            break
         current = current.parent
     for path in reversed(missing):
         path.mkdir(mode=0o700, exist_ok=True)

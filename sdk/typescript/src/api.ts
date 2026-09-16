@@ -1404,7 +1404,7 @@ export class CodexSecurity {
       requireModelSafeOutputDir(scanDir);
       releaseExecution = await (
         this.#dependencies.acquireScanExecution ?? acquireScanExecution
-      )(stateDirectory, scanDir, runtime.plugin.pluginRoot);
+      )(stateDirectory, scanDir, await bundledPluginRoot());
       notifyObserver(
         "onOutputDirReady",
         options.onOutputDirReady,
@@ -2469,6 +2469,8 @@ export class CodexSecurity {
                     options.onObserverError,
                     message,
                   ),
+                onCleanupError: (error) =>
+                  warnCleanupFailed(options, error, "Deep Scan pass"),
                 merge: async (mergePrompt, mergeSignal) => {
                   const turn = await readCodexTurn({
                     thread,
