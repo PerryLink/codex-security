@@ -20,6 +20,7 @@ import { runWorkbench, type WorkbenchCommandOptions } from "../src/runtime.js";
 import { prepareSemanticScanDraft } from "../src/scan-semantics.js";
 import { DEEP_SCAN_CHECKPOINT } from "../src/deep-scan.js";
 import { ScanTransportClosedError } from "../src/scan-execution.js";
+import type { ScanProgress } from "../src/worker-progress.js";
 
 const pluginRoot = fileURLToPath(
   new URL("../../../plugins/codex-security/", import.meta.url),
@@ -60,9 +61,10 @@ test.each([
     const codexHome = join(root, "codex");
     let scanDir = join(root, "scan");
     await Promise.all([mkdir(repo), mkdir(codexHome)]);
-    await writeFile(
-      join(repo, "app.py"),
-      "print('public synthetic fixture')\n",
+    await Promise.all(
+      ["app.py", "routes.py", "models.py", "helpers.py"].map((name) =>
+        writeFile(join(repo, name), "print('public synthetic fixture')\n"),
+      ),
     );
     const version = JSON.parse(
       await readFile(join(pluginRoot, ".codex-plugin/plugin.json"), "utf8"),
@@ -135,6 +137,8 @@ run_workbench(state, 'set-finding-triage', '--occurrence-id', completed['finding
     let sealedArtifacts: Map<string, Buffer<ArrayBuffer>> | undefined;
     const registrations = new Map<string, JsonObject>();
     let childTurns = 0;
+    const progressRuns: ScanProgress[][] = [];
+    let progress: ScanProgress[];
     const workbenches = new Map<string, WorkbenchCommandOptions>();
     const commands: Array<{ command: string; id: string | undefined }> = [];
     const turns: Array<{
@@ -252,6 +256,28 @@ run_workbench(state, 'set-finding-triage', '--occurrence-id', completed['finding
                 async runStreamed(prompt: string) {
                   const record = registrations.get(id)!;
                   const mode = record["mode"] as string;
+                  if (
+                    mode === "deep" &&
+                    prompt !== "Post-scan instructions once."
+                  ) {
+                    const mergePath = join(
+                      record["scanDir"] as string,
+                      "artifacts/deep-scan/merge-inputs.json",
+                    );
+                    expect(
+                      JSON.parse(prompt.slice(prompt.lastIndexOf("\n") + 1)),
+                    ).toBe(mergePath);
+                    const payload = JSON.parse(
+                      await readFile(mergePath, "utf8"),
+                    );
+                    expect(payload.scans.length).toBeGreaterThan(0);
+                    for (const scan of payload.scans) {
+                      expect(registrations.get(scan.childScanId)).toMatchObject(
+                        { mode: "standard" },
+                      );
+                      expect(scan).toMatchObject({ scanId: id, findings: [] });
+                    }
+                  }
                   turns.push({
                     id,
                     mode,
@@ -311,6 +337,43 @@ run_workbench(state, 'set-finding-triage', '--occurrence-id', completed['finding
                         );
                         controller.abort(error);
                         throw error;
+                      }
+                      const reviewed = directory.endsWith("pass-1") ? 2 : 3;
+                      for (const [phase, filesCompleted] of [
+                        ["discovery", 0],
+                        ["discovery", reviewed],
+                        ["reporting", reviewed],
+                      ] as const) {
+                        const before = progress.at(-1)!.filesCompleted;
+                        yield {
+                          type: "item.completed",
+                          item: {
+                            id: `${id}-${phase}-${filesCompleted}`,
+                            type: "agent_message",
+                            text:
+                              "CODEX_SECURITY_SCAN_PROGRESS " +
+                              JSON.stringify({
+                                phase,
+                                filesCompleted,
+                                filesTotal: 4,
+                              }),
+                          },
+                        };
+                        await new Promise<void>((resolve) =>
+                          setImmediate(resolve),
+                        );
+                        expect(progress.at(-1)).toMatchObject({
+                          phase: "discovery",
+                          filesTotal: 4,
+                        });
+                        expect(
+                          progress.at(-1)!.filesCompleted,
+                        ).toBeGreaterThanOrEqual(
+                          Math.max(before, filesCompleted),
+                        );
+                        expect(
+                          progress.at(-1)!.filesCompleted,
+                        ).toBeLessThanOrEqual(3);
                       }
                       const draft = {
                         scanId: id,
@@ -410,16 +473,20 @@ run_workbench(state, 'set-finding-triage', '--occurrence-id', completed['finding
         scanPrompt: "Inspect the synthetic source.",
         ...(budget ? { maxCostUsd: 0.001 } : {}),
         postScanPrompt: "Post-scan instructions once.",
+        onProgress: (update) => progress.push(update),
         onWarning: (message) => console.error(message),
       };
-      const run = () =>
-        client.run(repo, {
+      const run = () => {
+        progress = [];
+        progressRuns.push(progress);
+        return client.run(repo, {
           ...scanOptions,
           signal: AbortSignal.any([
             controller.signal,
             AbortSignal.timeout(20000),
           ]),
         });
+      };
       if (native === "discovery" || native === "sealed") {
         await expect(run()).rejects.toBeInstanceOf(ScanTransportClosedError);
         const saved = await runWorkbench(commandOptions, [
@@ -466,6 +533,17 @@ run_workbench(state, 'set-finding-triage', '--occurrence-id', completed['finding
         client = makeClient();
       }
       const result = await run();
+      for (const updates of progressRuns) {
+        const counts = updates.map((update) => update.filesCompleted);
+        expect(counts).toEqual([...counts].sort((left, right) => left - right));
+        expect(updates.every((update) => update.filesTotal === 4)).toBe(true);
+        expect(Math.max(...counts)).toBeLessThanOrEqual(3);
+      }
+      expect(progressRuns.flat()).toContainEqual({
+        phase: "discovery",
+        filesCompleted: 3,
+        filesTotal: 4,
+      });
       if (savedExecutionThread)
         expect(result.threadId).toBe(savedExecutionThread);
       if (sealedArtifacts) {

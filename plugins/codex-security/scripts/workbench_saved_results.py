@@ -1758,6 +1758,8 @@ def save_scan_artifact(db: Any, connection: Any, args: Any) -> dict[str, Any]:
         ):
             raise SystemExit("Use the typed scan tools for canonical artifacts and checkpoints.")
         write_scan_local_bytes(scan_dir, output, sys.stdin.buffer.read())
+        if scan["mode"] == "deep" and output == COMPOSITION_CHECKPOINT:
+            advance_scan_phase(db, connection, scan_id, "discovery")
     return {"scanId": scan_id, "path": str(scan_dir / output)}
 
 
@@ -1836,26 +1838,30 @@ def write_scan_draft(db: Any, connection: Any, args: Any) -> dict[str, Any]:
         # even when the parent omitted its explicit progress call.
         if scan["mode"] == "standard":
             phase = "discovery" if manifest["scan"].get("complete") is False else "reporting"
-            earlier = PHASES[: PHASES.index(phase)]
-            placeholders = ",".join("?" for _ in earlier)
-            timestamp = db.now()
-            try:
-                with connection:
-                    changed = connection.execute(
-                        "UPDATE scans SET phase = ?, updated_at = ? "
-                        f"WHERE id = ? AND status = 'running' AND phase IN ({placeholders})",
-                        (phase, timestamp, scan_id, *earlier),
-                    )
-                    if changed.rowcount:
-                        connection.execute(
-                            "UPDATE scan_progress SET phase_items_total = 0, "
-                            "phase_items_completed = 0, phase_progress_unit = NULL, updated_at = ? "
-                            "WHERE scan_id = ?",
-                            (timestamp, scan_id),
-                        )
-            except sqlite3.Error as exc:
-                print(f"Could not save scan progress: {exc}", file=sys.stderr)
+            advance_scan_phase(db, connection, scan_id, phase)
     return {"scanId": scan_id, "status": "draft_written"}
+
+
+def advance_scan_phase(db: Any, connection: Any, scan_id: str, phase: str) -> None:
+    earlier = PHASES[: PHASES.index(phase)]
+    placeholders = ",".join("?" for _ in earlier)
+    timestamp = db.now()
+    try:
+        with connection:
+            changed = connection.execute(
+                "UPDATE scans SET phase = ?, updated_at = ? "
+                f"WHERE id = ? AND status = 'running' AND phase IN ({placeholders})",
+                (phase, timestamp, scan_id, *earlier),
+            )
+            if changed.rowcount:
+                connection.execute(
+                    "UPDATE scan_progress SET phase_items_total = 0, "
+                    "phase_items_completed = 0, phase_progress_unit = NULL, updated_at = ? "
+                    "WHERE scan_id = ?",
+                    (timestamp, scan_id),
+                )
+    except sqlite3.Error as exc:
+        print(f"Could not save scan progress: {exc}", file=sys.stderr)
 
 
 def _scan_draft_digest(scan_dir: Path) -> str:

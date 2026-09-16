@@ -1320,6 +1320,8 @@ def complete_scan_locked(
                 f"{', '.join(missing_drafts)}. Check that the scan agent can run shell "
                 "commands and write to the scan directory before retrying."
             )
+    if scan["mode"] == "deep":
+        saved_results.advance_scan_phase(_WORKBENCH_DB_CONTEXT, connection, scan_id, "reporting")
     wrote = False
     try:
         documents = None
@@ -2592,7 +2594,12 @@ def scan_context(
         "workspace": workspace,
     }
     if scan["mode"] == "deep":
-        context["compositionCheckpoint"] = read_composition_checkpoint(scan)
+        checkpoint = read_composition_checkpoint(scan)
+        if checkpoint is not None:
+            checkpoint.pop("aggregate", None)
+            if isinstance(checkpoint.get("legacy"), dict):
+                checkpoint["legacy"].pop("coverage", None)
+        context["compositionCheckpoint"] = checkpoint
     if scan["recipe_json"] is not None:
         context["parentScanId"] = scan["parent_scan_id"]
         context["recipe"] = json.loads(scan["recipe_json"], parse_constant=reject_non_finite_json)

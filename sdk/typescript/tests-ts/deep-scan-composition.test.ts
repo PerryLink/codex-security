@@ -181,13 +181,17 @@ async function harness(
       if (args[0] === "get-scan")
         return { scan: { progress: { status: "running" } } };
       if (args[0] === "fail-scan") {
+        if (args[4]!.length > 2400)
+          throw new Error("Text value must be no longer than 2400 characters.");
         records.get(args[2]!)!.progress.status = "failed";
         return {};
       }
       throw new Error(`Unexpected workbench operation ${args[0]}`);
     },
     async merge(prompt) {
-      const payload = JSON.parse(prompt.slice(prompt.indexOf('{"scans":'))) as {
+      const path = join(scanDir, "artifacts/deep-scan/merge-inputs.json");
+      expect(prompt).toContain(JSON.stringify(path));
+      const payload = JSON.parse(await readFile(path, "utf8")) as {
         scans: SemanticScan[];
         previous: SemanticScan | null;
       };
@@ -541,26 +545,92 @@ describe("ordinary scan composition", () => {
     expect(h.mergeInputs).toEqual([1]);
   });
 
-  test("failed scans do not count toward clean saturation", async () => {
+  test.each([
+    ["short", "Discovery failed."],
+    ["long", "x".repeat(2401)],
+  ])(
+    "failed scans with %s errors do not count toward clean saturation",
+    async (_label, message) => {
+      retryDelay = spyOn(timers, "setTimeout").mockImplementation(
+        async <T>(_delay?: number, value?: T): Promise<T> => value as T,
+      );
+      const h = await harness({ stopAfterNoNew: 1, maxDiscoveryRuns: 1 });
+      h.setRun(async (options) => {
+        if (h.calls.length > 4)
+          return result(options.resumeScanId!, options.outputDir!);
+        throw new Error(message);
+      });
+      await expect(runDeepScans(h.input)).rejects.toThrow(
+        "every discovery run failed",
+      );
+      const state = await h.checkpoint();
+      expect(h.calls).toHaveLength(4);
+      expect(state.passes).toHaveLength(1);
+      expect(state.mergedScanIds).toEqual([]);
+      expect(state.noNewStreak).toBe(0);
+      expect(state.terminalReason).toBe("failed");
+      expect(state.consecutiveErrors).toBe(1);
+      expect(h.mergeInputs).toEqual([]);
+      expect(h.published).toEqual([]);
+    },
+  );
+
+  test("surfaces failed child persistence instead of restarting its retries", async () => {
     retryDelay = spyOn(timers, "setTimeout").mockImplementation(
       async <T>(_delay?: number, value?: T): Promise<T> => value as T,
     );
     const h = await harness({ stopAfterNoNew: 1, maxDiscoveryRuns: 1 });
-    h.setRun(async () => {
+    h.setRun(async (options) => {
+      if (h.calls.length > 4)
+        return result(options.resumeScanId!, options.outputDir!);
       throw new Error("Discovery failed.");
     });
+    const workbench = h.input.workbench;
+    h.input.workbench = async (args, input) => {
+      if (args[0] === "fail-scan")
+        throw new Error("Saved scan is unavailable.");
+      return await workbench(args, input);
+    };
     await expect(runDeepScans(h.input)).rejects.toThrow(
-      "every discovery run failed",
+      "Saved scan is unavailable.",
     );
-    const state = await h.checkpoint();
     expect(h.calls).toHaveLength(4);
-    expect(state.passes).toHaveLength(1);
-    expect(state.mergedScanIds).toEqual([]);
-    expect(state.noNewStreak).toBe(0);
-    expect(state.terminalReason).toBe("failed");
-    expect(state.consecutiveErrors).toBe(1);
-    expect(h.mergeInputs).toEqual([]);
-    expect(h.published).toEqual([]);
+    expect(h.metrics().closed).toBe(1);
+    expect((await h.checkpoint()).terminalReason).toBe("failed");
+  });
+
+  test("caps discovery when its deadline interrupts a child", async () => {
+    const h = await harness({ maxDiscoveryRuns: 1 });
+    const now = Date.parse(h.input.startedAt);
+    const clock = spyOn(Date, "now").mockReturnValue(now);
+    const schedule = globalThis.setTimeout;
+    let expire: (() => void) | undefined;
+    const timer = spyOn(globalThis, "setTimeout").mockImplementation(((
+      ...args: Parameters<typeof schedule>
+    ) => {
+      const [callback, milliseconds, ...parameters] = args;
+      if (milliseconds === 3_600_000) expire = () => callback(...parameters);
+      return schedule(...args);
+    }) as typeof schedule);
+    h.setRun(async (options) => {
+      clock.mockReturnValue(now + 3_600_000);
+      expect(expire).toBeDefined();
+      expire!();
+      throw options.signal!.reason;
+    });
+    try {
+      await runDeepScans(h.input);
+      expect(h.calls).toHaveLength(1);
+      expect(await h.checkpoint()).toMatchObject({
+        terminalReason: "capped",
+        consecutiveErrors: 0,
+      });
+      expect([...h.records.values()][0]!.progress.status).toBe("failed");
+      expect(h.metrics().closed).toBe(1);
+    } finally {
+      timer.mockRestore();
+      clock.mockRestore();
+    }
   });
 
   test("reports the original deadline when the final merge reaches saturation late", async () => {
@@ -656,7 +726,7 @@ describe("ordinary scan composition", () => {
       const reason =
         stop === "transport interruption"
           ? new ScanTransportClosedError("Native transport disconnected.")
-          : new Error("Canceled by the user.");
+          : new Error("Canceled by the user.".padEnd(2401, "."));
       h.setRun(async () => {
         h.controller.abort(reason);
         throw reason;

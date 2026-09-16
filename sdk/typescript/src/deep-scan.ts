@@ -249,15 +249,19 @@ export async function runDeepScans(
         : [];
     });
     if (!pending.length && (!allowEmpty || state.aggregate !== null)) return;
+    const prompt = await scanMergePrompt(
+      scanId,
+      pending,
+      state.aggregate,
+      scanDir,
+      input.writer,
+    );
     let merged: ReturnType<typeof validateMerge>;
     for (;;) {
       executionSignal.throwIfAborted();
       try {
         merged = validateMerge(
-          await input.merge(
-            scanMergePrompt(scanId, pending, state.aggregate),
-            executionSignal,
-          ),
+          await input.merge(prompt, executionSignal),
           pending,
           state.aggregate,
         );
@@ -337,7 +341,7 @@ export async function runDeepScans(
                 "--scan-id",
                 pass.scanId,
                 "--message",
-                safeErrorMessage(error),
+                safeErrorMessage(error).slice(0, 2400),
                 ...(latestCost
                   ? ["--cost-json", JSON.stringify(latestCost)]
                   : []),
@@ -364,7 +368,7 @@ export async function runDeepScans(
           "--scan-id",
           pass.scanId,
           "--message",
-          safeErrorMessage(discoverySignal.reason),
+          safeErrorMessage(discoverySignal.reason).slice(0, 2400),
           ...(latestCost ? ["--cost-json", JSON.stringify(latestCost)] : []),
         ]).catch(() => undefined);
       }
@@ -420,8 +424,12 @@ export async function runDeepScans(
         batch.push(pass);
       }
       await save();
-      await Promise.allSettled(batch.map(runPass));
+      const results = await Promise.allSettled(batch.map(runPass));
       executionSignal.throwIfAborted();
+      if (!deadlineController.signal.aborted) {
+        for (const result of results)
+          if (result.status === "rejected") throw result.reason;
+      }
       await refreshPasses();
     }
     await mergePending(true);

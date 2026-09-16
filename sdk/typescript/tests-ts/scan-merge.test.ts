@@ -587,15 +587,34 @@ describe("local scan merging", () => {
     );
   });
 
-  test("merge prompt includes source identities and requests semantic output only", () => {
-    const input = child("first");
-    const prompt = scanMergePrompt(parent, [input], null);
-    const payload = JSON.parse(prompt.slice(prompt.indexOf('{"scans":')));
-    expect(payload.scans[0].childScanId).toBe("first");
-    expect(payload.scans[0].scanId).toBe(parent);
-    expect(payload.scans[0]).not.toHaveProperty("coverage");
-    expect(payload.scans[0].findings[0].provenance.sourceFindingIds).toEqual([
-      "first:0",
-    ]);
-  });
+  for (const count of [1, 2048]) {
+    test(`merge reads ${count} assigned findings from a saved evidence file`, async () => {
+      const input = child(
+        "first",
+        Array.from({ length: count }, (_, index) => finding(`issue-${index}`)),
+      );
+      const previous: ScanAggregate = {
+        scanId: parent,
+        findings: [finding("previous")],
+      };
+      let saved = "";
+      const prompt = await scanMergePrompt(parent, [input], previous, root, {
+        async restore(path, contents) {
+          expect(path).toBe("artifacts/deep-scan/merge-inputs.json");
+          saved = Buffer.from(contents).toString("utf8");
+        },
+      });
+      const payload = JSON.parse(saved);
+      expect(payload.scans[0].childScanId).toBe("first");
+      expect(payload.scans[0].scanId).toBe(parent);
+      expect(payload.scans[0]).not.toHaveProperty("coverage");
+      expect(payload.scans[0].findings).toEqual(input.draft.findings);
+      expect(payload.previous).toEqual(previous);
+      expect(JSON.parse(prompt.split("\n").at(-1)!)).toBe(
+        join(root, "artifacts/deep-scan/merge-inputs.json"),
+      );
+      if (count > 1) expect([...saved].length).toBeGreaterThan(1 << 20);
+      expect([...prompt].length).toBeLessThan(1 << 20);
+    });
+  }
 });

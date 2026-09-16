@@ -1613,6 +1613,21 @@ export class CodexSecurity {
         onError: reportTrackingError,
       });
       costTracker = tracker;
+      const reportScanProgress = (progress: ScanProgress): void => {
+        if (
+          progress.phase === "discovery" &&
+          progress.filesCompleted === 0 &&
+          reviewedFileCount === 0 &&
+          progress.filesTotal !== scopeFileCount
+        ) {
+          scopeFileCount = progress.filesTotal;
+          tracker.setExpectedFilesTotal(scopeFileCount);
+        }
+        reportProgress({
+          ...progress,
+          phase: mode === "deep" ? "discovery" : progress.phase,
+        });
+      };
       const recipe = scanRecipe({
         repository: repo,
         target: normalized,
@@ -2178,6 +2193,12 @@ export class CodexSecurity {
         }
         completionCost =
           mode === "deep" ? combinedCost(snapshot.cost) : snapshot.cost;
+        if (mode === "deep" && scopeFileCount !== null)
+          reportProgress({
+            phase: "reporting",
+            filesCompleted: reviewedFileCount,
+            filesTotal: scopeFileCount,
+          });
         let preparation: JsonObject;
         try {
           preparation = await workbench(workbenchOptions, [
@@ -2305,6 +2326,7 @@ export class CodexSecurity {
                   safetyIdentifier: options.safetyIdentifier,
                   requireCost: options.maxCostUsd !== undefined,
                   onActivity: options.onActivity,
+                  onProgress: reportScanProgress,
                   onSessionEvent: options.onSessionEvent,
                   onWorkerStatus: options.onWorkerStatus,
                   onReconnect: options.onReconnect,
@@ -2501,18 +2523,7 @@ export class CodexSecurity {
               onTrustedAccessStatus: options.onTrustedAccessStatus,
               onReconnect: options.onReconnect,
               onActivity: options.onActivity,
-              onProgress: (progress) => {
-                if (
-                  progress.phase === "discovery" &&
-                  progress.filesCompleted === 0 &&
-                  reviewedFileCount === 0 &&
-                  progress.filesTotal !== scopeFileCount
-                ) {
-                  scopeFileCount = progress.filesTotal;
-                  tracker.setExpectedFilesTotal(scopeFileCount);
-                }
-                reportProgress(progress);
-              },
+              onProgress: reportScanProgress,
               onWorkerStatus: options.onWorkerStatus,
               onWarning: options.onWarning,
               onObserverError: options.onObserverError,

@@ -334,6 +334,109 @@ def test_native_legacy_settings_are_returned_only_without_a_saved_recipe(tmp_pat
     assert "deepScanSettings" not in joined
 
 
+@pytest.mark.parametrize(
+    "legacy",
+    [
+        None,
+        {},
+        {
+            "coverage": {"deferred": ["full coverage"]},
+            "discoveryRuns": 3,
+            "cost": {"estimatedUsd": 2},
+            "originThreadId": "legacy-thread",
+        },
+    ],
+)
+def test_scan_context_projects_composition_metadata_without_changing_checkpoint(
+    tmp_path: Path, legacy: dict | None
+) -> None:
+    target = tmp_path / "target"
+    target.mkdir()
+    state = tmp_path / "state"
+    parent = register(state, target, tmp_path / "scan", mode="deep")
+    assert (
+        run_workbench(state, "get-scan", "--scan-id", parent["scanId"])["compositionCheckpoint"]
+        is None
+    )
+    saved = checkpoint(state, parent)
+    saved.update(
+        aggregate={
+            "findings": [{"details": "full finding"}],
+            "coverage": {"surfaces": ["full surface"]},
+        },
+        legacy=legacy,
+        mergeFailures=2,
+        terminalReason=None,
+    )
+    run_workbench(
+        state,
+        "save-scan-artifact",
+        "--scan-id",
+        parent["scanId"],
+        "--artifact-path",
+        CHECKPOINT,
+        input_text=json.dumps(saved),
+    )
+    checkpoint_path = Path(parent["scanDir"]) / CHECKPOINT
+    full_checkpoint = checkpoint_path.read_bytes()
+    expected = {key: value for key, value in saved.items() if key != "aggregate"}
+    if isinstance(legacy, dict):
+        expected["legacy"] = {key: value for key, value in legacy.items() if key != "coverage"}
+    context = run_workbench(state, "get-scan", "--scan-id", parent["scanId"])
+    assert context["compositionCheckpoint"] == expected
+    assert checkpoint_path.read_bytes() == full_checkpoint
+    assert json.loads(full_checkpoint) == saved
+
+
+def test_composition_checkpoint_advances_discovery_without_regressing_resumed_progress(
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "target"
+    target.mkdir()
+    state = tmp_path / "state"
+    parent = register(state, target, tmp_path / "scan", mode="deep")
+    run_workbench(
+        state,
+        "save-scan-artifact",
+        "--scan-id",
+        parent["scanId"],
+        "--artifact-path",
+        "artifacts/note.txt",
+        input_text="synthetic note",
+    )
+    assert (
+        run_workbench(state, "get-scan", "--scan-id", parent["scanId"])["scan"]["progress"]["phase"]
+        == "preflight"
+    )
+    for phase in ("preflight", "threat_model", "discovery", "validation", "reporting"):
+        with sqlite3.connect(state / "workbench.sqlite3") as connection:
+            connection.execute("UPDATE scans SET phase = ? WHERE id = ?", (phase, parent["scanId"]))
+            connection.execute(
+                "UPDATE scan_progress SET phase_items_total = 4, phase_items_completed = 2, "
+                "phase_progress_unit = 'checks' WHERE scan_id = ?",
+                (parent["scanId"],),
+            )
+        checkpoint(state, parent)
+        progress = run_workbench(state, "get-scan", "--scan-id", parent["scanId"])["scan"][
+            "progress"
+        ]
+        advanced = phase in ("preflight", "threat_model")
+        assert progress["phase"] == ("discovery" if advanced else phase)
+        assert progress["phaseProgress"] == (
+            {"total": 0, "completed": 0, "unit": None}
+            if advanced
+            else {"total": 4, "completed": 2, "unit": "checks"}
+        )
+    ordinary = register(state, target, tmp_path / "ordinary")
+    checkpoint(state, ordinary)
+    assert (
+        run_workbench(state, "get-scan", "--scan-id", ordinary["scanId"])["scan"]["progress"][
+            "phase"
+        ]
+        == "preflight"
+    )
+
+
 def test_parent_reads_completed_child_after_registration_checkpoint_crash(tmp_path: Path) -> None:
     target = tmp_path / "target"
     target.mkdir()
@@ -360,7 +463,10 @@ def test_parent_reads_completed_child_after_registration_checkpoint_crash(tmp_pa
         run_workbench(state, "get-scan", "--scan-id", child["scanId"])["scan"]["findingCount"] == 1
     )
     context = run_workbench(state, "get-scan", "--scan-id", parent["scanId"])
-    assert context["compositionCheckpoint"] == saved
+    assert context["scan"]["progress"]["phase"] == "discovery"
+    assert context["compositionCheckpoint"] == {
+        key: value for key, value in saved.items() if key != "aggregate"
+    }
     assert context["scan"]["executionThreadIds"] == ["child-thread"]
     assert context["scan"]["progress"]["independentReviews"] == {
         "active": 0,
@@ -383,7 +489,9 @@ def test_parent_reads_completed_child_after_registration_checkpoint_crash(tmp_pa
     checkpoint(
         state, parent, passes=saved["passes"], merged=[child["scanId"]], terminal="saturated"
     )
-    run_workbench(state, "prepare-scan-completion", "--scan-id", parent["scanId"])
+    prepared = run_workbench(state, "prepare-scan-completion", "--scan-id", parent["scanId"])
+    assert prepared["scan"]["progress"]["phase"] == "reporting"
+    assert prepared["scan"]["progress"]["status"] == "running"
     run_workbench(state, "complete-scan", "--scan-id", parent["scanId"])
     assert (directory / "scan-manifest.json").read_bytes() == child_bytes
     context = run_workbench(state, "get-scan", "--scan-id", parent["scanId"])
@@ -449,7 +557,9 @@ def test_archiving_composition_preserves_children_and_reuses_pass_directories(
     assert archived_child["scan"]["findingCount"] == 1
     assert (archived / child_path / "scan-manifest.json").read_bytes() == child_manifest
     context = run_workbench(state, "get-scan", "--scan-id", parent["scanId"])
-    assert context["compositionCheckpoint"] == saved
+    assert context["compositionCheckpoint"] == {
+        key: value for key, value in saved.items() if key != "aggregate"
+    }
     assert context["scan"]["progress"]["independentReviews"]["completed"] == 1
     assert {scan["scanId"] for scan in run_workbench(state, "list-scans")["scans"]} == {
         parent["scanId"],

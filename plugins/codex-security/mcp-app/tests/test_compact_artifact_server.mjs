@@ -995,7 +995,8 @@ async function testPromptDrivenPrivateRecipe(bundle, runtimeLabel) {
     });
 
     try {
-      const started = requireSuccessfulTool(await callStart(), `${runtimeLabel}: start ${kind} scan`);
+      const startedResult = await callStart();
+      const started = requireSuccessfulTool(startedResult, `${runtimeLabel}: start ${kind} scan`);
       const { scanId, scanDir } = started.scan;
       const claimToken = started.handoffClaimToken;
       const recipe = privateScanRecipe(repoRoot, "standard");
@@ -1013,6 +1014,16 @@ async function testPromptDrivenPrivateRecipe(bundle, runtimeLabel) {
       const joined = requireSuccessfulTool(joinedResult, `${runtimeLabel}: rejoin ${kind} scan`);
       assert.equal(joined.startDisposition, "joined");
       assert.equal(joined.scan.scanId, scanId);
+      if (kind === "prompt-only") {
+        for (const result of [startedResult, joinedResult]) {
+          const instructions = result.content
+            .filter((content) => content.type === "text")
+            .map((content) => content.text)
+            .join("\n");
+          assert.ok(instructions.includes("complete_codex_security_scan"));
+          assert.equal(instructions.includes("get_codex_security_completed_scan"), false);
+        }
+      }
       assertPrivateRecipeOmitted(joinedResult, recipe, `${runtimeLabel}: ${kind} rejoin`);
       assert.deepEqual(runWorkbenchFixture(runtimeLabel, environment, [
         "get-scan-recipe", "--scan-id", scanId
