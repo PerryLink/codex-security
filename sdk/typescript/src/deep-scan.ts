@@ -125,17 +125,23 @@ export async function runDeepScans(
     if (pass.directory !== passDirectory(index))
       throw new Error("Saved scan pass escaped its parent.");
   }
+  let saveTail = Promise.resolve();
   const save = async (): Promise<void> => {
-    await workbench(
-      [
-        "save-scan-artifact",
-        "--scan-id",
-        scanId,
-        "--artifact-path",
-        DEEP_SCAN_CHECKPOINT,
-      ],
-      JSON.stringify(state),
-    );
+    const snapshot = JSON.stringify(state);
+    const pending = saveTail.then(async () => {
+      await workbench(
+        [
+          "save-scan-artifact",
+          "--scan-id",
+          scanId,
+          "--artifact-path",
+          DEEP_SCAN_CHECKPOINT,
+        ],
+        snapshot,
+      );
+    });
+    saveTail = pending.catch(() => undefined);
+    await pending;
   };
   await save();
   const previousRuns = state.legacy?.discoveryRuns ?? 0;
@@ -156,14 +162,11 @@ export async function runDeepScans(
   const validateMerge = await createScanMergeValidator(input.pluginRoot);
   const accepted = new Map<string, ScanMergeInput>();
   const saved = new Map<string, SavedPass>();
-  const reportCompletedCost = (
-    key: string,
-    cost: Readonly<ScanCost> | null,
-  ) => {
+  const reportPassCost = (key: string, cost: Readonly<ScanCost> | null) => {
     input.onCost(key, cost);
     if (cost === null && input.scanOptions.requireCost)
       throw new ScanCostTrackingError(
-        "The completed child scan cost is unavailable; its cost limit cannot be verified.",
+        "The child scan cost is unavailable; its cost limit cannot be verified.",
         scanDir,
       );
   };
@@ -199,8 +202,11 @@ export async function runDeepScans(
         state.consecutiveErrors += 1;
       }
       saved.set(record.scanId, record);
-      if (record.progress.status === "complete")
-        reportCompletedCost(pass.directory, record.cost ?? null);
+      if (
+        record.progress.status === "complete" ||
+        (record.progress.status === "failed" && record.continuationThreadId)
+      )
+        reportPassCost(pass.directory, record.cost ?? null);
       else if (record.cost) input.onCost(pass.directory, record.cost);
       if (
         record.progress.status === "complete" &&
@@ -370,7 +376,7 @@ export async function runDeepScans(
               signal,
             ),
           );
-          reportCompletedCost(pass.directory, result.cost);
+          reportPassCost(pass.directory, result.cost);
           executionSignal.throwIfAborted();
           state.consecutiveErrors = 0;
           await save();

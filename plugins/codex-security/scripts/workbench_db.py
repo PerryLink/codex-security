@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import argparse
-import errno
 import hashlib
 import json
 import math
@@ -16,20 +15,10 @@ import sys
 import tempfile
 import time
 import uuid
-from contextlib import closing, contextmanager
+from contextlib import closing
 from datetime import datetime, timedelta, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any
-
-try:
-    import fcntl as posix_file_lock
-except ModuleNotFoundError:  # pragma: no cover
-    posix_file_lock = None
-
-try:
-    import msvcrt as windows_file_lock
-except ModuleNotFoundError:  # pragma: no cover
-    windows_file_lock = None
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import workbench_native_indexes as native_indexes
@@ -58,7 +47,7 @@ from finalize_scan_contract import (
 )
 from finding_preview import bounded_finding_details
 from workbench import handoff
-from workbench.storage import resolve_scan_root, state_dir
+from workbench.storage import resolve_scan_root, scan_completion_lock, state_dir
 from workbench_cli import parse_args
 from workbench_constants import (
     ARTIFACTS,
@@ -164,70 +153,6 @@ def stale_claim_before(seconds: int = CLAIM_LEASE_SECONDS) -> str:
 
 def database_path() -> Path:
     return state_dir() / "workbench.sqlite3"
-
-
-@contextmanager
-def scan_completion_lock(scan_id: str) -> Any:
-    lock_dir = state_dir() / "completion-locks"
-    lock_dir.mkdir(parents=True, exist_ok=True)
-    lock_path = lock_dir / f"{require_uuid(scan_id, 'scan-id')}.lock"
-    descriptor = os.open(
-        lock_path,
-        os.O_RDWR | os.O_CREAT | getattr(os, "O_BINARY", 0),
-        0o600,
-    )
-    locked = False
-    try:
-        acquire_completion_file_lock(descriptor)
-        locked = True
-        yield
-    finally:
-        try:
-            if locked:
-                release_completion_file_lock(descriptor)
-        finally:
-            os.close(descriptor)
-
-
-def is_file_lock_contention(error: OSError) -> bool:
-    return error.errno in {errno.EACCES, errno.EAGAIN, errno.EDEADLK}
-
-
-def acquire_completion_file_lock(descriptor: int) -> None:
-    if posix_file_lock is not None:
-        posix_file_lock.flock(descriptor, posix_file_lock.LOCK_EX)
-        return
-    if windows_file_lock is None:
-        raise SystemExit("Scan completion requires operating-system file locking support.")
-
-    while os.fstat(descriptor).st_size == 0:
-        os.lseek(descriptor, 0, os.SEEK_SET)
-        try:
-            os.write(descriptor, b"\0")
-        except OSError as exc:
-            if not is_file_lock_contention(exc):
-                raise
-            time.sleep(0.05)
-
-    while True:
-        os.lseek(descriptor, 0, os.SEEK_SET)
-        try:
-            windows_file_lock.locking(descriptor, windows_file_lock.LK_NBLCK, 1)
-            return
-        except OSError as exc:
-            if not is_file_lock_contention(exc):
-                raise
-            time.sleep(0.05)
-
-
-def release_completion_file_lock(descriptor: int) -> None:
-    if posix_file_lock is not None:
-        posix_file_lock.flock(descriptor, posix_file_lock.LOCK_UN)
-        return
-    if windows_file_lock is None:
-        return
-    os.lseek(descriptor, 0, os.SEEK_SET)
-    windows_file_lock.locking(descriptor, windows_file_lock.LK_UNLCK, 1)
 
 
 def connect() -> sqlite3.Connection:

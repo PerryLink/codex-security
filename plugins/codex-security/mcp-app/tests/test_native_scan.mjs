@@ -224,6 +224,79 @@ test("native cancellation drains only its parent; shutdown drains the rest", asy
   assert.deepEqual(closed, ["first", "second"]);
 });
 
+test("native scans resolve empty and unset Codex homes consistently", async () => {
+  const root = await realpath(
+    await mkdtemp(join(tmpdir(), "native-codex-home-")),
+  );
+  const defaultHome = join(root, ".codex");
+  const explicitHome = join(root, "explicit");
+  const pluginRoot = join(root, "plugin");
+  const keys = [
+    "HOME",
+    "USERPROFILE",
+    "CODEX_HOME",
+    "CODEX_CLI_PATH",
+    "CODEX_SECURITY_CONFIG_PATH",
+    "CODEX_SECURITY_DEEP_SCAN_CONFIG_PATH",
+  ];
+  const before = Object.fromEntries(keys.map((key) => [key, process.env[key]]));
+  try {
+    Object.assign(process.env, {
+      HOME: root,
+      USERPROFILE: root,
+      CODEX_CLI_PATH: process.execPath,
+    });
+    delete process.env.CODEX_SECURITY_CONFIG_PATH;
+    delete process.env.CODEX_SECURITY_DEEP_SCAN_CONFIG_PATH;
+    await mkdir(join(pluginRoot, ".codex-plugin"), { recursive: true });
+    await writeFile(
+      join(pluginRoot, ".codex-plugin/plugin.json"),
+      JSON.stringify({ name: "codex-security", version: "0.0.0" }),
+    );
+    for (const [home, model, workers] of [
+      [defaultHome, "synthetic-default", 2],
+      [explicitHome, "synthetic-explicit", 4],
+    ]) {
+      await mkdir(join(home, "codex-security"), { recursive: true });
+      await writeFile(join(home, "config.toml"), `model = "${model}"\n`);
+      await writeFile(
+        join(home, "codex-security/config.toml"),
+        `[deep_scan]\nworkers = ${workers}\n`,
+      );
+    }
+    for (const [override, home, model, workers] of [
+      [undefined, defaultHome, "synthetic-default", 2],
+      ["", defaultHome, "synthetic-default", 2],
+      [explicitHome, explicitHome, "synthetic-explicit", 4],
+    ]) {
+      if (override === undefined) delete process.env.CODEX_HOME;
+      else process.env.CODEX_HOME = override;
+      const prepared = await prepareNativeScan({
+        ...input(),
+        pluginRoot,
+        recipe: { auth: "api-key" },
+      });
+      assert.equal(prepared.client.config.codexOverrides.model, model);
+      assert.equal(prepared.options.workers, workers);
+      const runtime = await prepared.client.dependencies.prepareRuntime({});
+      try {
+        const expectedHome = await realpath(home);
+        assert.equal(runtime.codexHome, expectedHome);
+        assert.equal(runtime.environment.CODEX_HOME, expectedHome);
+        assert.equal(process.env.CODEX_HOME, override);
+      } finally {
+        await rm(runtime.bootstrapWorkspace, { recursive: true, force: true });
+      }
+    }
+  } finally {
+    for (const key of keys) {
+      if (before[key] === undefined) delete process.env[key];
+      else process.env[key] = before[key];
+    }
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("native launches snapshot safety identifiers and prefer saved recipes", async () => {
   const root = await mkdtemp(join(tmpdir(), "native-safety-identifier-"));
   const keys = [

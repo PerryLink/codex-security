@@ -1,5 +1,4 @@
 import { readFile, realpath } from "node:fs/promises";
-import { homedir } from "node:os";
 import { join } from "node:path";
 import { parse as parseToml } from "smol-toml";
 import {
@@ -17,7 +16,10 @@ import {
   ScanSettingsSchema,
   type DeepScanOptions,
 } from "../../../../sdk/typescript/src/scan-settings.js";
-import { accountStatus } from "../../../../sdk/typescript/src/auth.js";
+import {
+  accountStatus,
+  configuredCodexHome,
+} from "../../../../sdk/typescript/src/auth.js";
 import { CodexSecurityError } from "../../../../sdk/typescript/src/errors.js";
 import { resolveDeepScanConfig } from "../../../../sdk/typescript/src/deep-config.js";
 import { ScanTransportClosedError } from "../../../../sdk/typescript/src/scan-execution.js";
@@ -158,11 +160,7 @@ export async function prepareNativeScan(
   const deep = await resolveDeepScanConfig(
     options,
     environment.CODEX_SECURITY_DEEP_SCAN_CONFIG_PATH ??
-      join(
-        environment.CODEX_HOME ?? join(homedir(), ".codex"),
-        "codex-security",
-        "config.toml",
-      ),
+      join(configuredCodexHome(environment), "codex-security", "config.toml"),
   );
   const config = await nativeScanConfiguration(
     environment,
@@ -221,9 +219,7 @@ export async function prepareNativeScan(
       environment: selectedEnvironment,
       inheritedPermissions,
       prepareRuntime: async (_config, runtimeSignal) => {
-        const codexHome = await realpath(
-          environment.CODEX_HOME ?? join(homedir(), ".codex"),
-        );
+        const codexHome = await realpath(configuredCodexHome(environment));
         const bootstrapWorkspace = await createIsolatedHome();
         try {
           const marketplaceRoot = await createMarketplace(
@@ -293,10 +289,7 @@ export async function nativeScanConfiguration(
       input.recipe.config as JsonObject,
       subagents,
     );
-  const ambientPath = join(
-    environment.CODEX_HOME ?? join(homedir(), ".codex"),
-    "config.toml",
-  );
+  const ambientPath = join(configuredCodexHome(environment), "config.toml");
   const ambient = await readFile(ambientPath, "utf8").catch(
     (error: NodeJS.ErrnoException) => {
       if (error.code === "ENOENT") return "";

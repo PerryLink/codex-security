@@ -2,11 +2,17 @@ from __future__ import annotations
 
 import copy
 import json
+import os
 import sqlite3
+import subprocess
+import sys
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from threading import Event
+from unittest import mock
 
 import pytest
-from workbench_test_support import run_workbench, write_checkpoint, write_completed_contract
+from workbench_test_support import SCRIPT, run_workbench, write_checkpoint, write_completed_contract
 
 CHECKPOINT = "artifacts/deep-scan/checkpoint.json"
 EXECUTION_THREADS = "artifacts/deep-scan/execution-threads.json"
@@ -69,6 +75,98 @@ def checkpoint(state: Path, scan: dict, *, passes=(), merged=(), terminal=None) 
         input_text=json.dumps(value),
     )
     return value
+
+
+def test_checkpoint_read_blocks_other_threads_and_atomic_writers(
+    tmp_path: Path, workbench_api, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = tmp_path / "target"
+    target.mkdir()
+    (target / "app.py").write_text("print('fixture')\n")
+    state = tmp_path / "state"
+    scan = register(state, target, tmp_path / "scan", mode="deep")
+    original = checkpoint(state, scan)
+    updated = {**original, "noNewStreak": 1}
+    monkeypatch.setenv("CODEX_SECURITY_STATE_DIR", str(state))
+    read_checkpoint = workbench_api["read_composition_checkpoint"]
+    reading, release_read, thread_waiting, thread_acquired = (Event() for _ in range(4))
+
+    def paused_read(scan_dir: Path, relative: str, context: str) -> dict:
+        descriptor = workbench_api["open_scan_local_file_descriptor"](scan_dir, relative, context)
+        with os.fdopen(descriptor, "rb") as source:
+            reading.set()
+            assert release_read.wait(10)
+            return json.load(source)
+
+    def competing_thread() -> None:
+        thread_waiting.set()
+        with workbench_api["scan_completion_lock"](scan["scanId"]):
+            thread_acquired.set()
+
+    writer_script = """
+import runpy, sys
+sys.path.insert(0, sys.argv[1])
+from workbench import storage
+acquire = storage.acquire_completion_file_lock
+def announce_acquire(descriptor):
+    print("waiting", flush=True)
+    acquire(descriptor)
+storage.acquire_completion_file_lock = announce_acquire
+sys.argv = sys.argv[2:]
+runpy.run_path(sys.argv[0], run_name="__main__")
+"""
+    with (
+        mock.patch.dict(read_checkpoint.__globals__, _read_scan_local_json=paused_read),
+        ThreadPoolExecutor(max_workers=3) as executor,
+    ):
+        reader = executor.submit(
+            read_checkpoint, {"id": scan["scanId"], "scan_dir": scan["scanDir"]}
+        )
+        writer = None
+        try:
+            assert reading.wait(5)
+            contender = executor.submit(competing_thread)
+            assert thread_waiting.wait(5)
+            assert not thread_acquired.wait(0.1)
+            writer = subprocess.Popen(
+                [
+                    sys.executable,
+                    "-c",
+                    writer_script,
+                    str(SCRIPT.parent),
+                    str(SCRIPT),
+                    "save-scan-artifact",
+                    "--scan-id",
+                    scan["scanId"],
+                    "--artifact-path",
+                    CHECKPOINT,
+                ],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            writer.stdin.write(json.dumps(updated))
+            writer.stdin.close()
+            writer.stdin = None
+            assert executor.submit(writer.stdout.readline).result(timeout=5).strip() == "waiting"
+            with pytest.raises(subprocess.TimeoutExpired):
+                writer.wait(timeout=0.1)
+            assert json.loads((Path(scan["scanDir"]) / CHECKPOINT).read_text()) == original
+        finally:
+            release_read.set()
+            if writer is not None:
+                try:
+                    stdout, stderr = writer.communicate(timeout=10)
+                finally:
+                    if writer.poll() is None:
+                        writer.kill()
+                        writer.communicate()
+        assert reader.result(timeout=5) == original
+        contender.result(timeout=5)
+        assert writer.returncode == 0, stderr
+        assert json.loads(stdout)["scanId"] == scan["scanId"]
+    assert json.loads((Path(scan["scanDir"]) / CHECKPOINT).read_text()) == updated
 
 
 def test_standard_resume_retains_registration_before_and_after_thread_binding(

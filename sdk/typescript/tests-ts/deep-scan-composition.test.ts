@@ -25,6 +25,7 @@ import {
   type DeepScanComposition,
 } from "../src/deep-scan.js";
 import { ScanResult } from "../src/result.js";
+import { abortable } from "../src/targets.js";
 import {
   ScanPermissionError,
   ScanTransportClosedError,
@@ -97,6 +98,7 @@ interface SavedRecord {
   parentScanId: string;
   targetPath: string;
   progress: { status: string };
+  continuationThreadId?: string;
   cost?: ScanCost | null;
 }
 
@@ -256,6 +258,77 @@ async function harness(
 }
 
 describe("ordinary scan composition", () => {
+  test("serializes concurrent child checkpoint writes", async () => {
+    const h = await harness({ workers: 2, stopAfterNoNew: 2 });
+    const registrationsReady = Promise.withResolvers<void>();
+    const releaseWrite = Promise.withResolvers<void>();
+    let registrations = 0;
+    const createClient = h.input.createClient;
+    h.input.createClient = () => {
+      const client = createClient();
+      return {
+        ...client,
+        run(repository, options = {}) {
+          return client.run(repository, {
+            ...options,
+            async onRegisteredScan(registration) {
+              const pending = options.onRegisteredScan?.(registration);
+              if (++registrations === 2) registrationsReady.resolve();
+              return pending;
+            },
+          });
+        },
+      };
+    };
+    const workbench = h.input.workbench;
+    let writing = 0;
+    let maximumWriting = 0;
+    h.input.workbench = async (args, contents) => {
+      if (args[0] !== "save-scan-artifact") return workbench(args, contents);
+      writing += 1;
+      maximumWriting = Math.max(maximumWriting, writing);
+      try {
+        const state = JSON.parse(contents!) as DeepScanCheckpoint;
+        if (state.passes.some((pass) => pass.scanId))
+          await releaseWrite.promise;
+        return await workbench(args, contents);
+      } finally {
+        writing -= 1;
+      }
+    };
+    const execution = runDeepScans(h.input);
+    try {
+      await Promise.race([registrationsReady.promise, execution]);
+    } finally {
+      releaseWrite.resolve();
+    }
+    await execution;
+    expect(maximumWriting).toBe(1);
+    const state = await h.checkpoint();
+    expect(state.mergedScanIds).toHaveLength(2);
+    expect(state.terminalReason).toBe("saturated");
+  });
+
+  test("preserves a checkpoint write failure and still saves terminal state", async () => {
+    const h = await harness({ stopAfterNoNew: 1 });
+    const workbench = h.input.workbench;
+    const failure = new Error("Synthetic checkpoint write failure.");
+    let rejected = false;
+    h.input.workbench = async (args, contents) => {
+      if (
+        args[0] === "save-scan-artifact" &&
+        JSON.parse(contents!).mergedScanIds.length > 0 &&
+        !rejected
+      ) {
+        rejected = true;
+        throw failure;
+      }
+      return workbench(args, contents);
+    };
+    await expect(runDeepScans(h.input)).rejects.toBe(failure);
+    expect((await h.checkpoint()).terminalReason).toBe("failed");
+  });
+
   test("runs fixed bounded batches and counts every successfully merged clean input", async () => {
     const h = await harness({ workers: 2, stopAfterNoNew: 4 });
     await runDeepScans(h.input);
@@ -806,6 +879,81 @@ describe("ordinary scan composition", () => {
     },
   );
 
+  test.each([
+    [false, false, true],
+    [false, true, true],
+    [true, false, true],
+    [true, true, true],
+    [false, true, false],
+    [true, true, false],
+  ])(
+    "accounts for failed pass cost (resumed: %p, required: %p, executed: %p)",
+    async (resumed, requireCost, executed) => {
+      retryDelay = spyOn(timers, "setTimeout").mockImplementation(
+        async <T>(_delay?: number, value?: T): Promise<T> => value as T,
+      );
+      const h = await harness({ stopAfterNoNew: 1, maxDiscoveryRuns: 2 });
+      h.input.scanOptions.requireCost = requireCost;
+      const failedDirectory = "artifacts/deep-scan/passes/pass-1";
+      const costs = new Map<string, Readonly<ScanCost> | null>();
+      h.input.onCost = (key, cost) => {
+        costs.set(key, cost);
+      };
+      if (resumed) {
+        const scanId = randomUUID();
+        h.records.set(scanId, {
+          scanId,
+          scanDir: join(h.input.scanDir, failedDirectory),
+          parentScanId: h.input.scanId,
+          targetPath: h.input.repository,
+          progress: { status: "failed" },
+          ...(executed ? { continuationThreadId: `thread-${scanId}` } : {}),
+        });
+        await h.seed({
+          version: 2,
+          startedAt: h.input.startedAt,
+          passes: [{ directory: failedDirectory, scanId }],
+          mergedScanIds: [],
+          aggregate: null,
+          noNewStreak: 0,
+          consecutiveErrors: 0,
+        });
+      }
+      h.setRun(async (options) => {
+        const scanId = options.resumeScanId!;
+        if (options.outputDir!.endsWith("pass-1")) {
+          if (executed)
+            h.records.get(scanId)!.continuationThreadId = `thread-${scanId}`;
+          throw new Error("Discovery failed.");
+        }
+        const completed = new ScanResult({
+          ...result(scanId, options.outputDir!),
+          turnResult: {
+            model: "gpt-6-astra",
+            usage: { input_tokens: 10000, output_tokens: 2000 },
+          },
+        });
+        h.records.get(scanId)!.cost = completed.cost;
+        return completed;
+      });
+      const stopped = executed && requireCost;
+      if (stopped)
+        await expect(runDeepScans(h.input)).rejects.toBeInstanceOf(
+          ScanCostTrackingError,
+        );
+      else {
+        await runDeepScans(h.input);
+        expect((await h.checkpoint()).terminalReason).toBe("saturated");
+        expect(h.published.at(-1)!.coverage["completeness"]).toBe("partial");
+      }
+      expect(h.calls).toHaveLength((resumed ? 0 : 4) + (stopped ? 0 : 1));
+      expect(h.mergeInputs).toEqual(stopped ? [] : [1]);
+      expect(costs.has(failedDirectory)).toBe(executed);
+      if (executed) expect(costs.get(failedDirectory)).toBeNull();
+      expect([...costs.values()].some((cost) => cost !== null)).toBe(!stopped);
+    },
+  );
+
   test.each([false, true])(
     "replaces partial child cost with unavailable completed cost (required: %p)",
     async (requireCost) => {
@@ -887,7 +1035,7 @@ describe("ordinary scan composition", () => {
             ...client,
             async run(repository, options = {}) {
               if (options.outputDir!.endsWith("pass-1")) {
-                await started;
+                await abortable(() => started, options.signal);
                 throw failure;
               }
               return await client.run(repository, options);
@@ -897,7 +1045,7 @@ describe("ordinary scan composition", () => {
       }
       h.setRun(async (options) => {
         if (options.outputDir!.endsWith("pass-1")) {
-          await started;
+          await abortable(() => started, options.signal);
           throw failure;
         }
         secondStarted();

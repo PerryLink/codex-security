@@ -17,6 +17,7 @@ from typing import Any
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from filesystem_identity import serialize_filesystem_identity
 from finalize_scan_contract import ContractError, _read_scan_local_json, write_scan_local_bytes
+from workbench.storage import scan_completion_lock
 from workbench_feedback import get_scan_feedback
 from workbench_target import (
     directory_content_digest,
@@ -34,7 +35,8 @@ def read_composition_checkpoint(scan: sqlite3.Row) -> dict[str, Any] | None:
         (scan_dir / COMPOSITION_CHECKPOINT).lstat()
     except FileNotFoundError:
         return None
-    checkpoint = _read_scan_local_json(scan_dir, COMPOSITION_CHECKPOINT, "Deep Scan checkpoint")
+    with scan_completion_lock(scan["id"]):
+        checkpoint = _read_scan_local_json(scan_dir, COMPOSITION_CHECKPOINT, "Deep Scan checkpoint")
     if checkpoint.get("version") != 2:
         raise ContractError("Unsupported Deep Scan checkpoint version.")
     return checkpoint
