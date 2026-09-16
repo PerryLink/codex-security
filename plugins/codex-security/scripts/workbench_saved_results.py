@@ -681,9 +681,10 @@ def merge_saved_results(
                 if "candidateId" in provenance:
                     original["candidateId"] = provenance["candidateId"]
                 if field == "deferred" and "surfaceIds" in original:
+                    surfaces = projection.get("surfaces", [])
                     surface_ids = {
                         surface.get("id"): surface["provenance"].get("sourceId")
-                        for surface in projection.get("surfaces", [])
+                        for surface in (surfaces if isinstance(surfaces, list) else [])
                         if isinstance(surface, dict) and isinstance(surface.get("provenance"), dict)
                     }
                     original["surfaceIds"] = [

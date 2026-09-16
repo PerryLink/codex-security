@@ -10,8 +10,14 @@ from test_deep_scan_successful_publication import publication_scan as publicatio
 
 @pytest.mark.parametrize("worker_count", [1, 2])
 @pytest.mark.parametrize("missing_parent_surfaces", [False, True])
+@pytest.mark.parametrize("retained_deferred", [False, True])
 def test_missing_projection_keeps_surface_links_and_independent_reviews(
-    workbench_api, workbench_db, publication_scan, worker_count, missing_parent_surfaces
+    workbench_api,
+    workbench_db,
+    publication_scan,
+    worker_count,
+    missing_parent_surfaces,
+    retained_deferred,
 ):
     scan = publication_scan()
     surface = {
@@ -26,7 +32,7 @@ def test_missing_projection_keeps_surface_links_and_independent_reviews(
         "candidateId": "pending-candidate",
         "surfaceIds": [surface["id"]],
     }
-    reviews, surfaces, originals = [], [], {}
+    reviews, surfaces, deferred_records, originals = [], [], [], {}
     for _ in range(worker_count):
         result = add_worker(workbench_db, scan)
         worker_id = result.parent.name
@@ -36,6 +42,20 @@ def test_missing_projection_keeps_surface_links_and_independent_reviews(
                 **surface,
                 "id": f"{worker_id}-attempt-1-surface-1",
                 "provenance": {"workerId": worker_id, "attempt": 1, "sourceId": surface["id"]},
+            }
+        )
+        deferred_records.append(
+            {
+                **deferred,
+                "id": f"{worker_id}-attempt-1-deferred-1",
+                "candidateId": f"{worker_id}-attempt-1-candidate-1",
+                "surfaceIds": [surfaces[-1]["id"]],
+                "provenance": {
+                    "workerId": worker_id,
+                    "attempt": 1,
+                    "sourceId": deferred["id"],
+                    "candidateId": deferred["candidateId"],
+                },
             }
         )
         result.write_text(
@@ -60,7 +80,7 @@ def test_missing_projection_keeps_surface_links_and_independent_reviews(
                 **scan.coverage,
                 "completeness": "partial",
                 "surfaces": None if missing_parent_surfaces else surfaces,
-                "deferred": [],
+                "deferred": deferred_records if retained_deferred else [],
                 "reviews": reviews,
             }
         )
