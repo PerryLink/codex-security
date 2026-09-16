@@ -715,7 +715,10 @@ def merge_saved_results(
                     for offset, surface in enumerate(source.get("surfaces", []), 1)
                 }
                 for projection in projected_coverages:
-                    for surface in projection.get("surfaces", []):
+                    surfaces = projection.get("surfaces", [])
+                    for surface in surfaces if isinstance(surfaces, list) else []:
+                        if not isinstance(surface, dict):
+                            continue
                         provenance = surface.get("provenance", {})
                         if (
                             isinstance(provenance, dict)

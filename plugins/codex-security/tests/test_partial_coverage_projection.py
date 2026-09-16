@@ -9,8 +9,9 @@ from test_deep_scan_successful_publication import publication_scan as publicatio
 
 
 @pytest.mark.parametrize("worker_count", [1, 2])
+@pytest.mark.parametrize("missing_parent_surfaces", [False, True])
 def test_missing_projection_keeps_surface_links_and_independent_reviews(
-    workbench_api, workbench_db, publication_scan, worker_count
+    workbench_api, workbench_db, publication_scan, worker_count, missing_parent_surfaces
 ):
     scan = publication_scan()
     surface = {
@@ -58,7 +59,7 @@ def test_missing_projection_keeps_surface_links_and_independent_reviews(
             {
                 **scan.coverage,
                 "completeness": "partial",
-                "surfaces": surfaces,
+                "surfaces": None if missing_parent_surfaces else surfaces,
                 "deferred": [],
                 "reviews": reviews,
             }
@@ -85,15 +86,21 @@ def test_missing_projection_keeps_surface_links_and_independent_reviews(
     assert len(pending) == worker_count
     by_surface_id = {item["id"]: item for item in coverage["surfaces"]}
     for item in pending:
-        linked = by_surface_id[item["surfaceIds"][0]]
-        assert linked["provenance"]["workerId"] == item["provenance"]["workerId"]
+        if not missing_parent_surfaces:
+            linked = by_surface_id[item["surfaceIds"][0]]
+            assert linked["provenance"]["workerId"] == item["provenance"]["workerId"]
         assert item["provenance"]["attempt"] == 1
         assert item["provenance"]["sourceId"] == deferred["id"]
         assert item["provenance"]["candidateId"] == deferred["candidateId"]
     assert {item["provenance"]["workerId"] for item in pending} == {
         item["workerId"] for item in reviews
     }
-    assert len(by_surface_id) == worker_count
+    if missing_parent_surfaces:
+        # The existing finalizer repairs malformed collections and reports a warning.
+        assert coverage["surfaces"] == []
+        assert recovered["warnings"]
+    else:
+        assert len(by_surface_id) == worker_count
     assert coverage["completeness"] == "partial"
     assert all(path.read_bytes() == data for path, data in originals.items())
     published = (scan.scan_dir / "coverage.json").read_bytes()
