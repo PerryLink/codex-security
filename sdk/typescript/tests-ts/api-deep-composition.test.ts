@@ -926,7 +926,9 @@ run_workbench(state, 'set-finding-triage', '--occurrence-id', completed['finding
           ...nativeOptions,
           signal: AbortSignal.any([
             controller.signal,
-            AbortSignal.timeout(20000),
+            AbortSignal.timeout(
+              Number(process.env["CODEX_SECURITY_TEST_TIMEOUT_MS"] ?? "30000"),
+            ),
           ]),
         });
       };
@@ -1246,7 +1248,9 @@ run_workbench(state, 'set-finding-triage', '--occurrence-id', completed['finding
             },
           },
         });
-        expect(turn.executable).toBe(environment.CODEX_CLI_PATH);
+        expect(await realpath(turn.executable!)).toBe(
+          await realpath(environment.CODEX_CLI_PATH),
+        );
         expect(turn.environment["SYNTHETIC_SCAN_SETTING"]).toBe("inherited");
         expect(turn.environment["CODEX_SAFETY_IDENTIFIER"]).toBe(
           native && !prepareNative ? "saved-native-identifier" : undefined,

@@ -1703,9 +1703,18 @@ def preserve_scan_results(db: Any, connection: Any, args: Any) -> dict[str, Any]
         )
         if args.thread_id is not None and args.thread_id != owner:
             raise SystemExit("Saved results can only be published from the owning Codex thread.")
-        db.handoff.require_current_continuation(
-            scan, args.claim_token, error_message="Saved results are owned by another continuation."
-        )
+        # The app can cancel before a continuation has claimed the scan.
+        if not (
+            getattr(args, "after_stop", False)
+            and scan["canceled_at"] is not None
+            and scan["handoff_claim_token"] is None
+            and args.claim_token is None
+        ):
+            db.handoff.require_current_continuation(
+                scan,
+                args.claim_token,
+                error_message="Saved results are owned by another continuation.",
+            )
         if cost_json is not None:
             stored = stored_scan_cost_fields(scan["cost_json"])
             if "usage" in stored:

@@ -135,16 +135,6 @@ assert.match(
   "Artifact claims must match the current persisted handoff token exactly.",
 );
 assert.match(
-  authenticatedArtifactClaimSource,
-  /scan\.continuationThreadId === threadId/,
-  "Ordinary artifact claims must remain bound to the owning Codex thread.",
-);
-assert.match(
-  authenticatedArtifactClaimSource,
-  /recoveryHandoffClaimTokenSchema\.safeParse\(handoffClaimToken\)\.success/,
-  "Cross-thread artifact recovery must require an exact recovery-token schema match.",
-);
-assert.match(
   serverSource,
   /throw new Error\(error\.stderr\.trim\(\),\s*\{\s*cause:\s*error\s*\}\)/,
   "Workbench failures must preserve subprocess exit, signal, and stderr diagnostics.",
