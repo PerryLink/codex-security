@@ -84,7 +84,19 @@ const canonicalScanDraftInputSchema = loadArtifactZodSchema(
       },
       coverage: {
         ...scanDraftDocument.$defs.coverage,
-        properties: coverageDocument.properties,
+        properties: {
+          ...coverageDocument.properties,
+          // String questions are normalized by the finalizer after admission.
+          openQuestions: {
+            ...coverageDocument.properties.openQuestions,
+            items: {
+              anyOf: [
+                scanDraftDocument.$defs.coverage.properties.openQuestions.items.anyOf[0],
+                coverageDocument.properties.openQuestions.items,
+              ],
+            },
+          },
+        },
       },
     },
   }] as SchemaDocument[],

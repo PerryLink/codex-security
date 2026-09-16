@@ -370,9 +370,15 @@ test.each([
   { path: ".", notes: "Checked", accepted: false },
   { path: "src/extract.py", notes: "", accepted: false },
   { path: "src/extract.py", notes: 17, accepted: false },
+  {
+    path: "src/extract.py",
+    notes: "Checked",
+    questions: [17],
+    accepted: false,
+  },
 ])(
   "canonical fields retain their rules: %j",
-  async ({ path, notes, accepted }) => {
+  async ({ path, notes, questions, accepted }) => {
     const root = await temporaryDirectory();
     const repository = join(root, "repository");
     await mkdir(repository);
@@ -403,6 +409,10 @@ test.each([
     ];
     coverage.surfaces[0].notes = notes;
     coverage.surfaces[0].riskArea = " ";
+    coverage.openQuestions = questions ?? [
+      "What deployment controls apply?",
+      { question: "Which controls apply?", followUpPrompt: " " },
+    ];
     await Promise.all([
       writeFile(join(scanDir, "scan-manifest.json"), JSON.stringify(manifest)),
       writeFile(join(scanDir, "findings.json"), JSON.stringify(findings)),
@@ -419,6 +429,7 @@ test.each([
       const draft = parseCanonicalScanDraft(canonical);
       expect(draft.findings[0].locations[0].path).toBe(path);
       expect(draft.coverage.surfaces[0].notes).toBe(notes);
+      expect(draft.coverage.openQuestions).toEqual(coverage.openQuestions);
       expect(draft.scope.context).toBe(" ");
       expect(draft.threatModel.assumptions).toEqual([" "]);
       expect(standard.error).toBe(standard.finalization);
@@ -432,6 +443,7 @@ test.each([
       live.findings[0].codeEvidence[0].path = "src/extract.py";
       live.coverage.surfaces[0].notes = "Checked";
       delete live.coverage.surfaces[0].riskArea;
+      live.coverage.openQuestions[1].followUpPrompt = "Describe controls.";
       expect(() => parseScanDraft({ ...live, scanId })).not.toThrow();
       const unsafeEvidence = structuredClone(canonical);
       unsafeEvidence.findings.findings[0].codeEvidence[0].path =

@@ -101,6 +101,9 @@ const client = new CodexSecurity(
                         finding.locations[0].role = " ";
                       }
                       if (name === "coverage.json") {
+                        document.openQuestions = [
+                          "What deployment controls apply?",
+                        ];
                         document.surfaces = ["HTTP API", "ArchiveSurface"].map(
                           (id) => ({
                             ...document.surfaces[0],
@@ -165,6 +168,9 @@ try {
   assert.equal(result.findings.findings[0].locations[0].role, " ");
   assert.equal(result.coverage.surfaces[0].notes, " ");
   assert.equal(result.coverage.surfaces[0].riskArea, " ");
+  assert.deepEqual(result.coverage.openQuestions, [
+    { question: "What deployment controls apply?" },
+  ]);
   assert.equal(result.manifest.scan.scope.context, " ");
   assert.deepEqual(result.manifest.scan.threatModel.assumptions, [" "]);
   const saved = await runWorkbench(
