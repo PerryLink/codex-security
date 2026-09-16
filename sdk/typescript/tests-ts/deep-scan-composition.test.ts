@@ -635,6 +635,75 @@ describe("ordinary scan composition", () => {
     },
   );
 
+  test.each([
+    [0, "every discovery run failed"],
+    [2, "consecutive error limit"],
+    [2, "expired deadline"],
+  ] as const)(
+    "resumes a persisted child failure after %i prior errors (%s)",
+    async (priorErrors, message) => {
+      const h = await harness({ maxDiscoveryRuns: 1 });
+      const scanId = randomUUID();
+      const pass = { directory: "artifacts/deep-scan/passes/pass-1", scanId };
+      h.records.set(scanId, {
+        scanId,
+        scanDir: join(h.input.scanDir, pass.directory),
+        parentScanId: h.input.scanId,
+        targetPath: h.input.repository,
+        progress: { status: "failed" },
+      });
+      await h.seed({
+        version: 2,
+        startedAt:
+          message === "expired deadline"
+            ? new Date(Date.parse(h.input.startedAt) - 3_600_001).toISOString()
+            : h.input.startedAt,
+        passes: [pass],
+        mergedScanIds: [],
+        aggregate: null,
+        noNewStreak: 0,
+        consecutiveErrors: priorErrors,
+      });
+      if (message === "expired deadline") {
+        await runDeepScans(h.input);
+        expect(await h.checkpoint()).toMatchObject({
+          terminalReason: "capped",
+          consecutiveErrors: priorErrors,
+          passes: [pass],
+        });
+        expect(h.calls).toEqual([]);
+        return;
+      }
+      const workbench = h.input.workbench;
+      h.input.workbench = async (args, input) => {
+        const result = await workbench(args, input);
+        if (
+          args[0] === "save-scan-artifact" &&
+          JSON.parse(input!).passes[0]?.failed
+        )
+          throw new ScanTransportClosedError("Transport closed.");
+        return result;
+      };
+      await expect(runDeepScans(h.input)).rejects.toBeInstanceOf(
+        ScanTransportClosedError,
+      );
+      expect((await h.checkpoint()).terminalReason).toBeUndefined();
+      h.input.workbench = workbench;
+
+      await expect(runDeepScans(h.input)).rejects.toThrow(message);
+      expect(await h.checkpoint()).toMatchObject({
+        passes: [{ ...pass, failed: true }],
+        consecutiveErrors: priorErrors + 1,
+        noNewStreak: 0,
+        mergedScanIds: [],
+        terminalReason: "failed",
+      });
+      expect(h.calls).toEqual([]);
+      expect(h.mergeInputs).toEqual([]);
+      expect(h.published).toEqual([]);
+    },
+  );
+
   test("keeps the consecutive error limit when a sibling finishes after it", async () => {
     retryDelay = spyOn(timers, "setTimeout").mockImplementation(
       async <T>(_delay?: number, value?: T): Promise<T> => value as T,
@@ -832,6 +901,7 @@ describe("ordinary scan composition", () => {
           throw failure;
         }
         secondStarted();
+        options.signal!.throwIfAborted();
         return await new Promise<ScanResult>((_resolve, reject) => {
           options.signal!.addEventListener(
             "abort",

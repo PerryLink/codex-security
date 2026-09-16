@@ -35,6 +35,7 @@ import {
   ScanCostTrackingError,
 } from "../src/deep-scan.js";
 import { ScanTransportClosedError } from "../src/scan-execution.js";
+import { ScanCostLimitExceededError } from "../src/errors.js";
 import type { ScanProgress } from "../src/worker-progress.js";
 import { readSavedScanLogs, type ScanLogSource } from "../src/scan-logs.js";
 import { PLUGIN_ROOT } from "./plugin-root.js";
@@ -104,6 +105,7 @@ test.each([
   { workers: 1, budget: false, provider: undefined },
   { workers: 2, budget: false, provider: undefined },
   { workers: 1, budget: true, provider: undefined },
+  { workers: 1, budget: true, firstChildBudget: true },
   { workers: 1, budget: false, provider: { env_key: "OPENAI_API_KEY" } },
   {
     workers: 1,
@@ -117,6 +119,13 @@ test.each([
   { workers: 1, budget: false, artifactFailure: "directory" },
   { workers: 1, budget: false, artifactFailure: "draft" },
   { workers: 1, budget: false, artifactFailure: "checkpoint" },
+  { workers: 1, budget: false, cleanupFailure: true },
+  {
+    workers: 1,
+    budget: false,
+    artifactFailure: "publication",
+    cleanupFailure: true,
+  },
   { workers: 1, budget: false, logFailure: true },
   { workers: 1, budget: false, usage: "missing-merge" },
   { workers: 1, budget: false, native: "sealed", usage: "missing-merge" },
@@ -128,8 +137,10 @@ test.each([
 ] as {
   workers: number;
   budget: boolean;
+  firstChildBudget?: boolean;
   trackingFailure?: boolean;
-  artifactFailure?: "directory" | "draft" | "checkpoint";
+  artifactFailure?: "directory" | "draft" | "checkpoint" | "publication";
+  cleanupFailure?: boolean;
   provider?: JsonObject;
   native?: "feedback" | "discovery" | "sealed";
   usage?: "missing-merge" | "missing-child" | "unreported-cache";
@@ -140,10 +151,12 @@ test.each([
   async ({
     workers,
     budget,
+    firstChildBudget,
     provider,
     native,
     trackingFailure,
     artifactFailure,
+    cleanupFailure,
     usage,
     requiredCost,
     logFailure,
@@ -163,6 +176,19 @@ test.each([
         writeFile(join(repo, name), "print('public synthetic fixture')\n"),
       ),
     );
+    const childFindings: JsonObject[] = firstChildBudget
+      ? JSON.parse(
+          await readFile(
+            join(pluginRoot, "examples/completed-scan/findings.json"),
+            "utf8",
+          ),
+        ).findings.slice(0, 1)
+      : [];
+    for (const finding of childFindings) {
+      for (const field of ["findingId", "occurrenceId", "fingerprints"])
+        delete finding[field];
+      finding["locations"] = [{ path: "app.py", startLine: 1, endLine: 1 }];
+    }
     const version = JSON.parse(
       await readFile(join(pluginRoot, ".codex-plugin/plugin.json"), "utf8"),
     ).version;
@@ -295,6 +321,7 @@ run_workbench(state, 'set-finding-triage', '--occurrence-id', completed['finding
     const finishedFollowUps: string[] = [];
     const warnings: string[] = [];
     let childTurns = 0;
+    let mergeAttempts = 0;
     let threadCount = 0;
     const progressRuns: ScanProgress[][] = [];
     let progress: ScanProgress[];
@@ -421,6 +448,11 @@ run_workbench(state, 'set-finding-triage', '--occurrence-id', completed['finding
                   throw new Error("Synthetic session index write failure.");
                 await writer.restore(path, contents);
               },
+              async remove(path) {
+                if (cleanupFailure && path.endsWith(".checkpoint.json"))
+                  throw new Error("Synthetic staging cleanup failure.");
+                await writer.remove(path);
+              },
             };
           },
           runWorkbench: async (options, args, input) => {
@@ -429,6 +461,11 @@ run_workbench(state, 'set-finding-triage', '--occurrence-id', completed['finding
               args[0] === "save-scan-artifact"
             )
               throw new Error("Synthetic checkpoint write failure.");
+            if (
+              artifactFailure === "publication" &&
+              args[0] === "write-scan-draft"
+            )
+              throw new Error("Synthetic publication write failure.");
             const result = await runWorkbench(options, args, input);
             const id = args.includes("--scan-id")
               ? args[args.indexOf("--scan-id") + 1]
@@ -508,6 +545,7 @@ run_workbench(state, 'set-finding-triage', '--occurrence-id', completed['finding
                     mode === "deep" &&
                     prompt !== "Post-scan instructions once."
                   ) {
+                    mergeAttempts += 1;
                     const mergePath = join(
                       record["scanDir"] as string,
                       "artifacts/deep-scan/merge-inputs.json",
@@ -770,7 +808,7 @@ run_workbench(state, 'set-finding-triage', '--occurrence-id', completed['finding
                       }
                       const draft = {
                         scanId: id,
-                        findings: [],
+                        findings: childFindings,
                         coverage: {
                           completeness: "complete",
                           surfaces: [],
@@ -836,7 +874,7 @@ run_workbench(state, 'set-finding-triage', '--occurrence-id', completed['finding
                               input_tokens:
                                 budget &&
                                 mode === "standard" &&
-                                childTurns === 2
+                                childTurns === (firstChildBudget ? 1 : 2)
                                   ? 100000
                                   : 10,
                               cached_input_tokens: 0,
@@ -948,10 +986,47 @@ run_workbench(state, 'set-finding-triage', '--occurrence-id', completed['finding
           expect(scan.continuationThreadId).not.toBe(id);
         }
       };
+      if (firstChildBudget) {
+        await expect(run()).rejects.toBeInstanceOf(ScanCostLimitExceededError);
+        expect(mergeAttempts).toBe(0);
+        expect(turns.map((turn) => turn.mode)).toEqual(["standard"]);
+        expect(registrations.size).toBe(2);
+        const parent = [...registrations.values()].find(
+          ({ mode }) => mode === "deep",
+        )!;
+        const saved = await runWorkbench(commandOptions, [
+          "get-scan",
+          "--scan-id",
+          parent["scanId"] as string,
+        ]);
+        expect(saved["scan"]).toMatchObject({ progress: { status: "failed" } });
+        expect(
+          JSON.parse(
+            await readFile(join(scanDir, DEEP_SCAN_CHECKPOINT), "utf8"),
+          ),
+        ).toMatchObject({
+          terminalReason: "capped",
+          aggregate: null,
+          mergedScanIds: [],
+        });
+        const findings = JSON.parse(
+          await readFile(join(scanDir, "findings.json"), "utf8"),
+        ).findings;
+        expect(findings).toHaveLength(1);
+        expect(findings[0]).toMatchObject(childFindings[0]!);
+        expect(
+          JSON.parse(await readFile(join(scanDir, "coverage.json"), "utf8")),
+        ).toMatchObject({ completeness: "partial" });
+        return;
+      }
       if (artifactFailure) {
         await expect(run()).rejects.toThrow(
           `Synthetic ${artifactFailure} write failure.`,
         );
+        if (cleanupFailure)
+          expect(warnings).toContain(
+            "Could not clean up after the Codex Security scan: Synthetic staging cleanup failure.",
+          );
         if (artifactFailure === "directory")
           expect([threadCount, turns.length]).toEqual([0, 0]);
         expect(
@@ -1130,6 +1205,10 @@ run_workbench(state, 'set-finding-triage', '--occurrence-id', completed['finding
         }
       }
       const result = await run();
+      if (cleanupFailure)
+        expect(warnings).toContain(
+          "Could not clean up after the Codex Security scan: Synthetic staging cleanup failure.",
+        );
       if (usage) {
         const saved = await runWorkbench(commandOptions, [
           "get-scan",

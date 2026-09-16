@@ -167,7 +167,7 @@ export async function runDeepScans(
         scanDir,
       );
   };
-  const refreshPasses = async (): Promise<void> => {
+  const refreshPasses = async (recoverFailures = false): Promise<void> => {
     const listed = await workbench([
       "list-scans",
       "--scan-root",
@@ -190,6 +190,14 @@ export async function runDeepScans(
         throw new Error("Saved scan pass registration changed.");
       }
       pass.scanId = record.scanId;
+      if (
+        recoverFailures &&
+        record.progress.status === "failed" &&
+        !pass.failed
+      ) {
+        pass.failed = true;
+        state.consecutiveErrors += 1;
+      }
       saved.set(record.scanId, record);
       if (record.progress.status === "complete")
         reportCompletedCost(pass.directory, record.cost ?? null);
@@ -216,14 +224,16 @@ export async function runDeepScans(
     }
     await save();
   };
-  await refreshPasses();
+  const deadline =
+    Date.parse(state.startedAt) + settings.maxTimeHours * 3_600_000;
+  await refreshPasses(
+    state.terminalReason === undefined && Date.now() < deadline,
+  );
   if (state.mergedScanIds.some((id) => !accepted.has(id))) {
     throw new Error(
       "An accepted merge input is no longer a sealed child scan.",
     );
   }
-  const deadline =
-    Date.parse(state.startedAt) + settings.maxTimeHours * 3_600_000;
   const deadlineController = new AbortController();
   let deadlineTimer: ReturnType<typeof setTimeout> | undefined;
   const tick = (): void => {

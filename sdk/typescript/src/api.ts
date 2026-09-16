@@ -2589,7 +2589,13 @@ export class CodexSecurity {
                     ]);
                   } finally {
                     await Promise.all(
-                      staged.map((path) => artifactWriter!.remove(path)),
+                      staged.map(async (path) => {
+                        try {
+                          await artifactWriter!.remove(path);
+                        } catch (error) {
+                          warnCleanupFailed(options, error);
+                        }
+                      }),
                     );
                   }
                 },

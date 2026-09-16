@@ -730,6 +730,8 @@ async function assertDeepScanRetainsStartupFailureAndTerminalState() {
   const fixtureTarget = path.join(fixtureRoot, "repository");
   const fixtureState = path.join(fixtureRoot, "state");
   const fixtureScanRoot = path.join(fixtureRoot, "scans");
+  const fixtureCodexHome = path.join(fixtureRoot, "codex-home");
+  await mkdir(fixtureCodexHome);
   await mkdir(path.join(fixtureTarget, "app"), { recursive: true });
   await writeFile(path.join(fixtureTarget, "app", "routes.py"), "route = 1\n");
 
@@ -737,6 +739,7 @@ async function assertDeepScanRetainsStartupFailureAndTerminalState() {
     cwd: pluginRoot,
     env: {
       CODEX_CLI_PATH: path.join(fixtureRoot, "missing-deep-scan-codex"),
+      CODEX_HOME: fixtureCodexHome,
       CODEX_SECURITY_SCAN_ROOT: fixtureScanRoot,
       CODEX_SECURITY_STATE_DIR: fixtureState,
     },
