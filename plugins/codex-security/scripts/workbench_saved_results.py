@@ -644,7 +644,10 @@ def merge_saved_results(
         and isinstance(review.get("attempt"), int)
     }
 
-    def coverage_receipts(item: dict[str, Any], worker: Any, relative: str) -> list[str]:
+    def coverage_receipts(item: dict[str, Any], worker: Any, relative: str) -> Any:
+        refs = item.get("receiptRefs", [])
+        if not isinstance(refs, list):
+            return refs
         directory = Path(relative).parent
         if directory.name == "checkpoints":
             directory = directory.parent
@@ -652,8 +655,10 @@ def merge_saved_results(
         worker_root = output.parent if output.name == "output" else output
         archive_prefix = (worker_root / "attempts").as_posix() + "/"
         return [
-            ref if ref.startswith(archive_prefix) else f"{directory.as_posix()}/{ref}"
-            for ref in item.get("receiptRefs", [])
+            f"{directory.as_posix()}/{ref}"
+            if isinstance(ref, str) and not ref.startswith(archive_prefix)
+            else ref
+            for ref in refs
         ]
 
     def coverage_record_retained(field: str, item: Any, worker: Any, relative: str) -> bool:
@@ -680,15 +685,18 @@ def merge_saved_results(
                     original["id"] = provenance["sourceId"]
                 if "candidateId" in provenance:
                     original["candidateId"] = provenance["candidateId"]
-                if field == "deferred" and "surfaceIds" in original:
+                if field == "deferred" and isinstance(original.get("surfaceIds"), list):
                     surfaces = projection.get("surfaces", [])
                     surface_ids = {
                         surface.get("id"): surface["provenance"].get("sourceId")
                         for surface in (surfaces if isinstance(surfaces, list) else [])
-                        if isinstance(surface, dict) and isinstance(surface.get("provenance"), dict)
+                        if isinstance(surface, dict)
+                        and isinstance(surface.get("id"), str)
+                        and isinstance(surface.get("provenance"), dict)
                     }
                     original["surfaceIds"] = [
-                        surface_ids.get(value, value) for value in original["surfaceIds"]
+                        surface_ids.get(value, value) if isinstance(value, str) else value
+                        for value in original["surfaceIds"]
                     ]
                 if original == source:
                     return True
@@ -710,15 +718,19 @@ def merge_saved_results(
             result["id"] = f"{prefix}-deferred-{index}"
             if "candidateId" in item:
                 result["candidateId"] = f"{prefix}-candidate-{index}"
-            if "surfaceIds" in item:
+            if isinstance(item.get("surfaceIds"), list):
+                surfaces = source.get("surfaces", [])
                 surface_ids = {
                     surface["id"]: f"{prefix}-surface-{offset}"
-                    for offset, surface in enumerate(source.get("surfaces", []), 1)
+                    for offset, surface in enumerate(
+                        surfaces if isinstance(surfaces, list) else [], 1
+                    )
+                    if isinstance(surface, dict) and isinstance(surface.get("id"), str)
                 }
                 for projection in projected_coverages:
                     surfaces = projection.get("surfaces", [])
                     for surface in surfaces if isinstance(surfaces, list) else []:
-                        if not isinstance(surface, dict):
+                        if not isinstance(surface, dict) or not isinstance(surface.get("id"), str):
                             continue
                         provenance = surface.get("provenance", {})
                         if (
@@ -729,7 +741,8 @@ def merge_saved_results(
                         ):
                             surface_ids[provenance["sourceId"]] = surface["id"]
                 result["surfaceIds"] = [
-                    surface_ids.get(value, value) for value in item["surfaceIds"]
+                    surface_ids.get(value, value) if isinstance(value, str) else value
+                    for value in item["surfaceIds"]
                 ]
         return result
 

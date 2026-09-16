@@ -11,6 +11,7 @@ from test_deep_scan_successful_publication import publication_scan as publicatio
 @pytest.mark.parametrize("worker_count", [1, 2])
 @pytest.mark.parametrize("missing_parent_surfaces", [False, True])
 @pytest.mark.parametrize("retained_deferred", [False, True])
+@pytest.mark.parametrize("idless_surface", [False, True])
 def test_missing_projection_keeps_surface_links_and_independent_reviews(
     workbench_api,
     workbench_db,
@@ -18,6 +19,7 @@ def test_missing_projection_keeps_surface_links_and_independent_reviews(
     worker_count,
     missing_parent_surfaces,
     retained_deferred,
+    idless_surface,
 ):
     scan = publication_scan()
     surface = {
@@ -32,15 +34,28 @@ def test_missing_projection_keeps_surface_links_and_independent_reviews(
         "candidateId": "pending-candidate",
         "surfaceIds": [surface["id"]],
     }
+    worker_surfaces = (
+        [{"label": "Background review", "disposition": "reviewed", "receiptRefs": []}]
+        if idless_surface
+        else []
+    ) + [surface]
     reviews, surfaces, deferred_records, originals = [], [], [], {}
     for _ in range(worker_count):
         result = add_worker(workbench_db, scan)
         worker_id = result.parent.name
         reviews.append({"workerId": worker_id, "attempt": 1, "completeness": "partial"})
+        if idless_surface:
+            surfaces.append(
+                {
+                    **worker_surfaces[0],
+                    "id": f"{worker_id}-attempt-1-surface-1",
+                    "provenance": {"workerId": worker_id, "attempt": 1},
+                }
+            )
         surfaces.append(
             {
                 **surface,
-                "id": f"{worker_id}-attempt-1-surface-1",
+                "id": f"{worker_id}-attempt-1-surface-{len(worker_surfaces)}",
                 "provenance": {"workerId": worker_id, "attempt": 1, "sourceId": surface["id"]},
             }
         )
@@ -67,7 +82,7 @@ def test_missing_projection_keeps_surface_links_and_independent_reviews(
                     "coverage": {
                         **scan.coverage,
                         "completeness": "partial",
-                        "surfaces": [surface],
+                        "surfaces": worker_surfaces,
                         "deferred": [deferred],
                     },
                 }
@@ -120,7 +135,7 @@ def test_missing_projection_keeps_surface_links_and_independent_reviews(
         assert coverage["surfaces"] == []
         assert recovered["warnings"]
     else:
-        assert len(by_surface_id) == worker_count
+        assert len(by_surface_id) == worker_count * len(worker_surfaces)
     assert coverage["completeness"] == "partial"
     assert all(path.read_bytes() == data for path, data in originals.items())
     published = (scan.scan_dir / "coverage.json").read_bytes()
