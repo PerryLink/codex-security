@@ -22,6 +22,7 @@ import { build } from "esbuild";
 import { CodexSecurity, type ScanOptions } from "../src/api.js";
 import type { JsonObject } from "../src/config.js";
 import type { ScanSessionEvent } from "../src/cost.js";
+import type { ScanCost } from "../src/cost-model.js";
 import type { ScanActivity } from "../src/scan-activity.js";
 import {
   prepareScanArtifactRestorer,
@@ -114,6 +115,9 @@ test.each([
   { workers: 1, budget: false, trackingFailure: true },
   { workers: 1, budget: false, artifactFailure: "directory" },
   { workers: 1, budget: false, artifactFailure: "draft" },
+  { workers: 1, budget: false, usage: "missing-merge" },
+  { workers: 1, budget: false, native: "sealed", usage: "missing-merge" },
+  { workers: 1, budget: false, usage: "unreported-cache" },
 ] as {
   workers: number;
   budget: boolean;
@@ -121,6 +125,7 @@ test.each([
   artifactFailure?: "directory" | "draft";
   provider?: JsonObject;
   native?: "feedback" | "discovery" | "sealed";
+  usage?: "missing-merge" | "unreported-cache";
 }[])(
   "Deep composes sealed ordinary scans and preserves a budgeted parent: %j",
   async ({
@@ -130,6 +135,7 @@ test.each([
     native,
     trackingFailure,
     artifactFailure,
+    usage,
   }) => {
     const python = Bun.which("python3") ?? Bun.which("python");
     if (python === null) throw new Error("Python is required for this test.");
@@ -272,6 +278,7 @@ run_workbench(state, 'set-finding-triage', '--occurrence-id', completed['finding
     let savedExecutionThread: string | undefined;
     let sealedArtifacts: Map<string, Buffer<ArrayBuffer>> | undefined;
     const registrations = new Map<string, JsonObject>();
+    const costs: ScanCost[] = [];
     let childTurns = 0;
     let threadCount = 0;
     const progressRuns: ScanProgress[][] = [];
@@ -769,17 +776,25 @@ run_workbench(state, 'set-finding-triage', '--occurrence-id', completed['finding
                     };
                     yield {
                       type: "turn.completed",
-                      usage: {
-                        input_tokens:
-                          budget && mode === "standard" && childTurns === 2
-                            ? 100000
-                            : 10,
-                        cached_input_tokens: 0,
-                        output_tokens: 3,
-                        cache_write_input_tokens: 0,
-                        reasoning_output_tokens: 0,
-                      },
-                    };
+                      usage:
+                        usage === "missing-merge" && mode === "deep"
+                          ? null
+                          : {
+                              input_tokens:
+                                budget &&
+                                mode === "standard" &&
+                                childTurns === 2
+                                  ? 100000
+                                  : 10,
+                              cached_input_tokens: 0,
+                              output_tokens: 3,
+                              cache_write_input_tokens: 0,
+                              ...(usage === "unreported-cache"
+                                ? { cache_write_input_tokens_reported: false }
+                                : {}),
+                              reasoning_output_tokens: 0,
+                            },
+                    } as ThreadEvent;
                   }
                   return { events: events() };
                 },
@@ -838,6 +853,7 @@ run_workbench(state, 'set-finding-triage', '--occurrence-id', completed['finding
         onProgress: (update) => progress.push(update),
         onActivity: (activity) => workerRun.activities.push(activity),
         onSessionEvent: (event) => workerRun.sessions.push(event),
+        onCost: (cost) => costs.push(cost),
         onWarning: (message) => {
           if (trackingFailure && message.startsWith("Deep Scan pass "))
             controller.abort(
@@ -1015,6 +1031,25 @@ run_workbench(state, 'set-finding-triage', '--occurrence-id', completed['finding
         }
       }
       const result = await run();
+      if (usage) {
+        const saved = await runWorkbench(commandOptions, [
+          "get-scan",
+          "--scan-id",
+          result.manifest.scan.id,
+        ]);
+        const scan = saved["scan"] as JsonObject;
+        expect(scan["progress"]).toMatchObject({ status: "complete" });
+        expect(costs.at(-1)!.estimatedUsd).toBeGreaterThan(0);
+        if (usage === "missing-merge") {
+          expect(result.cost).toBeNull();
+          expect(scan["cost"]).toBeUndefined();
+          expect(scan["usage"]).toMatchObject({ coverage: "unavailable" });
+        } else {
+          expect(result.cost).toEqual(costs.at(-1)!);
+          expect(result.cost!.cacheWriteInputTokensReported).toBe(false);
+          expect(result.cost).toEqual(scan["cost"] as unknown as ScanCost);
+        }
+      }
       for (const observed of workerRuns) {
         const labels = new Map<string, number>();
         for (const event of observed.sessions) {

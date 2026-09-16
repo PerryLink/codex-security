@@ -9,16 +9,12 @@ import {
   type TurnOptions,
 } from "@openai/codex-sdk";
 import { parse as parseToml } from "smol-toml";
-import {
-  deepMerge,
-  inlineToml,
-  type JsonObject,
-} from "../../../../sdk/typescript/src/config.js";
-import { ScanPermissionError } from "../../../../sdk/typescript/src/scan-execution.js";
-import { MCP_APP_VERSION } from "./version.js";
+import { deepMerge, inlineToml, type JsonObject } from "./config.js";
+import { ScanPermissionError } from "./scan-execution.js";
+import { VERSION } from "./version.js";
 
-/** Verify native managed permissions before each fresh or resumed worker turn. */
-export function createNativeCodex({
+/** Verify managed permissions before each fresh or resumed Deep Scan worker turn. */
+export function createPermissionCheckedCodex({
   config,
   configOverrides,
   ...options
@@ -31,8 +27,8 @@ export function createNativeCodex({
     ...(configOverrides ?? []),
   ];
   const environment = { ...options.env };
-  environment.CODEX_INTERNAL_ORIGINATOR_OVERRIDE ||= "codex_sdk_ts";
-  if (options.apiKey) environment.CODEX_API_KEY = options.apiKey;
+  environment["CODEX_INTERNAL_ORIGINATOR_OVERRIDE"] ||= "codex_sdk_ts";
+  if (options.apiKey) environment["CODEX_API_KEY"] = options.apiKey;
   const codex = new Codex({
     ...options,
     env: environment,
@@ -86,10 +82,10 @@ export function createNativeCodex({
           deepMerge(result, parseToml(override) as JsonObject),
         {} as JsonObject,
       );
-      const profileId = effectiveConfig.default_permissions;
+      const profileId = effectiveConfig["default_permissions"];
       const expectedProfile =
         typeof profileId === "string"
-          ? record(record(effectiveConfig.permissions)?.[profileId])
+          ? record(record(effectiveConfig["permissions"])?.[profileId])
           : undefined;
       if (
         typeof profileId !== "string" ||
@@ -97,7 +93,7 @@ export function createNativeCodex({
         !options.codexPathOverride
       ) {
         throw new ScanPermissionError(
-          "Native scan permissions could not be verified.",
+          "Scan permissions could not be verified.",
         );
       }
       await verifyPermissionProfile({
@@ -124,7 +120,7 @@ export function createNativeCodex({
                   : undefined;
             if (isPermissionFallback(message, profileId)) {
               const error = new ScanPermissionError(
-                `Codex rejected the required ${profileId} permission profile. The native scan was stopped.`,
+                `Codex rejected the required ${profileId} permission profile. The scan was stopped.`,
               );
               controller.abort(error);
               throw error;
@@ -191,22 +187,23 @@ async function verifyPermissionProfile(options: {
       const message = record(JSON.parse(line.value));
       if (!message)
         throw new Error("Invalid Codex permission preflight response.");
-      if (message.id === undefined || message.method !== undefined) continue;
+      if (message["id"] === undefined || message["method"] !== undefined)
+        continue;
       if (
-        message.id !== id ||
-        message.error !== undefined ||
-        !record(message.result)
+        message["id"] !== id ||
+        message["error"] !== undefined ||
+        !record(message["result"])
       ) {
         throw new Error(`Codex permission preflight failed for ${method}.`);
       }
-      return message.result as Record<string, unknown>;
+      return message["result"] as Record<string, unknown>;
     }
   };
   try {
     await request("initialize", {
       clientInfo: {
         name: "codex_security_deep_scan",
-        version: MCP_APP_VERSION,
+        version: VERSION,
       },
       capabilities: { experimentalApi: true },
     });
@@ -225,32 +222,32 @@ async function verifyPermissionProfile(options: {
         cwd: options.cwd,
         ...(cursor === undefined ? {} : { cursor }),
       });
-      if (!Array.isArray(catalog.data))
+      if (!Array.isArray(catalog["data"]))
         throw new Error("Invalid Codex permission profile catalog.");
-      for (const value of catalog.data) {
+      for (const value of catalog["data"]) {
         const entry = record(value);
-        if (entry?.id !== options.profileId) continue;
+        if (entry?.["id"] !== options.profileId) continue;
         if (selected) throw new Error("Duplicate Codex permission profile.");
         selected = entry;
       }
-      if (catalog.nextCursor === null) break;
+      if (catalog["nextCursor"] === null) break;
       if (
-        typeof catalog.nextCursor !== "string" ||
-        !catalog.nextCursor ||
-        cursors.has(catalog.nextCursor)
+        typeof catalog["nextCursor"] !== "string" ||
+        !catalog["nextCursor"] ||
+        cursors.has(catalog["nextCursor"])
       ) {
         throw new Error("Invalid Codex permission profile cursor.");
       }
-      cursor = catalog.nextCursor;
+      cursor = catalog["nextCursor"];
       cursors.add(cursor);
     } while (true);
-    const actual = record(configResponse.config);
+    const actual = record(configResponse["config"]);
     const actualProfile = record(
-      record(actual?.permissions)?.[options.profileId],
+      record(actual?.["permissions"])?.[options.profileId],
     );
     if (
-      selected?.allowed !== true ||
-      actual?.default_permissions !== options.profileId ||
+      selected?.["allowed"] !== true ||
+      actual?.["default_permissions"] !== options.profileId ||
       !actualProfile ||
       !isDeepStrictEqual(
         comparableProfile(actualProfile),
@@ -258,16 +255,15 @@ async function verifyPermissionProfile(options: {
       )
     ) {
       throw new ScanPermissionError(
-        `Codex did not accept the required ${options.profileId} permission profile. The native scan did not start.`,
+        `Codex did not accept the required ${options.profileId} permission profile. The scan did not start.`,
       );
     }
   } catch (error) {
     options.signal.throwIfAborted();
     if (error instanceof ScanPermissionError) throw error;
-    throw new ScanPermissionError(
-      "Native scan permissions could not be verified.",
-      { cause: error },
-    );
+    throw new ScanPermissionError("Scan permissions could not be verified.", {
+      cause: error,
+    });
   } finally {
     lines.close();
     child.kill();

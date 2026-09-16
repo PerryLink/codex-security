@@ -133,6 +133,7 @@ import {
   type PreparedKnowledgeBase,
 } from "./knowledge-base.js";
 import { FindingWorkflow, workflowDigest } from "./finding-workflow.js";
+import { createPermissionCheckedCodex } from "./permission-profile.js";
 import {
   ScanResult,
   type RepositoryFinding,
@@ -468,7 +469,7 @@ interface CodexSecurityRuntimeOptions {
 interface ClientDependencies {
   inheritedPermissions?: ScanPermissions;
   workerNumber?: (threadId: string) => number;
-  createCodex(options: CodexOptions): CodexClientLike;
+  createCodex?(options: CodexOptions): CodexClientLike;
   environment: ProcessEnvironment;
   prepareRuntime?: (
     config: Readonly<CodexSecurityConfig>,
@@ -486,7 +487,6 @@ interface ClientDependencies {
 }
 
 const DEFAULT_DEPENDENCIES: ClientDependencies = {
-  createCodex: (options) => new Codex(options),
   environment: process.env,
 };
 
@@ -1929,6 +1929,8 @@ export class CodexSecurity {
         }
         completionCost ??=
           (savedScan["cost"] as unknown as ScanCost | undefined) ?? null;
+        if (typeof resumeThreadId !== "string" && checkpoint?.legacy?.cost)
+          completionCost ??= combinedCost(null);
       } else {
         activeScan = { id: scanId, options: workbenchOptions };
       }
@@ -2121,6 +2123,9 @@ export class CodexSecurity {
         session,
         runtimePaths,
         options.auth,
+        undefined,
+        [],
+        mode === "deep" || options.deepScanPass === true,
       );
       const threadOptions: ThreadOptions = {
         threadSource: CODEX_SECURITY_THREAD_SOURCES.scan,
@@ -2167,7 +2172,10 @@ export class CodexSecurity {
                   .runStreamed(postScanPrompt, { signal })
             : () => thread.runStreamed(postScanPrompt, { signal });
       }
-      const finalize = async (usage: unknown): Promise<unknown> => {
+      const finalize = async (
+        usage: unknown,
+        savedCost: ScanCost | null = null,
+      ): Promise<unknown> => {
         if (options.validationPrompt !== undefined) {
           tracker.recordUsage(usage);
           await tracker.refresh().catch(reportTrackingError);
@@ -2237,7 +2245,9 @@ export class CodexSecurity {
           );
         }
         completionCost =
-          mode === "deep" ? combinedCost(snapshot.cost) : snapshot.cost;
+          mode === "deep" && snapshot.cost !== null
+            ? combinedCost(snapshot.cost)
+            : (snapshot.cost ?? savedCost);
         if (mode === "deep" && scopeFileCount !== null)
           reportProgress({
             phase: "reporting",
@@ -2293,7 +2303,8 @@ export class CodexSecurity {
         ? await (async () => {
             budgetAbortController.abort();
             const snapshot = await stopTracking(tracker);
-            const measuredCost = combinedCost(snapshot.cost);
+            const measuredCost =
+              snapshot.cost === null ? null : combinedCost(snapshot.cost);
             if (
               measuredCost &&
               (!completionCost ||
@@ -2507,7 +2518,12 @@ export class CodexSecurity {
               if (budgetRecovery !== null)
                 budgetRecovery.threadId ??=
                   checkpoint.legacy?.originThreadId ?? null;
-              const usage = await finalize(undefined);
+              const usage = await finalize(
+                undefined,
+                thread.id === null && checkpoint.legacy?.cost
+                  ? combinedCost(null)
+                  : null,
+              );
               const resultThreadId =
                 thread.id ?? checkpoint.legacy?.originThreadId;
               if (resultThreadId === undefined)
@@ -2906,13 +2922,18 @@ export class CodexSecurity {
         } catch {}
       }
       const transportClosed = signal.reason instanceof ScanTransportClosedError;
+      const preservedCost =
+        options.mode === "deep"
+          ? (completionCost ??
+            (tracked?.cost ? combinedCost(tracked.cost) : null))
+          : snapshot?.cost;
       if (activeScan !== null && (options.deepScanPass || transportClosed)) {
         await workbench({ ...activeScan.options, signal: undefined }, [
           "preserve-scan-results",
           "--scan-id",
           activeScan.id,
-          ...(snapshot?.cost
-            ? ["--cost-json", JSON.stringify(snapshot.cost)]
+          ...(preservedCost
+            ? ["--cost-json", JSON.stringify(preservedCost)]
             : []),
         ]).catch(() => undefined);
       }
@@ -2936,8 +2957,8 @@ export class CodexSecurity {
             // Scan history can be shared; never persist credential-bearing failures.
             "--message",
             safeErrorMessage(failure).slice(0, 2400),
-            ...(snapshot?.cost
-              ? ["--cost-json", JSON.stringify(snapshot.cost)]
+            ...(preservedCost
+              ? ["--cost-json", JSON.stringify(preservedCost)]
               : []),
           ]);
         } catch {}
@@ -3220,6 +3241,7 @@ export class CodexSecurity {
     auth: ScanAuthMode = "auto",
     config?: JsonObject,
     configOverrides: string[] = [],
+    requirePermissions = false,
   ): { codex: CodexClientLike; environment: ProcessEnvironment } {
     const {
       runtime,
@@ -3264,7 +3286,9 @@ export class CodexSecurity {
     delete sdkCodexConfig["projects"];
     delete sdkCodexConfig["permissions"];
     if (commandAuth) delete sdkCodexConfig["model_providers"];
-    if (session.inheritedPermissions !== undefined) {
+    const checkPermissions =
+      requirePermissions && this.#dependencies.createCodex === undefined;
+    if (session.inheritedPermissions !== undefined || checkPermissions) {
       const permissions = sessionConfig["permissions"] as JsonObject;
       configOverrides = [
         ...configOverrides,
@@ -3277,8 +3301,9 @@ export class CodexSecurity {
       ? sdkCodexConfig["responses_api_metadata"]
       : {};
     let codexPathOverride =
+      !checkPermissions &&
       environmentValue(this.#dependencies.environment, "CODEX_CLI_PATH") ===
-      undefined
+        undefined
         ? undefined
         : this.#codexCommand().command;
     let sdkEnvironment = definedEnvironment(
@@ -3286,14 +3311,22 @@ export class CodexSecurity {
         ? environment
         : withoutOpenAiApiKeys(environment),
     );
-    if (process.platform === "win32" && codexPathOverride === undefined) {
-      codexPathOverride = environment["CODEX_CLI_PATH"]!;
+    if (
+      checkPermissions ||
+      (process.platform === "win32" && codexPathOverride === undefined)
+    ) {
+      codexPathOverride ??= environment["CODEX_CLI_PATH"]!;
       sdkEnvironment = bundledCodexSdkEnvironment(
         codexPathOverride,
         sdkEnvironment,
       );
     }
-    const codex = this.#dependencies.createCodex({
+    const createCodex =
+      this.#dependencies.createCodex ??
+      (checkPermissions
+        ? createPermissionCheckedCodex
+        : (options: CodexOptions) => new Codex(options));
+    const codex = createCodex({
       ...(codexPathOverride === undefined
         ? {}
         : { codexPathOverride: executablePathForSpawn(codexPathOverride) }),
@@ -4468,6 +4501,7 @@ async function readCodexTurn(options: {
     } else if (event.type === "turn.completed") {
       status = "completed";
       usage = event["usage"];
+      break;
     } else if (event.type === "turn.failed") {
       throw new CodexSecurityError(turnFailureMessage(event["error"]));
     } else if (event.type === "error" && typeof event["message"] === "string") {
@@ -4814,12 +4848,17 @@ function addScanCosts(
   };
 }
 
-function scanCostUsage(cost: Readonly<ScanCost>): Record<string, number> {
+function scanCostUsage(
+  cost: Readonly<ScanCost>,
+): Record<string, number | boolean> {
   return {
     input_tokens: cost.inputTokens,
     cached_input_tokens: cost.cachedInputTokens,
     cache_write_input_tokens: cost.cacheWriteInputTokens,
     output_tokens: cost.outputTokens,
+    ...(cost.cacheWriteInputTokensReported === false
+      ? { cache_write_input_tokens_reported: false }
+      : {}),
   };
 }
 

@@ -35,7 +35,7 @@ import {
   snapshotNativeEnvironment,
 } from "./native-executable.js";
 import type { NativeParentSandbox } from "./native-permissions.js";
-import { createNativeCodex } from "./native-codex.js";
+import { createPermissionCheckedCodex } from "../../../../sdk/typescript/src/permission-profile.js";
 import type { ScanResults } from "./types.js";
 
 export interface NativeScanInput {
@@ -217,7 +217,7 @@ export async function prepareNativeScan(
       codexOverrides: config,
     },
     {
-      createCodex: createNativeCodex,
+      createCodex: createPermissionCheckedCodex,
       environment: selectedEnvironment,
       inheritedPermissions,
       prepareRuntime: async (_config, runtimeSignal) => {

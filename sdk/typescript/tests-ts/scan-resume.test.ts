@@ -27,7 +27,7 @@ import {
   prepareSemanticScanDraft,
   type SemanticScan,
 } from "../src/scan-semantics.js";
-import { runWorkbench } from "../src/runtime.js";
+import { prepareScanArtifactRestorer, runWorkbench } from "../src/runtime.js";
 import { capture, dependencies } from "./cli-fixtures.js";
 import { TestClient } from "./support/api-client.js";
 import {
@@ -497,6 +497,7 @@ function resumeClient(
         return runtime;
       },
       resolvePluginPython: async () => f.python,
+      prepareScanArtifactRestorer,
       runWorkbench: workbench,
       createCodex,
     });

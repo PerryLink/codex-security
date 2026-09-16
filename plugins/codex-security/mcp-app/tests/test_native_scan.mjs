@@ -21,7 +21,7 @@ const bundle = await build({
   bundle: true,
   stdin: {
     contents: `export * from ${JSON.stringify(fileURLToPath(new URL("../src/native-scan.ts", import.meta.url)))};
-      export { createNativeCodex } from ${JSON.stringify(fileURLToPath(new URL("../src/native-codex.ts", import.meta.url)))};
+      export { createPermissionCheckedCodex } from ${JSON.stringify(fileURLToPath(new URL("../../../../sdk/typescript/src/permission-profile.ts", import.meta.url)))};
       export { scanRuntimeCodexConfig } from ${JSON.stringify(fileURLToPath(new URL("../../../../sdk/typescript/src/api.ts", import.meta.url)))};`,
     resolveDir: fileURLToPath(new URL("../src/", import.meta.url)),
   },
@@ -61,7 +61,7 @@ const {
   prepareNativeScan,
   nativeScanConfiguration,
   scanRuntimeCodexConfig,
-  createNativeCodex,
+  createPermissionCheckedCodex,
 } = module.exports;
 
 async function collectNativeEvents(thread, prompt, options) {
@@ -366,7 +366,7 @@ if (process.argv.includes("app-server")) {
             `permissions.codex_security_comparison={extends=":read-only",filesystem={${JSON.stringify(join(root, "private"))}="deny"},network={enabled=false}}`,
           );
         }
-        const sdk = createNativeCodex({
+        const sdk = createPermissionCheckedCodex({
           codexPathOverride: executable,
           config: { ...config, default_permissions: ":read-only" },
           configOverrides,

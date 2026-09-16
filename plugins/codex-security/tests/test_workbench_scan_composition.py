@@ -524,8 +524,10 @@ def test_parent_reads_completed_child_after_registration_checkpoint_crash(tmp_pa
     (target / "app.py").write_text("print('fixture')\n")
     state = tmp_path / "state"
     parent = register(state, target, tmp_path / "scan", mode="deep")
-    directory = Path(parent["scanDir"]) / "artifacts/deep-scan/passes/pass-1"
-    saved = checkpoint(state, parent, passes=[{"directory": str(directory)}])
+    parent_dir = Path(parent["scanDir"])
+    pass_directory = "artifacts/deep-scan/passes/pass-1"
+    directory = parent_dir / pass_directory
+    saved = checkpoint(state, parent, passes=[{"directory": pass_directory}])
     child = register(state, target, directory, parent=parent["scanId"])
     run_workbench(
         state, "set-scan-thread", "--scan-id", child["scanId"], "--thread-id", "child-thread"
@@ -559,7 +561,7 @@ def test_parent_reads_completed_child_after_registration_checkpoint_crash(tmp_pa
     assert [item["scanId"] for item in recovered] == [child["scanId"]]
     assert recovered[0]["parentScanId"] == parent["scanId"]
     write_completed_contract(
-        Path(parent["scanDir"]),
+        parent_dir,
         parent["scanId"],
         target,
         relative_path="app.py",
@@ -567,8 +569,22 @@ def test_parent_reads_completed_child_after_registration_checkpoint_crash(tmp_pa
     )
     blocked = run_workbench(state, "complete-scan", "--scan-id", parent["scanId"], check=False)
     assert "must finish and save its aggregate" in blocked["stderr"]
-    checkpoint(
-        state, parent, passes=saved["passes"], merged=[child["scanId"]], terminal="saturated"
+    saved["passes"][0]["scanId"] = child["scanId"]
+    saved["mergedScanIds"] = [child["scanId"]]
+    saved["terminalReason"] = "saturated"
+    saved["aggregate"] = {
+        "scanId": parent["scanId"],
+        "findings": json.loads((parent_dir / "findings.json").read_text())["findings"],
+        "coverage": json.loads((parent_dir / "coverage.json").read_text()),
+    }
+    run_workbench(
+        state,
+        "save-scan-artifact",
+        "--scan-id",
+        parent["scanId"],
+        "--artifact-path",
+        CHECKPOINT,
+        input_text=json.dumps(saved),
     )
     prepared = run_workbench(state, "prepare-scan-completion", "--scan-id", parent["scanId"])
     assert prepared["scan"]["progress"]["phase"] == "reporting"
@@ -577,7 +593,10 @@ def test_parent_reads_completed_child_after_registration_checkpoint_crash(tmp_pa
     assert (directory / "scan-manifest.json").read_bytes() == child_bytes
     context = run_workbench(state, "get-scan", "--scan-id", parent["scanId"])
     assert context["scan"]["progress"]["status"] == "complete"
+    assert context["scan"]["findingCount"] == 1
     assert context["scan"]["progress"]["independentReviews"]["consolidating"] is False
+    assert json.loads((parent_dir / "coverage.json").read_text())["completeness"] == "complete"
+    assert json.loads((parent_dir / CHECKPOINT).read_text()) == saved
     indexed = run_workbench(state, "list-global-findings")["findings"]
     assert len(indexed) == 1
     assert indexed[0]["scanId"] == parent["scanId"]
