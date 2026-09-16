@@ -280,7 +280,10 @@ def test_native_parent_binds_once_and_keeps_native_claim(tmp_path: Path) -> None
     assert rejected["returncode"] != 0
 
 
-def test_native_legacy_settings_are_returned_only_without_a_saved_recipe(tmp_path: Path) -> None:
+@pytest.mark.parametrize("target_entry", [False, True])
+def test_native_legacy_settings_are_returned_only_without_a_saved_recipe(
+    tmp_path: Path, target_entry: bool
+) -> None:
     target = tmp_path / "target"
     target.mkdir()
     state = tmp_path / "state"
@@ -296,14 +299,23 @@ def test_native_legacy_settings_are_returned_only_without_a_saved_recipe(tmp_pat
     )
     assert "deepScanSettings" not in created
     scan = created["scan"]
+    token = None if target_entry else scan["handoffClaimToken"]
+    if target_entry:
+        with sqlite3.connect(state / "workbench.sqlite3") as connection:
+            connection.execute(
+                "UPDATE scans SET handoff_claim_token = NULL, continuation_thread_id = NULL "
+                "WHERE id = ?",
+                (scan["scanId"],),
+            )
     joined_args = (
         "begin-deep-scan",
-        "--scan-id",
-        scan["scanId"],
         "--thread-id",
         "native-owner",
-        "--claim-token",
-        scan["handoffClaimToken"],
+        *(
+            ("--target-path", str(target))
+            if target_entry
+            else ("--scan-id", scan["scanId"], "--claim-token", token)
+        ),
     )
     assert "deepScanSettings" not in run_workbench(state, *joined_args)
     with sqlite3.connect(state / "workbench.sqlite3") as connection:
@@ -311,27 +323,69 @@ def test_native_legacy_settings_are_returned_only_without_a_saved_recipe(tmp_pat
             "INSERT INTO deep_scan_runs (scan_id, schema_version, workflow_version, "
             "status, phase, workers, subagents, stop_after_no_new, "
             "stop_after_consecutive_errors, max_discovery_runs, max_time_hours, "
+            "discovery_runs_dispatched, consecutive_no_new, consecutive_errors, "
             "created_at, updated_at) "
-            "VALUES (?, 1, 'synthetic-legacy', 'running', 'setup', 2, 0, 3, 4, 8, 0.5, ?, ?)",
+            "VALUES (?, 1, 'synthetic-legacy', 'running', 'setup', 2, 0, 3, 4, 8, 0.5, 3, 2, 1, ?, ?)",
             (scan["scanId"], "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z"),
         )
-    assert run_workbench(state, *joined_args)["deepScanSettings"] == {
-        "workers": 2,
-        "subagents": 0,
-        "stopAfterNoNew": 3,
-        "stopAfterConsecutiveErrors": 4,
-        "maxDiscoveryRuns": 8,
-        "maxTimeHours": 0.5,
-    }
-    saved_recipe = recipe(target, "deep")
+        legacy = connection.execute("SELECT * FROM deep_scan_runs").fetchone()
+    for _ in range(2):
+        joined = run_workbench(state, *joined_args)
+        assert joined["startDisposition"] == "joined"
+        assert joined["scan"]["scanId"] == scan["scanId"]
+        assert joined["scan"]["scanDir"] == scan["scanDir"]
+        assert joined["scan"]["handoffClaimToken"] == token
+        assert joined["deepScanSettings"] == {
+            "workers": 2,
+            "subagents": 0,
+            "stopAfterNoNew": 3,
+            "stopAfterConsecutiveErrors": 4,
+            "maxDiscoveryRuns": 8,
+            "maxTimeHours": 0.5,
+        }
+    rejected = run_workbench(
+        state,
+        "begin-deep-scan",
+        "--scan-id",
+        scan["scanId"],
+        "--thread-id",
+        "other-owner",
+        *(("--claim-token", token) if token else ()),
+        check=False,
+    )
+    assert "owning Codex thread" in rejected["stderr"]
     with sqlite3.connect(state / "workbench.sqlite3") as connection:
-        connection.execute(
-            "UPDATE scans SET recipe_json = ? WHERE id = ?",
-            (json.dumps(saved_recipe), scan["scanId"]),
-        )
+        assert connection.execute("SELECT * FROM deep_scan_runs").fetchone() == legacy
+        assert connection.execute(
+            "SELECT deep_scan_owner_thread_id, continuation_thread_id, handoff_claim_token FROM scans"
+        ).fetchall() == [("native-owner", None if target_entry else "native-owner", token)]
+    saved_recipe = recipe(target, "deep")
+    saved_recipe["deepScan"]["maxDiscoveryRuns"] = 9
+    run_workbench(
+        state,
+        "register-cli-scan",
+        "--repository",
+        str(target),
+        "--scan-dir",
+        scan["scanDir"],
+        "--registration-json-stdin",
+        input_text=json.dumps(
+            {
+                "recipe": saved_recipe,
+                "scanId": scan["scanId"],
+                "threadId": "native-owner",
+                "claimToken": token,
+            }
+        ),
+    )
     joined = run_workbench(state, *joined_args)
+    assert joined["scan"]["scanId"] == scan["scanId"]
     assert joined["recipe"] == saved_recipe
     assert "deepScanSettings" not in joined
+    assert joined["compositionCheckpoint"]["legacy"]["originThreadId"] == "native-owner"
+    assert joined["compositionCheckpoint"]["legacy"]["discoveryRuns"] == 3
+    assert joined["compositionCheckpoint"]["noNewStreak"] == 2
+    assert joined["compositionCheckpoint"]["consecutiveErrors"] == 1
 
 
 @pytest.mark.parametrize(

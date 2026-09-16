@@ -466,6 +466,7 @@ interface CodexSecurityRuntimeOptions {
 
 interface ClientDependencies {
   inheritedPermissions?: ScanPermissions;
+  workerNumber?: (threadId: string) => number;
   createCodex(options: CodexOptions): CodexClientLike;
   environment: ProcessEnvironment;
   prepareRuntime?: (
@@ -1591,6 +1592,7 @@ export class CodexSecurity {
             }
           });
       };
+      const workerNumber = this.#dependencies.workerNumber;
       const tracker = new ScanCostTracker({
         codexHome: runtime.codexHome,
         model,
@@ -1600,6 +1602,7 @@ export class CodexSecurity {
             ? join(scanDir, "artifacts", "deep-scan", "merge")
             : scanDir,
         maxCostUsd: options.maxCostUsd,
+        workerNumber,
         onActivity:
           options.onActivity === undefined
             ? undefined
@@ -2115,6 +2118,8 @@ export class CodexSecurity {
         approvalPolicy,
       };
       let thread: CodexThreadLike;
+      let activityThreadId =
+        typeof resumeThreadId === "string" ? resumeThreadId : undefined;
       if (typeof resumeThreadId === "string") {
         if (codex.resumeThread === undefined) {
           throw new CodexSecurityError(
@@ -2341,9 +2346,14 @@ export class CodexSecurity {
                   scanDir,
                 ),
                 createClient: () =>
-                  new CodexSecurity(childConfig, this.#dependencies, {
-                    surface: this.#surface,
-                  }),
+                  new CodexSecurity(
+                    childConfig,
+                    {
+                      ...this.#dependencies,
+                      workerNumber: tracker.workerNumber.bind(tracker),
+                    },
+                    { surface: this.#surface },
+                  ),
                 scanOptions: {
                   target: options.target,
                   auth: options.auth,
@@ -2520,6 +2530,7 @@ export class CodexSecurity {
               workbenchValidated: true,
               model,
               onThreadStarted: async (threadId) => {
+                activityThreadId = threadId;
                 if (typeof resumeThreadId === "string") {
                   if (threadId !== resumeThreadId) {
                     throw new CodexSecurityError(
@@ -2551,7 +2562,15 @@ export class CodexSecurity {
               onScanStarted: options.onScanStarted,
               onTrustedAccessStatus: options.onTrustedAccessStatus,
               onReconnect: options.onReconnect,
-              onActivity: options.onActivity,
+              onActivity:
+                workerNumber === undefined || options.onActivity === undefined
+                  ? options.onActivity
+                  : (activity) =>
+                      options.onActivity?.({
+                        ...activity,
+                        id: `${activityThreadId}:${activity.id}`,
+                        worker: workerNumber(activityThreadId!),
+                      }),
               onProgress: reportScanProgress,
               onWorkerStatus: options.onWorkerStatus,
               onWarning: options.onWarning,

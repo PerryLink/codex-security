@@ -921,8 +921,15 @@ def start_scan(connection: sqlite3.Connection, args: argparse.Namespace) -> dict
 def begin_deep_scan(connection: sqlite3.Connection, args: argparse.Namespace) -> dict[str, Any]:
     """Bind native Deep entry to the same registered scan used by the SDK host."""
     if args.scan_id is None:
-        return _start_prompt_driven_scan(connection, args, headless_standard=True)
-    scan = require_scan(connection, args.scan_id)
+        target = require_target(args.target_path)
+        require_scannable_target(target)
+        scan = scan_history.existing_deep_scan_for_target(
+            connection, args.thread_id, str(target), require_scope(args.scope, "deep", target)
+        )
+        if scan is None or scan["handoff_claim_token"] is not None:
+            return _start_prompt_driven_scan(connection, args, headless_standard=True)
+    else:
+        scan = require_scan(connection, args.scan_id)
     workspace = require_workspace(connection, scan["workspace_id"])
     owner = scan["deep_scan_owner_thread_id"] or workspace["thread_id"]
     if owner != args.thread_id or scan["mode"] != "deep":

@@ -21,6 +21,8 @@ import { afterEach, expect, spyOn, test } from "bun:test";
 import { build } from "esbuild";
 import { CodexSecurity, type ScanOptions } from "../src/api.js";
 import type { JsonObject } from "../src/config.js";
+import type { ScanSessionEvent } from "../src/cost.js";
+import type { ScanActivity } from "../src/scan-activity.js";
 import { runWorkbench, type WorkbenchCommandOptions } from "../src/runtime.js";
 import { prepareSemanticScanDraft } from "../src/scan-semantics.js";
 import {
@@ -259,6 +261,12 @@ run_workbench(state, 'set-finding-triage', '--occurrence-id', completed['finding
     let childTurns = 0;
     const progressRuns: ScanProgress[][] = [];
     let progress: ScanProgress[];
+    const workerRuns: Array<{
+      threads: Set<string>;
+      activities: ScanActivity[];
+      sessions: ScanSessionEvent[];
+    }> = [];
+    let workerRun: (typeof workerRuns)[number];
     const workbenches = new Map<string, WorkbenchCommandOptions>();
     const commands: Array<{ command: string; id: string | undefined }> = [];
     const turns: Array<{
@@ -541,8 +549,68 @@ run_workbench(state, 'set-finding-triage', '--occurrence-id', completed['finding
                         },
                       }) + "\n",
                     );
+                    if (mode === "standard") {
+                      const delegated = `${thread.id}-worker`;
+                      workerRun.threads.add(thread.id);
+                      workerRun.threads.add(delegated);
+                      await writeFile(
+                        join(
+                          sessionHome,
+                          "sessions",
+                          `rollout-${delegated}.jsonl`,
+                        ),
+                        [
+                          {
+                            type: "session_meta",
+                            payload: {
+                              id: delegated,
+                              parent_thread_id: thread.id,
+                            },
+                          },
+                          {
+                            type: "response_item",
+                            payload: {
+                              type: "function_call",
+                              name: "exec_command",
+                              call_id: "shared-command",
+                              arguments: JSON.stringify({
+                                cmd: "printf synthetic-worker",
+                              }),
+                            },
+                          },
+                          {
+                            type: "response_item",
+                            payload: {
+                              type: "function_call_output",
+                              call_id: "shared-command",
+                              output: "synthetic-worker",
+                            },
+                          },
+                        ]
+                          .map((event) => JSON.stringify(event))
+                          .join("\n") + "\n",
+                      );
+                    }
                     yield { type: "thread.started", thread_id: thread.id };
                     if (mode === "standard") {
+                      for (const type of [
+                        "item.started",
+                        "item.completed",
+                      ] as const)
+                        yield {
+                          type,
+                          item: {
+                            id: "shared-command",
+                            type: "command_execution",
+                            command: "printf synthetic-worker",
+                            aggregated_output: "synthetic-worker",
+                            status:
+                              type === "item.started"
+                                ? "in_progress"
+                                : "completed",
+                            exit_code: 0,
+                          },
+                        };
                       childTurns += 1;
                       const directory = record["scanDir"] as string;
                       if (
@@ -736,6 +804,8 @@ run_workbench(state, 'set-finding-triage', '--occurrence-id', completed['finding
             : {}),
         postScanPrompt: "Post-scan instructions once.",
         onProgress: (update) => progress.push(update),
+        onActivity: (activity) => workerRun.activities.push(activity),
+        onSessionEvent: (event) => workerRun.sessions.push(event),
         onWarning: (message) => {
           if (trackingFailure && message.startsWith("Deep Scan pass "))
             controller.abort(
@@ -747,6 +817,8 @@ run_workbench(state, 'set-finding-triage', '--occurrence-id', completed['finding
       const run = () => {
         progress = [];
         progressRuns.push(progress);
+        workerRun = { threads: new Set(), activities: [], sessions: [] };
+        workerRuns.push(workerRun);
         return client.run(repo, {
           ...scanOptions,
           ...nativeOptions,
@@ -855,6 +927,30 @@ run_workbench(state, 'set-finding-triage', '--occurrence-id', completed['finding
         client = await makeClient();
       }
       const result = await run();
+      for (const observed of workerRuns) {
+        const labels = new Map<string, number>();
+        for (const event of observed.sessions) {
+          if (!observed.threads.has(event.threadId)) {
+            expect(event.worker).toBeUndefined();
+            continue;
+          }
+          expect(event.worker).toBeGreaterThan(0);
+          if (labels.has(event.threadId))
+            expect(event.worker).toBe(labels.get(event.threadId));
+          labels.set(event.threadId, event.worker!);
+        }
+        expect(new Set(labels.keys())).toEqual(observed.threads);
+        expect(new Set(labels.values()).size).toBe(labels.size);
+        for (const threadId of observed.threads)
+          expect(
+            observed.activities
+              .filter(({ id }) => id === `${threadId}:shared-command`)
+              .map(({ worker, status }) => ({ worker, status })),
+          ).toEqual([
+            { worker: labels.get(threadId), status: "running" },
+            { worker: labels.get(threadId), status: "completed" },
+          ]);
+      }
       for (const updates of progressRuns) {
         const counts = updates.map((update) => update.filesCompleted);
         expect(counts).toEqual([...counts].sort((left, right) => left - right));
