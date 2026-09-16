@@ -575,6 +575,65 @@ describe("ordinary scan composition", () => {
     },
   );
 
+  test.each([false, true])(
+    "counts exhausted unregistered passes toward the run cap (restart: %p)",
+    async (restart) => {
+      retryDelay = spyOn(timers, "setTimeout").mockImplementation(
+        async <T>(_delay?: number, value?: T): Promise<T> => value as T,
+      );
+      const h = await harness({ maxDiscoveryRuns: 1 });
+      const attempts: ScanOptions[] = [];
+      let closed = 0;
+      h.input.createClient = () => ({
+        async run(_repository, options = {}) {
+          attempts.push(options);
+          throw new Error("Scan registration failed.");
+        },
+        async close() {
+          closed++;
+        },
+      });
+      if (restart) {
+        const workbench = h.input.workbench;
+        h.input.workbench = async (args, input) => {
+          const result = await workbench(args, input);
+          if (
+            args[0] === "save-scan-artifact" &&
+            JSON.parse(input!).passes[0]?.failed
+          )
+            h.controller.abort(
+              new ScanTransportClosedError("Transport closed."),
+            );
+          return result;
+        };
+        await expect(runDeepScans(h.input)).rejects.toBeInstanceOf(
+          ScanTransportClosedError,
+        );
+        expect((await h.checkpoint()).terminalReason).toBeUndefined();
+        h.input.workbench = workbench;
+        h.input.signal = new AbortController().signal;
+      }
+      await expect(runDeepScans(h.input)).rejects.toThrow(
+        "every discovery run failed",
+      );
+      expect(attempts).toHaveLength(4);
+      expect(new Set(attempts.map((attempt) => attempt.outputDir)).size).toBe(
+        1,
+      );
+      expect(closed).toBe(1);
+      expect(h.records.size).toBe(0);
+      expect(await h.checkpoint()).toMatchObject({
+        startedAt: h.input.startedAt,
+        passes: [
+          { directory: "artifacts/deep-scan/passes/pass-1", failed: true },
+        ],
+        consecutiveErrors: 1,
+        noNewStreak: 0,
+        terminalReason: "failed",
+      });
+    },
+  );
+
   test("surfaces failed child persistence instead of restarting its retries", async () => {
     retryDelay = spyOn(timers, "setTimeout").mockImplementation(
       async <T>(_delay?: number, value?: T): Promise<T> => value as T,

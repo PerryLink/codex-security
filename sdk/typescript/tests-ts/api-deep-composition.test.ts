@@ -1,19 +1,24 @@
 import { randomUUID } from "node:crypto";
+import * as childProcess from "node:child_process";
 import { execFileSync } from "node:child_process";
+import { existsSync } from "node:fs";
 import {
   appendFile,
   mkdir,
   mkdtemp,
   readFile,
+  realpath,
   rm,
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
+import { createRequire } from "node:module";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { parse as parseToml } from "smol-toml";
+import { parse as parseToml, stringify as stringifyToml } from "smol-toml";
 import type { ThreadEvent, ThreadOptions } from "@openai/codex-sdk";
-import { afterEach, expect, test } from "bun:test";
+import { afterEach, expect, spyOn, test } from "bun:test";
+import { build } from "esbuild";
 import { CodexSecurity, type ScanOptions } from "../src/api.js";
 import type { JsonObject } from "../src/config.js";
 import { runWorkbench, type WorkbenchCommandOptions } from "../src/runtime.js";
@@ -21,11 +26,63 @@ import { prepareSemanticScanDraft } from "../src/scan-semantics.js";
 import { DEEP_SCAN_CHECKPOINT } from "../src/deep-scan.js";
 import { ScanTransportClosedError } from "../src/scan-execution.js";
 import type { ScanProgress } from "../src/worker-progress.js";
+import { PLUGIN_ROOT } from "./plugin-root.js";
 
 const pluginRoot = fileURLToPath(
   new URL("../../../plugins/codex-security/", import.meta.url),
 );
 const roots: string[] = [];
+
+type ClientArguments = ConstructorParameters<typeof CodexSecurity>;
+type CapturedNativeScan = {
+  client: { config: ClientArguments[0]; dependencies: ClientArguments[1] };
+  options: ScanOptions;
+};
+
+// Capture only the constructor boundary; keep the adapter's runtime preparation
+// and the SDK's ordinary scan execution real without process-wide module mocks.
+async function nativeScanFactory() {
+  const entry = new URL(
+    "../../../plugins/codex-security/mcp-app/src/native-scan.ts",
+    import.meta.url,
+  );
+  const bundle = await build({
+    bundle: true,
+    entryPoints: [fileURLToPath(entry)],
+    define: { "import.meta.url": JSON.stringify(entry.href) },
+    format: "cjs",
+    platform: "node",
+    write: false,
+    plugins: [
+      {
+        name: "capture-native-client",
+        setup(build) {
+          build.onResolve({ filter: /sdk\/typescript\/src\/api\.js$/ }, () => ({
+            path: "client",
+            namespace: "fixture",
+          }));
+          build.onLoad({ filter: /.*/, namespace: "fixture" }, () => ({
+            resolveDir: fileURLToPath(new URL(".", entry)),
+            contents: `export { selectedScanEnvironment } from ${JSON.stringify(fileURLToPath(new URL("../src/api.ts", import.meta.url)))};
+            export class CodexSecurity { constructor(config, dependencies) { this.config = config; this.dependencies = dependencies; } }`,
+          }));
+        },
+      },
+    ],
+  });
+  const module = { exports: {} };
+  new Function("require", "module", "exports", bundle.outputFiles[0]!.text)(
+    createRequire(import.meta.url),
+    module,
+    module.exports,
+  );
+  return (
+    module.exports as {
+      prepareNativeScan(input: unknown): Promise<CapturedNativeScan>;
+    }
+  ).prepareNativeScan;
+}
+
 afterEach(async () => {
   await Promise.all(
     roots.splice(0).map((root) => rm(root, { recursive: true, force: true })),
@@ -55,7 +112,9 @@ test.each([
   async ({ workers, budget, provider, native }) => {
     const python = Bun.which("python3") ?? Bun.which("python");
     if (python === null) throw new Error("Python is required for this test.");
-    const root = await mkdtemp(join(tmpdir(), "ordinary-composition-"));
+    const root = await realpath(
+      await mkdtemp(join(tmpdir(), "ordinary-composition-")),
+    );
     roots.push(root);
     const repo = join(root, "repo");
     const codexHome = join(root, "codex");
@@ -72,6 +131,7 @@ test.each([
     let runtimeVersion = version;
     const environment = {
       ...process.env,
+      CODEX_HOME: codexHome,
       CODEX_SECURITY_STATE_DIR: join(root, "state"),
       CODEX_CLI_PATH: process.execPath,
       SYNTHETIC_SCAN_SETTING: "inherited",
@@ -84,6 +144,61 @@ test.each([
             CODEX_API_KEY: "synthetic-native-key",
           }),
     };
+    const nativeSettings = {
+      model: "gpt-6-astra",
+      model_reasoning_effort: "ultra",
+      forced_login_method: "chatgpt",
+      cli_auth_credentials_store: "file",
+      mcp_servers: {
+        synthetic: {
+          command: "synthetic-mcp",
+          env: { FIXTURE_TOKEN: "saved-mcp-setting" },
+        },
+      },
+      shell_environment_policy: {
+        inherit: "core",
+        set: { FIXTURE_SETTING: "saved-shell-setting" },
+      },
+    };
+    let ambientConfig = stringifyToml(nativeSettings);
+    const managedHome = join(
+      environment.CODEX_SECURITY_STATE_DIR,
+      "codex-home",
+    );
+    const managedAuth = JSON.stringify({ auth_mode: "chatgpt", account: "C" });
+    const managedConfig = 'model = "managed-decoy"\n';
+    const accountLog = join(root, "account-status.jsonl");
+    const loginFixture = join(root, "login-fixture.mjs");
+    const prepareNative =
+      native === "discovery" ? await nativeScanFactory() : undefined;
+    if (prepareNative) {
+      environment.CODEX_CLI_PATH = Bun.which("node")!;
+      await mkdir(managedHome, { recursive: true });
+      await Promise.all([
+        writeFile(
+          loginFixture,
+          `
+import { appendFileSync, readFileSync } from "node:fs";
+import { join } from "node:path";
+const args = process.argv.slice(2);
+if (args.at(-2) !== "login" || args.at(-1) !== "status") throw new Error("Unexpected fixture command");
+if (!args.includes('cli_auth_credentials_store="file"')) throw new Error("Expected saved file credential store");
+const home = process.env.CODEX_HOME;
+const { account } = JSON.parse(readFileSync(join(home, "auth.json"), "utf8"));
+appendFileSync(${JSON.stringify(accountLog)}, JSON.stringify({ home, account, args }) + "\\n");
+console.log("Logged in using ChatGPT");
+process.exit(0);
+`,
+        ),
+        writeFile(join(codexHome, "config.toml"), ambientConfig),
+        writeFile(
+          join(codexHome, "auth.json"),
+          JSON.stringify({ auth_mode: "chatgpt", account: "A" }),
+        ),
+        writeFile(join(managedHome, "auth.json"), managedAuth),
+        writeFile(join(managedHome, "config.toml"), managedConfig),
+      ]);
+    }
     const commandOptions = { python, pluginRoot, environment };
     let registeredScan: ScanOptions["registeredScan"];
     let feedbackBefore: Buffer<ArrayBuffer> | undefined;
@@ -150,10 +265,61 @@ run_workbench(state, 'set-finding-triage', '--occurrence-id', completed['finding
       overrides?: string[];
       executable?: string;
       environment: Record<string, string>;
+      account?: string;
+      resumed: boolean;
     }> = [];
-    const makeClient = () =>
-      new CodexSecurity(
-        {
+    let nativeOptions: ScanOptions | undefined;
+    let nativeRecipe: JsonObject | undefined;
+    const makeClient = async () => {
+      let prepared: CapturedNativeScan | undefined;
+      if (prepareNative) {
+        const nativeEnvironment: NodeJS.ProcessEnv = {
+          ...environment,
+          OPENAI_API_KEY: undefined,
+          CODEX_API_KEY: undefined,
+          CODEX_SAFETY_IDENTIFIER: undefined,
+          CODEX_SECURITY_CONFIG_PATH: undefined,
+          CODEX_SECURITY_DEEP_SCAN_CONFIG_PATH: undefined,
+        };
+        const before = Object.fromEntries(
+          Object.keys(nativeEnvironment).map((key) => [key, process.env[key]]),
+        );
+        try {
+          for (const [key, value] of Object.entries(nativeEnvironment)) {
+            if (value === undefined) delete process.env[key];
+            else process.env[key] = value;
+          }
+          prepared = await prepareNative({
+            scan: {
+              ...registeredScan,
+              targetPath: repo,
+              userContext: "Inspect the synthetic source.",
+            },
+            recipe: nativeRecipe ?? {
+              postScanPrompt: "Post-scan instructions once.",
+            },
+            savedDeepScanSettings: {
+              workers,
+              subagents: 3,
+              stopAfterNoNew: 2,
+              maxDiscoveryRuns: 4,
+              maxTimeHours: 1,
+            },
+            threadId: registeredScan!.threadId,
+            pluginRoot: PLUGIN_ROOT,
+            pythonPath: python,
+            parentSandbox: { filesystemDenies: [join(root, "private")] },
+          });
+          nativeOptions = prepared.options;
+        } finally {
+          for (const [key, value] of Object.entries(before)) {
+            if (value === undefined) delete process.env[key];
+            else process.env[key] = value;
+          }
+        }
+      }
+      return new CodexSecurity(
+        prepared?.client.config ?? {
           pluginPath: pluginRoot,
           codexOverrides: {
             model: "gpt-6-astra",
@@ -187,6 +353,7 @@ run_workbench(state, 'set-finding-triage', '--occurrence-id', completed['finding
               version: runtimeVersion,
             },
           }),
+          ...prepared?.client.dependencies,
           resolvePluginPython: async () => python,
           runWorkbench: async (options, args, input) => {
             const result = await runWorkbench(options, args, input);
@@ -287,14 +454,61 @@ run_workbench(state, 'set-finding-triage', '--occurrence-id', completed['finding
                     overrides: options.configOverrides,
                     executable: options.codexPathOverride,
                     environment: options.env!,
+                    resumed: savedThreadId !== null,
+                    ...(prepareNative
+                      ? {
+                          account: JSON.parse(
+                            await readFile(
+                              join(env["CODEX_HOME"]!, "auth.json"),
+                              "utf8",
+                            ),
+                          ).account,
+                        }
+                      : {}),
                   });
+                  if (prepareNative) {
+                    expect(env["CODEX_HOME"]).toBe(codexHome);
+                    expect(options.apiKey).toBeUndefined();
+                    expect(env).not.toHaveProperty("OPENAI_API_KEY");
+                    expect(env).not.toHaveProperty("CODEX_API_KEY");
+                    expect(options.config).toMatchObject(nativeSettings);
+                    const preflight = parseToml(
+                      await readFile(
+                        env["CODEX_SECURITY_CONFIG_PATH"]!,
+                        "utf8",
+                      ),
+                    );
+                    expect(preflight).not.toHaveProperty("mcp_servers");
+                    expect(preflight).not.toHaveProperty(
+                      "shell_environment_policy",
+                    );
+                    expect(preflight).toMatchObject({
+                      model: nativeSettings.model,
+                      model_reasoning_effort:
+                        nativeSettings.model_reasoning_effort,
+                      features: {
+                        multi_agent_v2: {
+                          enabled: true,
+                          max_concurrent_threads_per_session: 4,
+                        },
+                      },
+                    });
+                    expect(
+                      await readFile(join(codexHome, "config.toml"), "utf8"),
+                    ).toBe(ambientConfig);
+                  }
                   async function* events(): AsyncGenerator<ThreadEvent> {
                     thread.id ??= randomUUID();
-                    await mkdir(join(codexHome, "sessions"), {
+                    const sessionHome = env["CODEX_HOME"]!;
+                    await mkdir(join(sessionHome, "sessions"), {
                       recursive: true,
                     });
                     await appendFile(
-                      join(codexHome, "sessions", `rollout-${thread.id}.jsonl`),
+                      join(
+                        sessionHome,
+                        "sessions",
+                        `rollout-${thread.id}.jsonl`,
+                      ),
                       JSON.stringify({
                         type: "session_meta",
                         payload: {
@@ -315,7 +529,7 @@ run_workbench(state, 'set-finding-triage', '--occurrence-id', completed['finding
                         interrupted = true;
                         await appendFile(
                           join(
-                            codexHome,
+                            sessionHome,
                             "sessions",
                             `rollout-${thread.id}.jsonl`,
                           ),
@@ -457,7 +671,25 @@ run_workbench(state, 'set-finding-triage', '--occurrence-id', completed['finding
         },
         { surface: "sdk" },
       );
-    let client = makeClient();
+    };
+    let client = await makeClient();
+    const originalSpawn = childProcess.spawn;
+    const loginSpawn = prepareNative
+      ? spyOn(childProcess, "spawn").mockImplementation(((
+          ...spawnArgs: Parameters<typeof childProcess.spawn>
+        ) => {
+          const [command, args, options] = spawnArgs;
+          if (
+            options?.env?.["CODEX_HOME"] === codexHome &&
+            Array.isArray(args) &&
+            args.at(-2) === "login" &&
+            args.at(-1) === "status"
+          ) {
+            return originalSpawn(command, [loginFixture, ...args], options);
+          }
+          return originalSpawn(...spawnArgs);
+        }) as typeof childProcess.spawn)
+      : undefined;
     try {
       const scanOptions: ScanOptions = {
         mode: "deep",
@@ -469,7 +701,9 @@ run_workbench(state, 'set-finding-triage', '--occurrence-id', completed['finding
         maxTimeHours: 1,
         outputDir: scanDir,
         registeredScan,
-        ...(native ? { safetyIdentifier: "saved-native-identifier" } : {}),
+        ...(native && !prepareNative
+          ? { safetyIdentifier: "saved-native-identifier" }
+          : {}),
         scanPrompt: "Inspect the synthetic source.",
         ...(budget ? { maxCostUsd: 0.001 } : {}),
         postScanPrompt: "Post-scan instructions once.",
@@ -481,6 +715,7 @@ run_workbench(state, 'set-finding-triage', '--occurrence-id', completed['finding
         progressRuns.push(progress);
         return client.run(repo, {
           ...scanOptions,
+          ...nativeOptions,
           signal: AbortSignal.any([
             controller.signal,
             AbortSignal.timeout(20000),
@@ -530,7 +765,33 @@ run_workbench(state, 'set-finding-triage', '--occurrence-id', completed['finding
         controller = new AbortController();
         environment.CODEX_SAFETY_IDENTIFIER = "changed-ambient-identifier";
         await client.close();
-        client = makeClient();
+        if (prepareNative) {
+          nativeRecipe = (
+            await runWorkbench(commandOptions, [
+              "get-scan-recipe",
+              "--scan-id",
+              registeredScan!.scanId,
+            ])
+          )["recipe"] as JsonObject;
+          expect(nativeRecipe["config"]).toMatchObject(nativeSettings);
+          ambientConfig = stringifyToml({
+            model: "competing-ambient-model",
+            model_reasoning_effort: "low",
+            cli_auth_credentials_store: "keyring",
+            mcp_servers: { synthetic: { command: "competing-mcp" } },
+            shell_environment_policy: {
+              set: { FIXTURE_SETTING: "competing-shell" },
+            },
+          });
+          await Promise.all([
+            writeFile(
+              join(codexHome, "auth.json"),
+              JSON.stringify({ auth_mode: "chatgpt", account: "B" }),
+            ),
+            writeFile(join(codexHome, "config.toml"), ambientConfig),
+          ]);
+        }
+        client = await makeClient();
       }
       const result = await run();
       for (const updates of progressRuns) {
@@ -608,15 +869,61 @@ run_workbench(state, 'set-finding-triage', '--occurrence-id', completed['finding
             },
           },
         });
-        expect(turn.executable).toBe(process.execPath);
+        expect(turn.executable).toBe(environment.CODEX_CLI_PATH);
         expect(turn.environment["SYNTHETIC_SCAN_SETTING"]).toBe("inherited");
         expect(turn.environment["CODEX_SAFETY_IDENTIFIER"]).toBe(
-          native ? "saved-native-identifier" : undefined,
+          native && !prepareNative ? "saved-native-identifier" : undefined,
         );
       }
       const children = turns.filter((turn) => turn.mode === "standard");
       expect(children).toHaveLength(native === "discovery" ? 3 : 2);
       expect(new Set(children.map((turn) => turn.id)).size).toBe(2);
+      if (prepareNative) {
+        const accounts = (await readFile(accountLog, "utf8"))
+          .trim()
+          .split("\n")
+          .map((line) => JSON.parse(line));
+        expect(accounts[0]).toMatchObject({ home: codexHome, account: "A" });
+        expect(accounts.at(-1)).toMatchObject({
+          home: codexHome,
+          account: "B",
+        });
+        for (const { args } of accounts)
+          expect(args).toContain('cli_auth_credentials_store="file"');
+        expect(
+          accounts.every(
+            ({ home, account }) =>
+              home === codexHome && ["A", "B"].includes(account),
+          ),
+        ).toBe(true);
+        expect(
+          children.map(({ account, resumed }) => ({ account, resumed })),
+        ).toEqual([
+          { account: "A", resumed: false },
+          { account: "A", resumed: false },
+          { account: "B", resumed: true },
+        ]);
+        expect(
+          turns
+            .filter(
+              ({ mode, prompt }) =>
+                mode === "deep" && prompt !== "Post-scan instructions once.",
+            )
+            .map(({ account }) => account),
+        ).toEqual(["A", "B"]);
+        expect(result.cost!.estimatedUsd).toBeGreaterThan(0);
+        expect(existsSync(join(codexHome, "sessions"))).toBe(true);
+        expect(existsSync(join(managedHome, "sessions"))).toBe(false);
+        expect(await readFile(join(managedHome, "auth.json"), "utf8")).toBe(
+          managedAuth,
+        );
+        expect(await readFile(join(managedHome, "config.toml"), "utf8")).toBe(
+          managedConfig,
+        );
+        expect(await readFile(join(codexHome, "config.toml"), "utf8")).toBe(
+          ambientConfig,
+        );
+      }
       for (const child of children) {
         expect(child.prompt).toContain("Inspect the synthetic source.");
         expect(child.prompt).not.toContain("sourceFindingIds");
@@ -676,7 +983,20 @@ run_workbench(state, 'set-finding-triage', '--occurrence-id', completed['finding
       expect(listedIds).toContain(result.manifest.scan.id);
       expect(listedIds).toHaveLength(native === "feedback" ? 2 : 1);
     } finally {
-      await client.close();
+      try {
+        await client.close();
+      } finally {
+        loginSpawn?.mockRestore();
+      }
+    }
+    if (prepareNative) {
+      expect(existsSync(join(codexHome, "sessions"))).toBe(true);
+      expect(
+        JSON.parse(await readFile(join(codexHome, "auth.json"), "utf8")),
+      ).toEqual({ auth_mode: "chatgpt", account: "B" });
+      expect(await readFile(join(codexHome, "config.toml"), "utf8")).toBe(
+        ambientConfig,
+      );
     }
   },
 );

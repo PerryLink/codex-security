@@ -1,4 +1,4 @@
-import { readFile } from "node:fs/promises";
+import { readFile, realpath } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { Codex } from "@openai/codex-sdk";
@@ -10,6 +10,7 @@ import {
 } from "../../../../sdk/typescript/src/api.js";
 import {
   hasCommandAuth,
+  inlineToml,
   scanCompositionOverrides,
   scanModelProvider,
   type JsonObject,
@@ -23,6 +24,14 @@ import { CodexSecurityError } from "../../../../sdk/typescript/src/errors.js";
 import { resolveDeepScanConfig } from "../../../../sdk/typescript/src/deep-config.js";
 import { ScanTransportClosedError } from "../../../../sdk/typescript/src/scan-execution.js";
 import type { ScanResult } from "../../../../sdk/typescript/src/result.js";
+import {
+  cleanupSdkDirectory,
+  createIsolatedHome,
+  createMarketplace,
+  MARKETPLACE_NAME,
+  PLUGIN_NAME,
+  pluginMetadata,
+} from "../../../../sdk/typescript/src/runtime.js";
 import {
   resolveCodexPath,
   snapshotNativeEnvironment,
@@ -208,9 +217,52 @@ export async function prepareNativeScan(
       codexOverrides: config,
     },
     {
-      createCodex: (options) => new Codex(options),
+      // Raw tables preserve literal MCP server names and environment keys.
+      createCodex: ({ config, configOverrides, ...options }) =>
+        new Codex({
+          ...options,
+          configOverrides: [
+            ...Object.entries((config ?? {}) as JsonObject).map(
+              ([name, value]) => `${name}=${inlineToml(value)}`,
+            ),
+            ...(configOverrides ?? []),
+          ],
+        }),
       environment: selectedEnvironment,
       inheritedPermissions,
+      prepareRuntime: async (_config, runtimeSignal) => {
+        const codexHome = await realpath(
+          environment.CODEX_HOME ?? join(homedir(), ".codex"),
+        );
+        const bootstrapWorkspace = await createIsolatedHome();
+        try {
+          const marketplaceRoot = await createMarketplace(
+            bootstrapWorkspace,
+            input.pluginRoot,
+            runtimeSignal,
+          );
+          const pluginRoot = join(marketplaceRoot, "plugins", PLUGIN_NAME);
+          return {
+            codexHome,
+            persistentCredentialHome: true,
+            preserveCodexHomeConfig: true,
+            bootstrapWorkspace,
+            configPath: join(bootstrapWorkspace, "config-preflight.toml"),
+            environment: { ...selectedEnvironment, CODEX_HOME: codexHome },
+            credentialsAvailable: false,
+            plugin: {
+              pluginRoot,
+              installedRoot: pluginRoot,
+              marketplaceRoot,
+              marketplaceName: MARKETPLACE_NAME,
+              ...(await pluginMetadata(pluginRoot)),
+            },
+          };
+        } catch (error) {
+          await cleanupSdkDirectory(bootstrapWorkspace);
+          throw error;
+        }
+      },
     },
     { surface: "sdk" },
   );

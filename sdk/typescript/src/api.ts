@@ -246,6 +246,8 @@ interface CodexClientLike {
 interface PreparedRuntime {
   codexHome: string;
   persistentCredentialHome?: boolean;
+  /** Native runs use the invoking account without rewriting its home config. */
+  preserveCodexHomeConfig?: boolean;
   bootstrapWorkspace?: string;
   configPath?: string;
   plugin: PluginInstall;
@@ -1641,10 +1643,13 @@ export class CodexSecurity {
         deepScan: deepScanConfiguration?.settings,
         auth: options.auth,
       });
-      if (
-        session.inheritedPermissions !== undefined ||
-        session.preserveProviderEnvironment
-      ) {
+      if (session.inheritedPermissions !== undefined) {
+        recipe["config"] = {
+          ...structuredClone(effectiveConfig),
+          approval_policy: approvalPolicy,
+        };
+        recipe["inheritedPermissions"] = session.inheritedPermissions;
+      } else if (session.preserveProviderEnvironment) {
         const nativeConfig = sharedCredentialCodexConfig(
           effectiveConfig,
           runtimeHome,
@@ -1655,8 +1660,6 @@ export class CodexSecurity {
             savedConfig[key] = nativeConfig[key]!;
         }
       }
-      if (session.inheritedPermissions !== undefined)
-        recipe["inheritedPermissions"] = session.inheritedPermissions;
       if (session.preserveProviderEnvironment)
         recipe["preserveProviderEnvironment"] = true;
       if (options.scanPrompt?.trim()) recipe["requiresScanPrompt"] = true;
@@ -3440,6 +3443,7 @@ export class CodexSecurity {
           this.#codexCommand(),
           runtime.environment,
           signal,
+          runtime.preserveCodexHomeConfig ? effectiveConfig : undefined,
         );
         runtime.credentialsAvailable = status.authenticated;
         this.#runtimeCredentialSource = status.authenticated
@@ -3490,7 +3494,7 @@ export class CodexSecurity {
       });
       checkOpen();
       const runtimeConfig =
-        runtime.configPath === undefined
+        runtime.configPath === undefined || runtime.preserveCodexHomeConfig
           ? undefined
           : await readCodexHomeConfig(
               { ...runtime.environment, CODEX_HOME: runtime.codexHome },

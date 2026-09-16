@@ -504,6 +504,64 @@ def test_parent_reads_completed_child_after_registration_checkpoint_crash(tmp_pa
     assert run_workbench(state, "list-repositories")["repositories"][0]["scanCount"] == 2
 
 
+@pytest.mark.parametrize("missing", ["checkpoint", "output"])
+def test_history_hides_composition_children_without_parent_artifacts(
+    tmp_path: Path, missing: str
+) -> None:
+    target = tmp_path / "target"
+    target.mkdir()
+    (target / "app.py").write_text("print('fixture')\n")
+    state = tmp_path / "state"
+    parent_dir = tmp_path / "scan"
+    parent = register(state, target, parent_dir, mode="deep")
+    rerun = register(state, target, tmp_path / "rerun", parent=parent["scanId"])
+    child_path = "artifacts/deep-scan/passes/pass-1"
+    child = register(state, target, parent_dir / child_path, parent=parent["scanId"])
+    checkpoint(state, parent, passes=[{"directory": child_path, "scanId": child["scanId"]}])
+    with sqlite3.connect(state / "workbench.sqlite3") as connection:
+        for day, scan in enumerate((parent, rerun, child), 1):
+            connection.execute(
+                "UPDATE scans SET started_at = ? WHERE id = ?",
+                (f"2026-01-0{day}T00:00:00Z", scan["scanId"]),
+            )
+    for scan in (rerun, child):
+        write_completed_contract(
+            Path(scan["scanDir"]), scan["scanId"], target, relative_path="app.py"
+        )
+        run_workbench(state, "complete-scan", "--scan-id", scan["scanId"])
+    if missing == "checkpoint":
+        (parent_dir / CHECKPOINT).unlink()
+    else:
+        parent_dir.rename(tmp_path / "removed-output")
+
+    assert {scan["scanId"] for scan in run_workbench(state, "list-scans")["scans"]} == {
+        parent["scanId"],
+        rerun["scanId"],
+    }
+    assert (
+        run_workbench(state, "list-scans", "--status", "complete", "--limit", "1")["scans"][0][
+            "scanId"
+        ]
+        == rerun["scanId"]
+    )
+    indexed = run_workbench(state, "list-global-findings")["findings"]
+    assert len(indexed) == 1
+    assert indexed[0]["scanId"] == rerun["scanId"]
+    assert indexed[0]["occurrenceCount"] == 1
+    assert indexed[0]["knownScanIds"] == [rerun["scanId"]]
+    visible = run_workbench(state, "get-scan", "--scan-id", rerun["scanId"])["scan"]
+    assert "knownScanIds" not in visible["findings"][0]
+    assert "matches" not in visible["findings"][0]
+    repository = run_workbench(state, "list-repositories")["repositories"][0]
+    assert repository["scanCount"] == 2
+    assert repository["latestScan"]["scanId"] == rerun["scanId"]
+    explicit = run_workbench(state, "list-scans", "--scan-root", child["scanDir"])["scans"]
+    assert [scan["scanId"] for scan in explicit] == [child["scanId"]]
+    assert (
+        run_workbench(state, "get-scan", "--scan-id", child["scanId"])["scan"]["findingCount"] == 1
+    )
+
+
 def test_archiving_composition_preserves_children_and_reuses_pass_directories(
     tmp_path: Path,
 ) -> None:

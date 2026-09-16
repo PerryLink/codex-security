@@ -24,7 +24,7 @@ export const DEEP_SCAN_CHECKPOINT = "artifacts/deep-scan/checkpoint.json";
 export interface DeepScanCheckpoint {
   version: 2;
   startedAt: string;
-  passes: Array<{ directory: string; scanId?: string }>;
+  passes: Array<{ directory: string; scanId?: string; failed?: true }>;
   mergedScanIds: string[];
   aggregate: SemanticScan | null;
   noNewStreak: number;
@@ -347,6 +347,7 @@ export async function runDeepScans(
                   : []),
               ]);
             }
+            pass.failed = true;
             state.consecutiveErrors += 1;
             await save();
             return;
@@ -395,8 +396,9 @@ export async function runDeepScans(
       }
       const unfinished = state.passes.filter(
         (pass) =>
-          pass.scanId === undefined ||
-          saved.get(pass.scanId)?.progress.status === "running",
+          !pass.failed &&
+          (pass.scanId === undefined ||
+            saved.get(pass.scanId)?.progress.status === "running"),
       );
       if (
         discoveryDeadlineReached ||

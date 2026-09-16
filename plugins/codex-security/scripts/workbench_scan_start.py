@@ -56,11 +56,17 @@ def composition_children(connection: sqlite3.Connection, scan: sqlite3.Row) -> l
 
 
 def composition_child_ids(connection: sqlite3.Connection) -> set[str]:
-    parents = connection.execute(
-        "SELECT * FROM scans WHERE mode = 'deep' AND id IN "
-        "(SELECT parent_scan_id FROM scans WHERE mode = 'standard')"
-    ).fetchall()
-    return {child["id"] for parent in parents for child in composition_children(connection, parent)}
+    children = connection.execute(
+        "SELECT children.id, children.scan_dir, parents.scan_dir AS parent_scan_dir "
+        "FROM scans AS children JOIN scans AS parents ON parents.id = children.parent_scan_id "
+        "WHERE parents.mode = 'deep' AND children.mode = 'standard'"
+    )
+    return {
+        child["id"]
+        for child in children
+        if Path(child["scan_dir"]).parent
+        == Path(child["parent_scan_dir"]) / "artifacts/deep-scan/passes"
+    }
 
 
 def create_scan_directory(directory: Path) -> None:

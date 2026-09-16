@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 import { build } from "esbuild";
+import { parse as parseToml } from "smol-toml";
 
 const bundle = await build({
   bundle: true,
@@ -355,6 +356,47 @@ console.log(JSON.stringify({ type: "turn.completed", usage: { input_tokens: 0, c
           assert.equal(process.env.OPENAI_API_KEY, "synthetic-competing-key");
         }
       }
+      const prepared = await prepareNativeScan(input());
+      const executionConfig = {
+        model: "native-config-model",
+        mcp_servers: {
+          "synthetic.server": {
+            command: "synthetic-command",
+            env: { "SYNTHETIC.SETTING": "selected" },
+          },
+        },
+        shell_environment_policy: { set: { "SYNTHETIC.SETTING": "selected" } },
+        features: { plugins: false },
+      };
+      await prepared.client.dependencies
+        .createCodex({
+          codexPathOverride: executable,
+          env: {
+            ...prepared.client.dependencies.environment,
+            NATIVE_AUTH_CAPTURE: capture,
+          },
+          config: executionConfig,
+          configOverrides: ['model="explicit-model"'],
+        })
+        .startThread({ workingDirectory: root, skipGitRepoCheck: true })
+        .run("Synthetic config launch only.");
+      const configArguments = JSON.parse(await readFile(capture, "utf8")).argv;
+      for (const name of [
+        "mcp_servers",
+        "shell_environment_policy",
+        "features",
+      ]) {
+        assert.deepEqual(
+          parseToml(
+            configArguments.find((argument) => argument.startsWith(`${name}=`)),
+          )[name],
+          executionConfig[name],
+        );
+      }
+      assert.ok(
+        configArguments.indexOf('model="explicit-model"') >
+          configArguments.indexOf('model="native-config-model"'),
+      );
       const accountConfig = {
         cli_auth_credentials_store: "file",
         forced_chatgpt_workspace_id: "synthetic-workspace",
