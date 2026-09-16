@@ -708,7 +708,13 @@ def merge_saved_results(
         # Match projectDiscoveryCoverage so recovered holes retain source ownership.
         prefix = f"{worker['id']}-attempt-{worker['attempt']}"
         result = copy.deepcopy(item)
-        result["provenance"] = {"workerId": worker["id"], "attempt": worker["attempt"]}
+        provenance = result.get("provenance")
+        if not isinstance(provenance, dict):
+            provenance = {}
+        for key in ("workerId", "attempt", "sourceId", "candidateId"):
+            provenance.pop(key, None)
+        provenance.update(workerId=worker["id"], attempt=worker["attempt"])
+        result["provenance"] = provenance
         for key, name in (("id", "sourceId"), ("candidateId", "candidateId")):
             if key in item:
                 result["provenance"][name] = item[key]
