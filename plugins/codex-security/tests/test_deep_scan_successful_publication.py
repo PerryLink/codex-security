@@ -234,7 +234,8 @@ def test_publication_renders_each_source_remediation(
         retained = [canonical, *canonical["provenance"].pop("previousFindings")]
         for source in retained:
             for field in ("findingId", "occurrenceId", "fingerprints"):
-                assert source.pop(field)
+                value = source.pop(field)
+                assert value
         assert retained == sources
         coverage = json.loads((scan.scan_dir / "coverage.json").read_text())
         for field in ("documentType", "schemaVersion", "scanId"):
