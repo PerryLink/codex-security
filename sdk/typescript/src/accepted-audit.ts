@@ -9,41 +9,28 @@ export interface ScanDraftInput {
 }
 
 /** Accepted evidence may still describe partial or unknown source coverage. */
-export interface AuditEvidence {
+export type AuditOutcome<Execution> = {
+  execution: Execution;
   checkpoint?: ScanDraftInput;
-  accepted?: ScanDraftInput;
-}
-
-export type AuditOutcome<Execution> = AuditEvidence &
-  (
-    | { status: "accepted"; execution: Execution; accepted: ScanDraftInput }
-    | { status: "checkpoint"; execution: Execution }
-  );
+} & (
+  | { status: "accepted"; accepted: ScanDraftInput }
+  | { status: "checkpoint" }
+);
 
 /** One attempt; enclosing callers own retries and public completion. */
 export async function runAcceptedAudit<Execution>(input: {
   signal: AbortSignal;
   execute: () => Promise<Execution>;
-  accept: (execution: Execution) => Promise<AuditEvidence>;
+  accept: (execution: Execution) => Promise<ScanDraftInput | void>;
 }): Promise<AuditOutcome<Execution>> {
   input.signal.throwIfAborted();
   const execution = await input.execute();
   input.signal.throwIfAborted();
-  const evidence = await input.accept(execution);
+  const checkpoint = await input.accept(execution);
   input.signal.throwIfAborted();
-  return evidence.accepted === undefined
-    ? { ...evidence, execution, status: "checkpoint" }
-    : {
-        ...evidence,
-        execution,
-        status: "accepted",
-        accepted: evidence.accepted,
-      };
-}
-
-/** Process completion alone does not accept an unfinished audit checkpoint. */
-export function auditEvidence(checkpoint: ScanDraftInput): AuditEvidence {
+  if (checkpoint === undefined) return { execution, status: "checkpoint" };
+  // Process completion alone does not accept an unfinished audit checkpoint.
   return checkpoint.complete === false
-    ? { checkpoint }
-    : { checkpoint, accepted: checkpoint };
+    ? { checkpoint, execution, status: "checkpoint" }
+    : { checkpoint, execution, status: "accepted", accepted: checkpoint };
 }

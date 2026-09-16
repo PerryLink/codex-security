@@ -1,5 +1,5 @@
 import type { ScanDraftInput } from "../artifact-scan-draft.js";
-import { auditEvidence, runAcceptedAudit } from "../../../../../sdk/typescript/src/accepted-audit.js";
+import { runAcceptedAudit } from "../../../../../sdk/typescript/src/accepted-audit.js";
 import { createHash } from "node:crypto";
 import { promises as fs } from "node:fs";
 import { dirname, join } from "node:path";
@@ -538,7 +538,7 @@ export class DeepScanWorkerRunner {
             throw withWorkerDiagnostics(validationError, result.diagnostics);
           }
           validationCompleted = accepted?.complete !== false;
-          return accepted === undefined ? {} : auditEvidence(accepted);
+          return accepted;
         };
         // Reducers keep their aggregate contract; discovery uses the shared audit.
         const audit = input.kind === "discovery"

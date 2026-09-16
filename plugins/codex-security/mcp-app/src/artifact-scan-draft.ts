@@ -995,11 +995,10 @@ function parseSemanticScanDraft(input: unknown, schema: z.ZodType<ScanDraftInput
 export function parsePersistedScanDraft(
   input: Record<string, unknown>
 ): ScanDraftInput {
-  return parsePersistedDraft(input, scanDraftInputSchema);
+  return parsePersistedDraft(structuredClone(input), scanDraftInputSchema);
 }
 
-function parsePersistedDraft(input: Record<string, unknown>, schema: z.ZodType<ScanDraftInput>): ScanDraftInput {
-  const compatible = structuredClone(input);
+function parsePersistedDraft(compatible: Record<string, unknown>, schema: z.ZodType<ScanDraftInput>): ScanDraftInput {
   if (Array.isArray(compatible.findings)) {
     for (const finding of compatible.findings) {
       if (isObject(finding)) normalizePersistedFindingDetails(finding);

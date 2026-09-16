@@ -19,7 +19,7 @@ const bundle = await build({
 const {
   createDeepScanArtifacts, recordCodexSecurityScanDraft,
   recordCodexSecurityWorkerScanDraft, validateDiscoveryArtifacts,
-  readDiscoveryAuditDraft, auditEvidence, runAcceptedAudit,
+  readDiscoveryAuditDraft, runAcceptedAudit,
 } = await import(`data:text/javascript;base64,${Buffer.from(bundle.outputFiles[0].contents).toString("base64")}`);
 
 const scanId = "811aef98-3709-4c2d-8b7a-742977521865";
@@ -72,9 +72,9 @@ for (const completeness of ["complete", "partial", "unknown"]) {
       assert.equal(JSON.parse(await readFile(path.join(scanDir, "scan-manifest.json"))).scan.complete, false);
       const controller = new AbortController();
       const execute = async () => ({ threadId: "audit-conversation", usage: null });
-      const accept = async () => auditEvidence(await readDiscoveryAuditDraft(
+      const accept = async () => await readDiscoveryAuditDraft(
         artifacts, path.join(workerRoot, "result.json"), scanId,
-      ));
+      );
       const unfinished = await runAcceptedAudit({ signal: controller.signal, execute, accept });
       assert.equal(unfinished.status, "checkpoint");
       assert.equal(unfinished.checkpoint.complete, false);

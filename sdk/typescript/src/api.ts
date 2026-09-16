@@ -1,7 +1,6 @@
 /// <reference lib="esnext.disposable" preserve="true" />
 
 import {
-  auditEvidence,
   runAcceptedAudit,
   type ScanDraftInput,
 } from "./accepted-audit.js";
@@ -3736,7 +3735,7 @@ export async function runScanEvents(
       }
       return { ...turn, threadId, status };
     };
-    const accept = async () => {
+    const accept = async (): Promise<ScanDraftInput> => {
       // Matching, custom validation and the canonical seal remain with the caller.
       const [manifest, findings, coverage] = await Promise.all(
         ["scan-manifest.json", "findings.json", "coverage.json"].map(
@@ -3753,13 +3752,12 @@ export async function runScanEvents(
           pathToFileURL(join(options.pluginRoot, "mcp/helpers.mjs")).href
         )
       ).default;
-      const draft: ScanDraftInput = helper.parseCanonicalScanDraft({
+      return helper.parseCanonicalScanDraft({
         scanId: options.scanId ?? manifest.scan.id,
         manifest,
         findings,
         coverage,
       });
-      return auditEvidence(draft);
     };
     const audit = await runAcceptedAudit({
       signal: options.signal,
