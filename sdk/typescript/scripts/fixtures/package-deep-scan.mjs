@@ -474,7 +474,10 @@ async function readExecutions(f) {
 async function assertExecutions(f, scanId, preflights = 3) {
   const executions = await readExecutions(f);
   for (const execution of executions) {
-    assert.equal(execution.python, f.env.PYTHON);
+    assert.equal(
+      await realpath(execution.python),
+      await realpath(f.env.PYTHON),
+    );
   }
   const workers = executions.filter((entry) => entry.phase === "worker");
   const reducers = executions.filter((entry) => entry.phase === "reducer");
