@@ -337,15 +337,19 @@ function publicationRunner(fixture, { before, after } = {}) {
 }
 
 for (const workflow of ["deep-scan-mcp/v1", "deep-security-scan/v1"]) {
-  for (const loseResponse of [false, true]) {
-    test(`${workflow} finishes the same call after accepted publication (lost=${loseResponse})`, async (t) => {
+  for (const [loseResponse, receiptIoFailure] of [[false, false], [true, false], [false, true]]) {
+    test(`${workflow} finishes accepted publication (lost=${loseResponse}, receipt I/O failure=${receiptIoFailure})`, async (t) => {
       const f = await publicationFixture(t, workflow);
+      if (receiptIoFailure) f.environment.TEST_WORKBENCH_RECEIPT_IO_FAILURE = "1";
       const before = await f.workers();
       const sources = await Promise.all(f.results.map((file) => readFile(file)));
       let accepted;
-      const runner = publicationRunner(f, { after: async (attempt) => {
+      const runner = publicationRunner(f, { after: async (attempt, { draftPath }) => {
         if (attempt === 1) accepted = await snapshot(f.run);
         else assert.deepEqual(await snapshot(f.run), accepted);
+        if (receiptIoFailure) {
+          await assert.rejects(readFile(draftPath.replace(/\.json$/, ".accepted.json")), { code: "ENOENT" });
+        }
         if (loseResponse && attempt === 1) throw new Error("Synthetic accepted publication response loss");
       } });
       let publications = 0;
@@ -380,6 +384,25 @@ for (const workflow of ["deep-scan-mcp/v1", "deep-security-scan/v1"]) {
     });
   }
 }
+
+test("receipt I/O failure cannot authorize replay after response loss", async (t) => {
+  const f = await publicationFixture(t);
+  f.environment.TEST_WORKBENCH_RECEIPT_IO_FAILURE = "1";
+  const workers = await f.workers();
+  const lost = new Error("Synthetic accepted publication response loss");
+  let accepted;
+  const runner = publicationRunner(f, { after: async (_attempt, { draftPath }) => {
+    accepted = await snapshot(f.run);
+    await assert.rejects(readFile(draftPath.replace(/\.json$/, ".accepted.json")), { code: "ENOENT" });
+    throw lost;
+  } });
+  await assert.rejects(f.publish(runner.run), (error) => error === lost);
+  assert.equal(runner.requests.length, 1);
+  assert.equal(runner.writes(), 1);
+  assert.deepEqual(await snapshot(f.run), accepted);
+  assert.deepEqual(await f.workers(), workers);
+  assert.deepEqual(await readdir(path.join(f.run.scanDir, "drafts")), []);
+});
 
 for (const code of ["EACCES", "ECONNRESET"]) {
   for (const matching of [false, true]) {

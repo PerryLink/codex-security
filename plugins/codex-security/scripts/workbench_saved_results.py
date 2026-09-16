@@ -1515,14 +1515,18 @@ def write_scan_draft(db: Any, connection: Any, args: Any) -> dict[str, Any]:
                     "checkpoint": checkpoint if args.checkpoint_path is not None else None,
                 },
             }
-            write_scan_local_bytes(
-                scan_dir,
-                Path(args.draft_path)
-                .with_suffix(".accepted.json")
-                .relative_to(scan_dir)
-                .as_posix(),
-                (json.dumps(acceptance, allow_nan=False, indent=2) + "\n").encode(),
-            )
+            try:
+                write_scan_local_bytes(
+                    scan_dir,
+                    Path(args.draft_path)
+                    .with_suffix(".accepted.json")
+                    .relative_to(scan_dir)
+                    .as_posix(),
+                    (json.dumps(acceptance, allow_nan=False, indent=2) + "\n").encode(),
+                )
+            except OSError:
+                # Publication succeeded; a missing receipt still prevents lost-response replay.
+                pass
         # Accepted Standard drafts are evidence of review or report assembly,
         # even when the parent omitted its explicit progress call.
         if scan["mode"] == "standard":

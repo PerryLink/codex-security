@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import copy
+import errno
 import json
+import os
 import uuid
 from argparse import Namespace
+from pathlib import Path
 
 import pytest
 from test_deep_scan_successful_publication import add_worker
@@ -183,3 +186,61 @@ def test_failed_publication_does_not_acknowledge_staged_input(
         workbench_api["write_scan_draft"](workbench_db, args)
 
     assert {path: path.read_bytes() for path in (scan.scan_dir / "drafts").iterdir()} == staged
+
+
+@pytest.mark.parametrize("workflow", ["deep-scan-mcp/v1", "deep-security-scan/v1"])
+@pytest.mark.parametrize("failure", ["write", "rename"])
+def test_receipt_io_failure_preserves_successful_publication(
+    workbench_api, workbench_db, publication_scan, monkeypatch, workflow, failure
+):
+    scan = publication_scan()
+    result = add_worker(workbench_db, scan)
+    with workbench_db:
+        workbench_db.execute(
+            "UPDATE deep_scan_runs SET workflow_version = ?, coordinator_generation = 2 "
+            "WHERE scan_id = ?",
+            (workflow, scan.scan_id),
+        )
+        workbench_db.execute(
+            "UPDATE deep_scan_workers SET kind = 'dedup', merge_state = 'none' WHERE scan_id = ?",
+            (scan.scan_id,),
+        )
+    args = stage_publication(scan, generation=2, result_path=result, title="Accepted aggregate")
+    draft = json.loads(Path(args.draft_path).read_text())
+    staged = {path: path.read_bytes() for path in (scan.scan_dir / "drafts").iterdir()}
+    saved_results = workbench_api["saved_results"]
+    original_write = saved_results.write_scan_local_bytes
+    original_replace = os.replace
+    failures = []
+
+    def fail_receipt(filename):
+        failures.append(filename)
+        # The fault occurs only after all three canonical files have been published.
+        for name, document in (
+            ("findings.json", draft["findings"]),
+            ("coverage.json", draft["coverage"]),
+            ("scan-manifest.json", draft["manifest"]),
+        ):
+            assert json.loads((scan.scan_dir / name).read_text()) == document
+        raise OSError(errno.ENOSPC, "Synthetic receipt I/O failure", filename)
+
+    def write_file(scan_dir, filename, contents):
+        if failure == "write" and filename.endswith(".accepted.json"):
+            fail_receipt(filename)
+        return original_write(scan_dir, filename, contents)
+
+    def replace_file(source, destination, *args, **kwargs):
+        if failure == "rename" and str(destination).endswith(".accepted.json"):
+            fail_receipt(destination)
+        return original_replace(source, destination, *args, **kwargs)
+
+    monkeypatch.setattr(saved_results, "write_scan_local_bytes", write_file)
+    monkeypatch.setattr(os, "replace", replace_file)
+
+    assert workbench_api["write_scan_draft"](workbench_db, args) == {
+        "scanId": scan.scan_id,
+        "status": "draft_written",
+    }
+    assert len(failures) == 1
+    assert {path: path.read_bytes() for path in (scan.scan_dir / "drafts").iterdir()} == staged
+    assert len(list((scan.scan_dir / "checkpoints").glob("*.json"))) == 1
