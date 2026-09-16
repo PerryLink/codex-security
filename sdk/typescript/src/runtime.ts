@@ -109,11 +109,16 @@ import sys
 
 module = run_path(sys.argv[1])
 try:
-    module["write_scan_local_bytes"](
-        Path(sys.argv[2]),
-        sys.argv[3],
-        sys.stdin.buffer.read(),
-        expected_root_identity=(int(sys.argv[4]), int(sys.argv[5])),
+    operation = {
+        "restore": "write_scan_local_bytes",
+        "prepareDirectory": "prepare_scan_local_directory",
+        "remove": "_remove_scan_local_file_if_exists",
+    }[sys.argv[6]]
+    arguments = [Path(sys.argv[2]), sys.argv[3]]
+    if sys.argv[6] == "restore":
+        arguments.append(sys.stdin.buffer.read())
+    module[operation](
+        *arguments, expected_root_identity=(int(sys.argv[4]), int(sys.argv[5]))
     )
 except (module["ContractError"], OSError) as error:
     raise SystemExit(str(error))
@@ -1742,7 +1747,12 @@ export async function validateOutputDir(
 export async function prepareScanArtifactRestorer(
   options: WorkbenchCommandOptions,
   scanDirectory: string,
-): Promise<ScanArtifactRestorer> {
+): Promise<
+  ScanArtifactRestorer & {
+    prepareDirectory(relativePath: string): Promise<void>;
+    remove(relativePath: string): Promise<void>;
+  }
+> {
   let helperPath: string;
   let canonicalPath: string;
   let dev: string;
@@ -1800,43 +1810,53 @@ export async function prepareScanArtifactRestorer(
     );
   }
 
-  return {
-    async restore(relativePath, contents) {
-      try {
-        const result = await runCodexCommand(
-          { command: options.python },
-          [
-            "-I",
-            "-X",
-            "utf8",
-            "-B",
-            "-c",
-            RESTORE_SCAN_ARTIFACT_PROGRAM,
-            helperPath,
-            canonicalPath,
-            relativePath,
-            dev,
-            ino,
-          ],
-          pluginHelperEnvironment(options.environment),
-          contents,
-          options.signal,
-        );
-        if (!result.success) {
-          throw new Error(
-            result.stderr.trim() ||
-              result.stdout.trim() ||
-              `Artifact restoration exited with status ${result.exitCode}.`,
-          );
-        }
-      } catch (error) {
-        if (options.signal?.aborted) throw error;
-        throw new OutputDirectoryError(
-          "Could not safely restore a completed scan artifact.",
-          { cause: error },
+  const update = async (
+    operation: "restore" | "prepareDirectory" | "remove",
+    relativePath: string,
+    contents?: Uint8Array,
+  ): Promise<void> => {
+    try {
+      const result = await runCodexCommand(
+        { command: options.python },
+        [
+          "-I",
+          "-X",
+          "utf8",
+          "-B",
+          "-c",
+          RESTORE_SCAN_ARTIFACT_PROGRAM,
+          helperPath,
+          canonicalPath,
+          relativePath,
+          dev,
+          ino,
+          operation,
+        ],
+        pluginHelperEnvironment(options.environment),
+        contents,
+        options.signal,
+      );
+      if (!result.success) {
+        throw new Error(
+          result.stderr.trim() ||
+            result.stdout.trim() ||
+            `Artifact restoration exited with status ${result.exitCode}.`,
         );
       }
-    },
+    } catch (error) {
+      if (options.signal?.aborted) throw error;
+      throw new OutputDirectoryError(
+        operation === "restore"
+          ? "Could not safely restore a completed scan artifact."
+          : "Could not safely update a scan artifact.",
+        { cause: error },
+      );
+    }
+  };
+  return {
+    restore: (path, contents) => update("restore", path, contents),
+    prepareDirectory: (path) => update("prepareDirectory", path),
+    remove: (path) => update("remove", path),
   };
 }
 

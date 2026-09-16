@@ -71,6 +71,8 @@ export class TestClient extends CodexSecurity {
         acquireScanExecution: async () => () => {},
         prepareScanArtifactRestorer: async () => ({
           restore: async () => {},
+          prepareDirectory: async () => {},
+          remove: async () => {},
         }),
         runWorkbench: async (_options, args, input) =>
           mockWorkbench(args, input),

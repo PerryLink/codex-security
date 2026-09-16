@@ -1,18 +1,30 @@
 import assert from "node:assert/strict";
-import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import {
+  chmod,
+  mkdir,
+  mkdtemp,
+  readFile,
+  realpath,
+  rm,
+  writeFile,
+} from "node:fs/promises";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
+import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 import { build } from "esbuild";
 import { parse as parseToml } from "smol-toml";
 
 const bundle = await build({
   bundle: true,
-  entryPoints: [
-    fileURLToPath(new URL("../src/native-scan.ts", import.meta.url)),
-  ],
+  stdin: {
+    contents: `export * from ${JSON.stringify(fileURLToPath(new URL("../src/native-scan.ts", import.meta.url)))};
+      export { createNativeCodex } from ${JSON.stringify(fileURLToPath(new URL("../src/native-codex.ts", import.meta.url)))};
+      export { scanRuntimeCodexConfig } from ${JSON.stringify(fileURLToPath(new URL("../../../../sdk/typescript/src/api.ts", import.meta.url)))};`,
+    resolveDir: fileURLToPath(new URL("../src/", import.meta.url)),
+  },
   define: {
     "import.meta.url": JSON.stringify(
       new URL("../src/native-scan.ts", import.meta.url).href,
@@ -44,8 +56,69 @@ new Function("require", "module", "exports", bundle.outputFiles[0].text)(
   module,
   module.exports,
 );
-const { NativeScanHost, prepareNativeScan, nativeScanConfiguration } =
-  module.exports;
+const {
+  NativeScanHost,
+  prepareNativeScan,
+  nativeScanConfiguration,
+  scanRuntimeCodexConfig,
+  createNativeCodex,
+} = module.exports;
+
+async function collectNativeEvents(thread, prompt, options) {
+  const { events } = await thread.runStreamed(prompt, options);
+  const collected = [];
+  for await (const event of events) collected.push(event);
+  return collected;
+}
+
+function syntheticPermissionAppServer() {
+  return `function servePermissionProfiles() {
+  const { parse } = require(${JSON.stringify(createRequire(import.meta.url).resolve("smol-toml"))});
+  const config = {};
+  const argv = process.argv.slice(2);
+  function merge(target, value) {
+    for (const [key, child] of Object.entries(value)) {
+      if (child && typeof child === "object" && !Array.isArray(child)) {
+        target[key] = merge(target[key] ?? {}, child);
+      } else target[key] = child;
+    }
+    return target;
+  }
+  for (let index = 0; index < argv.length; index++) {
+    if (argv[index] === "--config" || argv[index] === "-c") merge(config, parse(argv[++index]));
+  }
+  const scenario = process.env.NATIVE_PROFILE_SCENARIO
+    ? fs.readFileSync(process.env.NATIVE_PROFILE_SCENARIO, "utf8").trim() : "valid";
+  const selected = config.default_permissions;
+  const profile = config.permissions[selected];
+  profile.description = "Synthetic profile description";
+  profile.network.fixtureNull = null;
+  if (scenario === "substituted-default") config.default_permissions = ":read-only";
+  if (scenario === "substituted-profile") {
+    for (const [key, value] of Object.entries(profile.filesystem)) {
+      if (value === "deny") delete profile.filesystem[key];
+    }
+  }
+  const capture = (value) => {
+    if (process.env.NATIVE_PROFILE_CAPTURE) fs.appendFileSync(process.env.NATIVE_PROFILE_CAPTURE, JSON.stringify(value) + "\\n");
+  };
+  capture({ kind: "preflight", argv, cwd: process.cwd(), marker: process.env.NATIVE_PROFILE_MARKER,
+    codex: process.env.CODEX_API_KEY, openai: process.env.OPENAI_API_KEY });
+  require("node:readline").createInterface({ input: process.stdin }).on("line", (line) => {
+    const request = JSON.parse(line);
+    capture({ kind: "request", method: request.method, params: request.params });
+    if (request.id === undefined) return;
+    let result;
+    if (request.method === "initialize") result = {};
+    else if (request.method === "config/read") result = { config };
+    else if (request.method === "permissionProfile/list") result = request.params?.cursor === "selected-page"
+      ? { data: [{ id: selected, allowed: scenario !== "disallowed" }], nextCursor: null }
+      : { data: [{ id: "other-profile", allowed: true }], nextCursor: "selected-page" };
+    else throw new Error("Unexpected app-server request " + request.method);
+    console.log(JSON.stringify({ id: request.id, result }));
+  });
+}`;
+}
 
 function input(id = "parent") {
   return {
@@ -206,6 +279,214 @@ test("native launches snapshot safety identifiers and prefer saved recipes", asy
 });
 
 test(
+  "native worker turns verify the selected permissions before fresh and resumed execution",
+  {
+    skip:
+      process.platform === "win32"
+        ? "Synthetic executable uses a POSIX shebang."
+        : false,
+  },
+  async () => {
+    const root = await realpath(
+      await mkdtemp(join(tmpdir(), "native-permission-child-")),
+    );
+    const executable = join(root, "codex");
+    const capture = join(root, "capture.jsonl");
+    const scenario = join(root, "scenario");
+    const fallback =
+      "Configured value for `permission_profile` is disallowed by requirements; falling back from `codex_security_scan` to required value `:read-only`.";
+    const observations = async () =>
+      (await readFile(capture, "utf8"))
+        .trim()
+        .split("\n")
+        .filter(Boolean)
+        .map(JSON.parse);
+    const rawConfig = (argv) =>
+      argv.flatMap((value, index) =>
+        value === "--config" || value === "-c" ? [argv[index + 1]] : [],
+      );
+    const permissionError = (error) => {
+      assert.equal(error.constructor.name, "ScanPermissionError");
+      return true;
+    };
+    try {
+      await writeFile(
+        executable,
+        `#!${process.execPath}
+const fs = require("node:fs");
+${syntheticPermissionAppServer()}
+if (process.argv.includes("app-server")) {
+  servePermissionProfiles();
+} else {
+  const capture = (value) => fs.appendFileSync(process.env.NATIVE_PROFILE_CAPTURE, JSON.stringify(value) + "\\n");
+  capture({ kind: "exec", argv: process.argv.slice(2), marker: process.env.NATIVE_PROFILE_MARKER,
+    codex: process.env.CODEX_API_KEY, openai: process.env.OPENAI_API_KEY });
+  console.log(JSON.stringify({ type: "thread.started", thread_id: "synthetic-worker-thread" }));
+  const scenario = fs.readFileSync(process.env.NATIVE_PROFILE_SCENARIO, "utf8").trim();
+  if (scenario.startsWith("late-fallback")) {
+    process.on("SIGTERM", () => { capture({ kind: "aborted" }); process.exit(0); });
+    console.log(JSON.stringify(scenario === "late-fallback-error"
+      ? { type: "error", message: ${JSON.stringify(fallback)} }
+      : { type: "item.completed", item: { type: "error", message: ${JSON.stringify(fallback)} } }));
+    setTimeout(() => {
+      console.log(JSON.stringify({ type: "item.completed", item: { type: "agent_message", text: "must not be consumed" } }));
+      console.log(JSON.stringify({ type: "turn.completed", usage: { input_tokens: 0, cached_input_tokens: 0, output_tokens: 0 } }));
+      process.exit(0);
+    }, 500);
+  } else {
+    console.log(JSON.stringify({ type: "turn.completed", usage: { input_tokens: 0, cached_input_tokens: 0, output_tokens: 0 } }));
+  }
+}
+`,
+        { mode: 0o700 },
+      );
+      for (const role of ["discovery", "merge", "comparison"]) {
+        const cwd = join(root, role);
+        await mkdir(cwd);
+        const config = scanRuntimeCodexConfig(
+          { approval_policy: "on-request" },
+          root,
+          {
+            filesystem: {
+              [join(root, "private")]: "deny",
+              glob_scan_max_depth: 3,
+            },
+            network: { enabled: false },
+          },
+        );
+        const profileId =
+          role === "comparison"
+            ? "codex_security_comparison"
+            : "codex_security_scan";
+        const configOverrides = [
+          `default_permissions=${JSON.stringify(profileId)}`,
+        ];
+        if (role === "comparison") {
+          configOverrides.push(
+            `permissions.codex_security_comparison={extends=":read-only",filesystem={${JSON.stringify(join(root, "private"))}="deny"},network={enabled=false}}`,
+          );
+        }
+        const sdk = createNativeCodex({
+          codexPathOverride: executable,
+          config: { ...config, default_permissions: ":read-only" },
+          configOverrides,
+          apiKey: "synthetic-final-key",
+          env: {
+            CODEX_HOME: root,
+            CODEX_API_KEY: "synthetic-stale-key",
+            NATIVE_PROFILE_CAPTURE: capture,
+            NATIVE_PROFILE_SCENARIO: scenario,
+            NATIVE_PROFILE_MARKER: role,
+          },
+        });
+        for (const resumed of [false, true]) {
+          const options = {
+            workingDirectory: cwd,
+            skipGitRepoCheck: true,
+            approvalPolicy: "never",
+            ...(role === "comparison"
+              ? { networkAccessEnabled: false, webSearchMode: "disabled" }
+              : {}),
+          };
+          const thread = resumed
+            ? sdk.resumeThread(`synthetic-${role}-thread`, options)
+            : sdk.startThread(options);
+          await writeFile(scenario, "valid");
+          await writeFile(capture, "");
+          const events = await collectNativeEvents(
+            thread,
+            "Synthetic permission verification.",
+          );
+          assert.equal(events.at(-1).type, "turn.completed");
+          assert.equal(thread.id, "synthetic-worker-thread");
+          const observed = await observations();
+          const preflight = observed.find(
+            (entry) => entry.kind === "preflight",
+          );
+          const executed = observed.find((entry) => entry.kind === "exec");
+          assert.equal(preflight.cwd, cwd);
+          assert.equal(executed.argv[executed.argv.indexOf("--cd") + 1], cwd);
+          assert.equal(executed.argv.includes("resume"), resumed);
+          assert.deepEqual(rawConfig(preflight.argv), rawConfig(executed.argv));
+          assert.equal(
+            rawConfig(preflight.argv).at(-1),
+            'approval_policy="never"',
+          );
+          for (const process of [preflight, executed]) {
+            assert.equal(process.marker, role);
+            assert.equal(process.codex, "synthetic-final-key");
+            assert.equal(process.openai, undefined);
+          }
+          const requests = observed.filter((entry) => entry.kind === "request");
+          assert.deepEqual(
+            requests.map((entry) => entry.method),
+            [
+              "initialize",
+              "initialized",
+              "config/read",
+              "permissionProfile/list",
+              "permissionProfile/list",
+            ],
+          );
+          for (const request of requests.slice(2))
+            assert.equal(request.params.cwd, cwd);
+          assert.equal(requests.at(-1).params.cursor, "selected-page");
+          if (role === "comparison") break;
+
+          for (const rejectedScenario of [
+            "disallowed",
+            "substituted-default",
+            "substituted-profile",
+          ]) {
+            await writeFile(scenario, rejectedScenario);
+            await writeFile(capture, "");
+            await assert.rejects(
+              collectNativeEvents(thread, "Recheck the same worker turn."),
+              permissionError,
+            );
+            assert.equal(
+              (await observations()).filter((entry) => entry.kind === "exec")
+                .length,
+              0,
+            );
+          }
+          for (const lateScenario of [
+            "late-fallback-item",
+            "late-fallback-error",
+          ]) {
+            await writeFile(scenario, lateScenario);
+            await writeFile(capture, "");
+            const streamed = await thread.runStreamed(
+              "Stop on a late permission fallback.",
+            );
+            const yielded = [];
+            await assert.rejects(async () => {
+              for await (const event of streamed.events) yielded.push(event);
+            }, permissionError);
+            assert.deepEqual(
+              yielded.map((event) => event.type),
+              ["thread.started"],
+            );
+            for (let attempt = 0; attempt < 100; attempt += 1) {
+              if (
+                (await observations()).some((entry) => entry.kind === "aborted")
+              )
+                break;
+              await delay(10);
+            }
+            assert.ok(
+              (await observations()).some((entry) => entry.kind === "aborted"),
+            );
+          }
+        }
+      }
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  },
+);
+
+test(
   "native-selected credentials reach actual SDK child processes",
   {
     skip:
@@ -233,6 +514,10 @@ test(
         executable,
         `#!${process.execPath}
 const fs = require("node:fs");
+${syntheticPermissionAppServer()}
+if (process.argv.includes("app-server")) {
+  servePermissionProfiles();
+} else {
 if (process.argv.includes("login")) {
   fs.writeFileSync(${JSON.stringify(join(root, "login.json"))}, JSON.stringify({
     codex: process.env.CODEX_API_KEY,
@@ -255,6 +540,7 @@ fs.writeFileSync(process.env.NATIVE_AUTH_CAPTURE, JSON.stringify({
 }));
 console.log(JSON.stringify({ type: "thread.started", thread_id: "synthetic-auth-thread" }));
 console.log(JSON.stringify({ type: "turn.completed", usage: { input_tokens: 0, cached_input_tokens: 0, output_tokens: 0 } }));
+}
 `,
       );
       await chmod(executable, 0o700);
@@ -328,15 +614,23 @@ console.log(JSON.stringify({ type: "turn.completed", usage: { input_tokens: 0, c
           );
           const sdk = prepared.client.dependencies.createCodex({
             codexPathOverride: executable,
-            config: prepared.client.config.codexOverrides,
+            config: scanRuntimeCodexConfig(
+              prepared.client.config.codexOverrides,
+              root,
+              {
+                filesystem: { [join(root, "private")]: "deny" },
+                network: { enabled: false },
+              },
+            ),
             env: {
               ...prepared.client.dependencies.environment,
               NATIVE_AUTH_CAPTURE: capture,
             },
           });
-          await sdk
-            .startThread({ workingDirectory: root, skipGitRepoCheck: true })
-            .run("Synthetic credential launch only.");
+          await collectNativeEvents(
+            sdk.startThread({ workingDirectory: root, skipGitRepoCheck: true }),
+            "Synthetic credential launch only.",
+          );
           const observed = JSON.parse(await readFile(capture, "utf8"));
           assert.ok(observed.argv.includes('approval_policy="never"'));
           assert.equal(observed.codex, "synthetic-native-selected");
@@ -358,12 +652,13 @@ console.log(JSON.stringify({ type: "turn.completed", usage: { input_tokens: 0, c
           assert.equal(process.env.CODEX_API_KEY, "synthetic-native-selected");
           assert.equal(process.env.OPENAI_API_KEY, "synthetic-competing-key");
           if (!selected) {
-            await sdk
-              .resumeThread("synthetic-auth-thread", {
+            await collectNativeEvents(
+              sdk.resumeThread("synthetic-auth-thread", {
                 workingDirectory: root,
                 skipGitRepoCheck: true,
-              })
-              .run("Synthetic resumed launch only.");
+              }),
+              "Synthetic resumed launch only.",
+            );
             const resumed = JSON.parse(await readFile(capture, "utf8"));
             assert.ok(resumed.argv.includes('approval_policy="never"'));
             assert.equal(
@@ -385,18 +680,25 @@ console.log(JSON.stringify({ type: "turn.completed", usage: { input_tokens: 0, c
         shell_environment_policy: { set: { "SYNTHETIC.SETTING": "selected" } },
         features: { plugins: false },
       };
-      await prepared.client.dependencies
-        .createCodex({
-          codexPathOverride: executable,
-          env: {
-            ...prepared.client.dependencies.environment,
-            NATIVE_AUTH_CAPTURE: capture,
-          },
-          config: executionConfig,
-          configOverrides: ['model="explicit-model"'],
-        })
-        .startThread({ workingDirectory: root, skipGitRepoCheck: true })
-        .run("Synthetic config launch only.");
+      const configuredSdk = prepared.client.dependencies.createCodex({
+        codexPathOverride: executable,
+        env: {
+          ...prepared.client.dependencies.environment,
+          NATIVE_AUTH_CAPTURE: capture,
+        },
+        config: scanRuntimeCodexConfig(executionConfig, root, {
+          filesystem: { [join(root, "private")]: "deny" },
+          network: { enabled: false },
+        }),
+        configOverrides: ['model="explicit-model"'],
+      });
+      await collectNativeEvents(
+        configuredSdk.startThread({
+          workingDirectory: root,
+          skipGitRepoCheck: true,
+        }),
+        "Synthetic config launch only.",
+      );
       const configArguments = JSON.parse(await readFile(capture, "utf8")).argv;
       for (const name of [
         "mcp_servers",

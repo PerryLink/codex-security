@@ -920,14 +920,16 @@ def start_scan(connection: sqlite3.Connection, args: argparse.Namespace) -> dict
 
 def begin_deep_scan(connection: sqlite3.Connection, args: argparse.Namespace) -> dict[str, Any]:
     """Bind native Deep entry to the same registered scan used by the SDK host."""
+    claim_token = args.claim_token
     if args.scan_id is None:
         target = require_target(args.target_path)
         require_scannable_target(target)
         scan = scan_history.existing_deep_scan_for_target(
             connection, args.thread_id, str(target), require_scope(args.scope, "deep", target)
         )
-        if scan is None or scan["handoff_claim_token"] is not None:
+        if scan is None:
             return _start_prompt_driven_scan(connection, args, headless_standard=True)
+        claim_token = scan["handoff_claim_token"] if scan["handoff_status"] == "delivered" else None
     else:
         scan = require_scan(connection, args.scan_id)
     workspace = require_workspace(connection, scan["workspace_id"])
@@ -935,7 +937,7 @@ def begin_deep_scan(connection: sqlite3.Connection, args: argparse.Namespace) ->
     if owner != args.thread_id or scan["mode"] != "deep":
         raise SystemExit("A Deep Scan can only be resumed by its owning Codex thread.")
     handoff.require_current_continuation(
-        scan, args.claim_token, error_message="Deep Scan is owned by another continuation."
+        scan, claim_token, error_message="Deep Scan is owned by another continuation."
     )
     if scan["status"] == "running" and scan["canceled_at"] is None:
         require_scan_target_identity(scan)
@@ -1336,13 +1338,13 @@ def complete_scan_locked(
             checkpoint = read_composition_checkpoint(scan) if scan["mode"] == "deep" else None
             if (
                 checkpoint is not None
-                and checkpoint.get("terminalReason") == "capped"
+                and checkpoint.get("terminalReason") in {"capped", "saturated"}
                 and any(
                     item.get("scanId") not in checkpoint["mergedScanIds"]
                     for item in checkpoint["passes"]
                 )
             ):
-                # A saved deadline can expire before resumed children run again.
+                # A saved stopping condition can be reached before resumed children run again.
                 for child in composition_children(connection, scan):
                     if (
                         child["id"] not in checkpoint["mergedScanIds"]

@@ -2055,6 +2055,55 @@ describe("plugin runtime preparation", () => {
     },
   );
 
+  test("keeps scan artifact directories, staging and cleanup inside the checked root", async () => {
+    const root = await temporaryDirectory();
+    const scanDir = join(root, "scan");
+    const sibling = join(root, "sibling");
+    await Promise.all([
+      mkdir(scanDir, { mode: 0o700 }),
+      mkdir(sibling, { mode: 0o700 }),
+    ]);
+    const python = Bun.which("python3") ?? Bun.which("python");
+    expect(python).not.toBeNull();
+    const writer = await prepareScanArtifactRestorer(
+      { python: python!, pluginRoot: PLUGIN_ROOT, environment: {} },
+      scanDir,
+    );
+    await writer.prepareDirectory("artifacts/deep-scan/merge");
+    await writer.restore(
+      "artifacts/deep-scan/merge/retained.json",
+      Buffer.from("{}"),
+    );
+    await writer.prepareDirectory("artifacts/deep-scan/merge");
+    expect(
+      await readFile(
+        join(scanDir, "artifacts/deep-scan/merge/retained.json"),
+        "utf8",
+      ),
+    ).toBe("{}");
+    await writer.restore("drafts/staged.json", Buffer.from("{}"));
+    await writer.remove("drafts/staged.json");
+    expect(await readdir(join(scanDir, "drafts"))).toEqual([]);
+
+    await writeFile(join(sibling, "retained.json"), "preserved");
+    await symlink(
+      sibling,
+      join(scanDir, "linked"),
+      process.platform === "win32" ? "junction" : "dir",
+    );
+    for (const operation of [
+      () => writer.prepareDirectory("linked/merge"),
+      () => writer.restore("linked/staged.json", Buffer.from("{}")),
+      () => writer.remove("linked/retained.json"),
+    ]) {
+      await expect(operation()).rejects.toThrow("Could not safely");
+      expect(await readdir(sibling)).toEqual(["retained.json"]);
+      expect(await readFile(join(sibling, "retained.json"), "utf8")).toBe(
+        "preserved",
+      );
+    }
+  });
+
   test("resolves the exact npm Codex executable", () => {
     const command = resolveCodexCommand();
     expect(isAbsolute(command.command)).toBe(true);

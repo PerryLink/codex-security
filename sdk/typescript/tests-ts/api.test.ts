@@ -53,6 +53,7 @@ import {
 import { estimateScanCost, type ScanCost } from "../src/cost.js";
 import { resolveCodexCommand, runWorkbench } from "../src/runtime.js";
 import { matchScanFindingsInternal } from "../src/scan-comparison.js";
+import { ScanPermissionError } from "../src/scan-execution.js";
 import { normalizeTarget } from "../src/targets.js";
 import { SYNTHETIC_CREDENTIALS } from "./cli-fixtures.js";
 import { INTEGRATION_TARGET, PLUGIN_ROOT } from "./plugin-root.js";
@@ -4102,11 +4103,12 @@ describe("CodexSecurity orchestration", () => {
   });
 
   test.each([
-    ["the follow-up turn", false, "Could not draft fixes."],
-    ["artifact restoration setup", true, "restoration setup failed"],
+    ["the follow-up turn", false, "Could not draft fixes.", false],
+    ["artifact restoration setup", true, "restoration setup failed", false],
+    ["required worker permissions", false, "Permission profile changed", true],
   ] as const)(
-    "warns when %s fails without failing a completed scan",
-    async (_scenario, setupFails, failureMessage) => {
+    "handles %s failure after a completed scan",
+    async (_scenario, setupFails, failureMessage, permissionFails) => {
       const root = await temporaryDirectory();
       const repository = join(root, "repository");
       const codexHome = join(root, "codex-home");
@@ -4153,6 +4155,8 @@ describe("CodexSecurity orchestration", () => {
                 if (setupFails) {
                   throw new Error("post-scan turn started after setup failed");
                 }
+                if (permissionFails)
+                  throw new ScanPermissionError(failureMessage);
                 async function* failedEvents(): AsyncGenerator<ThreadEvent> {
                   yield {
                     type: "turn.failed",
@@ -4166,12 +4170,18 @@ describe("CodexSecurity orchestration", () => {
         },
       );
 
-      await expect(
-        client.run(repository, {
-          postScanPrompt: "Draft confirmed fixes.",
-          onWarning: (warning) => warnings.push(warning),
-        }),
-      ).resolves.toMatchObject({ scanDir });
+      const scan = client.run(repository, {
+        postScanPrompt: "Draft confirmed fixes.",
+        onWarning: (warning) => warnings.push(warning),
+      });
+      if (permissionFails) {
+        await expect(scan).rejects.toBeInstanceOf(ScanPermissionError);
+        expect(warnings).toEqual([]);
+        expect(turns).toBe(2);
+        await client.close();
+        return;
+      }
+      await expect(scan).resolves.toMatchObject({ scanDir });
       expect(warnings).toEqual([
         `Could not run post-scan instructions: ${failureMessage}`,
       ]);

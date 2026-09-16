@@ -16,6 +16,7 @@ import { runDeepScans, ScanCostTrackingError } from "./deep-scan.js";
 import {
   acquireScanExecution,
   ScanTransportClosedError,
+  ScanPermissionError,
 } from "./scan-execution.js";
 import { prepareSemanticScanDraft } from "./scan-semantics.js";
 import { homedir, tmpdir } from "node:os";
@@ -1787,18 +1788,21 @@ export class CodexSecurity {
             "The workbench returned mismatched scan resume context.",
           );
         }
-        const savedSession =
-          typeof resumeThreadId === "string"
-            ? await findScanSession(runtime.codexHome, resumeThreadId)
-            : null;
+      }
+      if (
+        typeof registration["sealedProducerVersion"] !== "string" &&
+        typeof resumeThreadId === "string"
+      ) {
+        const savedSession = await findScanSession(
+          runtime.codexHome,
+          resumeThreadId,
+        );
         if (
-          typeof registration["sealedProducerVersion"] !== "string" &&
-          typeof resumeThreadId === "string" &&
-          (savedSession === null ||
-            savedSession.workingDirectory !==
-              (mode === "deep"
-                ? join(scanDir, "artifacts", "deep-scan", "merge")
-                : scanDir))
+          savedSession === null ||
+          savedSession.workingDirectory !==
+            (mode === "deep"
+              ? join(scanDir, "artifacts", "deep-scan", "merge")
+              : scanDir)
         ) {
           throw new CodexSecurityError(
             `The original Codex session for scan ${scanId} is unavailable. Restore its session logs in the original Codex Security state directory before resuming.`,
@@ -2103,14 +2107,21 @@ export class CodexSecurity {
           },
         };
       }
+      const artifactWriter =
+        mode === "deep"
+          ? await prepareArtifactRestorer(
+              { ...workbenchOptions, signal: undefined },
+              scanDir,
+            )
+          : undefined;
+      const mergeDirectory = join(scanDir, "artifacts", "deep-scan", "merge");
+      await artifactWriter?.prepareDirectory("artifacts/deep-scan/merge");
+      checkOpen();
       const { codex, environment } = this.#createSessionCodex(
         session,
         runtimePaths,
         options.auth,
       );
-      const mergeDirectory = join(scanDir, "artifacts", "deep-scan", "merge");
-      if (mode === "deep")
-        await mkdir(mergeDirectory, { recursive: true, mode: 0o700 });
       const threadOptions: ThreadOptions = {
         threadSource: CODEX_SECURITY_THREAD_SOURCES.scan,
         workingDirectory: mode === "deep" ? mergeDirectory : scanDir,
@@ -2341,10 +2352,7 @@ export class CodexSecurity {
                     : runtimePaths.CODEX_SECURITY_STARTED_AT,
                 signal,
                 workbench: ownedWorkbench,
-                writer: await prepareArtifactRestorer(
-                  workbenchOptions,
-                  scanDir,
-                ),
+                writer: artifactWriter!,
                 createClient: () =>
                   new CodexSecurity(
                     childConfig,
@@ -2466,36 +2474,33 @@ export class CodexSecurity {
                     },
                     draft,
                   );
-                  const directory = join(scanDir, "drafts");
-                  await mkdir(directory, { recursive: true, mode: 0o700 });
-                  const draftPath = join(directory, `${randomUUID()}.json`);
-                  const checkpointPath = join(
-                    directory,
-                    `${randomUUID()}.checkpoint.json`,
-                  );
+                  const draftPath = `drafts/${randomUUID()}.json`;
+                  const checkpointPath = `drafts/${randomUUID()}.checkpoint.json`;
+                  const staged: string[] = [];
                   try {
-                    await writeFile(draftPath, JSON.stringify(documents), {
-                      flag: "wx",
-                      mode: 0o600,
-                    });
-                    await writeFile(checkpointPath, JSON.stringify(draft), {
-                      flag: "wx",
-                      mode: 0o600,
-                    });
+                    await artifactWriter!.restore(
+                      draftPath,
+                      Buffer.from(JSON.stringify(documents)),
+                    );
+                    staged.push(draftPath);
+                    await artifactWriter!.restore(
+                      checkpointPath,
+                      Buffer.from(JSON.stringify(draft)),
+                    );
+                    staged.push(checkpointPath);
                     await ownedWorkbench([
                       "write-scan-draft",
                       "--scan-id",
                       scanId,
                       "--draft-path",
-                      draftPath,
+                      join(scanDir, draftPath),
                       "--checkpoint-path",
-                      checkpointPath,
+                      join(scanDir, checkpointPath),
                     ]);
                   } finally {
-                    await Promise.all([
-                      rm(draftPath, { force: true }),
-                      rm(checkpointPath, { force: true }),
-                    ]);
+                    await Promise.all(
+                      staged.map((path) => artifactWriter!.remove(path)),
+                    );
                   }
                 },
               });
@@ -2649,7 +2654,12 @@ export class CodexSecurity {
           });
           checkOpen();
         } catch (error) {
-          if (signal.aborted || this.#closed) throw error;
+          if (
+            signal.aborted ||
+            this.#closed ||
+            error instanceof ScanPermissionError
+          )
+            throw error;
           if (artifactRestorer !== null) {
             for (const artifact of completedArtifacts) {
               try {
@@ -2775,6 +2785,7 @@ export class CodexSecurity {
             )) as RepositoryFinding[] | undefined;
           }
         } catch (error) {
+          if (error instanceof ScanPermissionError) throw error;
           notifyObserver(
             "onWarning",
             options.onWarning,
@@ -2787,7 +2798,10 @@ export class CodexSecurity {
       // Recorded first: everything below can throw a different error for this same failed
       // scan, and cleanup must treat all of those as a failure it is not allowed to mask.
       scanFailure = true;
-      if (error instanceof ScanCostTrackingError)
+      if (
+        error instanceof ScanCostTrackingError ||
+        error instanceof ScanPermissionError
+      )
         costAbortController.abort(error);
       const tracked = await costTracker?.stop().catch(() => null);
       const cost = combinedCost(tracked?.cost ?? mergeCost);
@@ -2801,6 +2815,7 @@ export class CodexSecurity {
       let failure =
         signal.reason instanceof ScanCostLimitExceededError ||
         signal.reason instanceof ScanCostTrackingError ||
+        signal.reason instanceof ScanPermissionError ||
         signal.reason instanceof ScanTransportClosedError
           ? signal.reason
           : error;
@@ -2935,6 +2950,7 @@ export class CodexSecurity {
             }
           }
         } catch (postScanError) {
+          if (postScanError instanceof ScanPermissionError) throw postScanError;
           notifyObserver(
             "onWarning",
             options.onWarning,
@@ -5411,6 +5427,7 @@ function throwIfAborted(signal?: AbortSignal, scanDir = ""): void {
   if (
     signal.reason instanceof ScanCostLimitExceededError ||
     signal.reason instanceof ScanCostTrackingError ||
+    signal.reason instanceof ScanPermissionError ||
     signal.reason instanceof ScanTransportClosedError
   )
     throw signal.reason;

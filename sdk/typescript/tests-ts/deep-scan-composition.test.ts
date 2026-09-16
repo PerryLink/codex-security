@@ -25,7 +25,10 @@ import {
   type DeepScanComposition,
 } from "../src/deep-scan.js";
 import { ScanResult } from "../src/result.js";
-import { ScanTransportClosedError } from "../src/scan-execution.js";
+import {
+  ScanPermissionError,
+  ScanTransportClosedError,
+} from "../src/scan-execution.js";
 import {
   scanFindingIdentity,
   type JsonObject,
@@ -308,15 +311,16 @@ describe("ordinary scan composition", () => {
   });
 
   test.each([
-    [0, 0],
-    [0, 1],
-    [0, 3],
-    [2, 0],
-    [2, 1],
-    [3, 0],
-  ])(
-    "resumes a sealed child with %i saved and %i new merge failures",
-    async (priorFailures, failures) => {
+    [0, 0, false],
+    [0, 1, false],
+    [0, 3, false],
+    [2, 0, false],
+    [2, 1, false],
+    [3, 0, false],
+    [2, 1, true],
+  ] as const)(
+    "resumes a sealed child with %i saved and %i new merge failures (permission: %p)",
+    async (priorFailures, failures, permissionFailure) => {
       const h = await harness({ stopAfterNoNew: 1, maxDiscoveryRuns: 1 });
       const childDirectory = "artifacts/deep-scan/passes/pass-1";
       const scanDir = join(h.input.scanDir, childDirectory);
@@ -343,22 +347,26 @@ describe("ordinary scan composition", () => {
         ...(priorFailures === 0 ? {} : { mergeFailures: priorFailures }),
       });
       const merge = h.input.merge;
+      const failure = permissionFailure
+        ? new ScanPermissionError("Merge permissions rejected.")
+        : new Error("Merge failed.");
       let attempts = 0;
       h.input.merge = async (...args) => {
-        if (++attempts <= failures) throw new Error("Merge failed.");
+        if (++attempts <= failures) throw failure;
         return merge(...args);
       };
-      if (priorFailures + failures >= 3) {
+      if (permissionFailure || priorFailures + failures >= 3) {
         await expect(runDeepScans(h.input)).rejects.toThrow(
           priorFailures === 3
             ? "consecutive merge error limit"
-            : "Merge failed.",
+            : failure.message,
         );
-        expect(attempts).toBe(3 - priorFailures);
+        expect(attempts).toBe(permissionFailure ? 1 : 3 - priorFailures);
         expect(h.calls).toEqual([]);
+        expect(h.published).toEqual([]);
         expect(await h.checkpoint()).toMatchObject({
           consecutiveErrors: 2,
-          mergeFailures: 3,
+          mergeFailures: permissionFailure ? priorFailures : 3,
           noNewStreak: 0,
           mergedScanIds: [],
           terminalReason: "failed",
@@ -635,47 +643,77 @@ describe("ordinary scan composition", () => {
     },
   );
 
-  test("required child metering failure stops sibling discovery without retries or merging", async () => {
-    const h = await harness({ workers: 2, maxDiscoveryRuns: 4 });
-    h.input.scanOptions.requireCost = true;
-    const failure = new ScanCostTrackingError(
-      "Required usage unavailable.",
-      h.input.scanDir,
-    );
-    let secondStarted!: () => void;
-    const started = new Promise<void>((resolve) => {
-      secondStarted = resolve;
-    });
-    const retries: string[] = [];
-    h.input.onRetry = (message) => retries.push(message);
-    h.setRun(async (options) => {
-      if (options.outputDir!.endsWith("pass-1")) {
-        await started;
-        throw failure;
-      }
-      secondStarted();
-      return await new Promise<ScanResult>((_resolve, reject) => {
-        options.signal!.addEventListener(
-          "abort",
-          () => reject(options.signal!.reason),
-          { once: true },
-        );
+  test.each([
+    "metering",
+    "permission before registration",
+    "permission after registration",
+  ])(
+    "required child %s failure stops sibling discovery without retries or merging",
+    async (kind) => {
+      const h = await harness({ workers: 2, maxDiscoveryRuns: 4 });
+      h.input.scanOptions.requireCost = kind === "metering";
+      const beforeRegistration = kind === "permission before registration";
+      const failure =
+        kind === "metering"
+          ? new ScanCostTrackingError(
+              "Required usage unavailable.",
+              h.input.scanDir,
+            )
+          : new ScanPermissionError("Read-only permissions rejected.");
+      let secondStarted!: () => void;
+      const started = new Promise<void>((resolve) => {
+        secondStarted = resolve;
       });
-    });
-    await expect(runDeepScans(h.input)).rejects.toBe(failure);
-    expect(h.calls).toHaveLength(2);
-    expect(h.metrics().closed).toBe(2);
-    expect(retries).toEqual([]);
-    expect(h.mergeInputs).toEqual([]);
-    expect(
-      [...h.records.values()].map((record) => record.progress.status),
-    ).toEqual(["failed", "failed"]);
-    expect(await h.checkpoint()).toMatchObject({
-      terminalReason: "failed",
-      consecutiveErrors: 0,
-      mergedScanIds: [],
-    });
-  });
+      const retries: string[] = [];
+      h.input.onRetry = (message) => retries.push(message);
+      if (beforeRegistration) {
+        const createClient = h.input.createClient;
+        h.input.createClient = () => {
+          const client = createClient();
+          return {
+            ...client,
+            async run(repository, options = {}) {
+              if (options.outputDir!.endsWith("pass-1")) {
+                await started;
+                throw failure;
+              }
+              return await client.run(repository, options);
+            },
+          };
+        };
+      }
+      h.setRun(async (options) => {
+        if (options.outputDir!.endsWith("pass-1")) {
+          await started;
+          throw failure;
+        }
+        secondStarted();
+        return await new Promise<ScanResult>((_resolve, reject) => {
+          options.signal!.addEventListener(
+            "abort",
+            () => reject(options.signal!.reason),
+            { once: true },
+          );
+        });
+      });
+      await expect(runDeepScans(h.input)).rejects.toBe(failure);
+      expect(h.calls).toHaveLength(beforeRegistration ? 1 : 2);
+      expect(h.metrics().closed).toBe(2);
+      expect(retries).toEqual([]);
+      expect(h.mergeInputs).toEqual([]);
+      expect(
+        [...h.records.values()].map((record) => record.progress.status),
+      ).toEqual(beforeRegistration ? ["failed"] : ["failed", "failed"]);
+      const state = await h.checkpoint();
+      expect(state).toMatchObject({
+        terminalReason: "failed",
+        consecutiveErrors: 0,
+        noNewStreak: 0,
+        mergedScanIds: [],
+      });
+      if (beforeRegistration) expect(state.passes[0]!.scanId).toBeUndefined();
+    },
+  );
 
   test("surfaces failed child persistence instead of restarting its retries", async () => {
     retryDelay = spyOn(timers, "setTimeout").mockImplementation(

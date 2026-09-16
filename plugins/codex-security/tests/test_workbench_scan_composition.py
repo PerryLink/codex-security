@@ -91,7 +91,10 @@ def test_standard_resume_retains_registration_before_and_after_thread_binding(
     assert "original checkout revision or contents changed" in rejected["stderr"]
 
 
-def test_native_parent_binds_once_and_keeps_native_claim(tmp_path: Path) -> None:
+@pytest.mark.parametrize("rejoin_context", [None, "Different optional context."])
+def test_native_parent_binds_once_and_keeps_native_claim(
+    tmp_path: Path, rejoin_context: str | None
+) -> None:
     target = tmp_path / "target"
     target.mkdir()
     (target / "app.py").write_text("print('fixture')\n")
@@ -107,9 +110,19 @@ def test_native_parent_binds_once_and_keeps_native_claim(tmp_path: Path) -> None
         "--scan-root",
         str(tmp_path / "scans"),
     )
-    created = run_workbench(state, *arguments)
+    created = run_workbench(state, *arguments, "--user-context", "Original optional context.")
     scan = created["scan"]
-    assert run_workbench(state, *arguments)["scan"]["scanId"] == scan["scanId"]
+    arguments += ("--user-context", rejoin_context) if rejoin_context else ()
+    with sqlite3.connect(state / "workbench.sqlite3") as connection:
+        connection.execute("UPDATE scans SET handoff_status = 'pending'")
+    rejected = run_workbench(state, *arguments, check=False)
+    assert "owned by another continuation" in rejected["stderr"]
+    with sqlite3.connect(state / "workbench.sqlite3") as connection:
+        connection.execute("UPDATE scans SET handoff_status = 'delivered'")
+    joined = run_workbench(state, *arguments)
+    assert joined["startDisposition"] == "joined"
+    for key in ("scanId", "scanDir", "handoffClaimToken", "userContext"):
+        assert joined["scan"][key] == scan[key]
     token = scan["handoffClaimToken"]
     registration = {
         "recipe": recipe(target, "deep"),
@@ -136,7 +149,9 @@ def test_native_parent_binds_once_and_keeps_native_claim(tmp_path: Path) -> None
     assert first["threadId"] is None
     assert first["claimToken"] == token
     assert run_workbench(state, *bind, input_text=json.dumps(registration))["threadId"] is None
-    assert run_workbench(state, *arguments)["scan"]["scanId"] == scan["scanId"]
+    joined = run_workbench(state, *arguments)
+    for key in ("scanId", "scanDir", "handoffClaimToken", "userContext"):
+        assert joined["scan"][key] == scan[key]
     context_args = (
         "update-scan-context",
         "--scan-id",
@@ -195,6 +210,18 @@ def test_native_parent_binds_once_and_keeps_native_claim(tmp_path: Path) -> None
         ("sdk-execution", token),
         ("native-owner", "00000000-0000-4000-8000-000000000000"),
     ):
+        rejected = run_workbench(
+            state,
+            "begin-deep-scan",
+            "--scan-id",
+            scan["scanId"],
+            "--thread-id",
+            owner,
+            "--claim-token",
+            claim,
+            check=False,
+        )
+        assert rejected["returncode"] != 0
         rejected = run_workbench(
             state,
             "update-scan-context",
@@ -850,9 +877,17 @@ def test_native_cancel_retains_accepted_and_later_unmerged_findings(
 
 
 @pytest.mark.parametrize("has_aggregate", [False, True])
-@pytest.mark.parametrize("child_state", ["failed", "checkpoint", "coverage"])
-def test_capped_scoped_parent_preserves_unmerged_child_results(
-    tmp_path: Path, has_aggregate: bool, child_state: str
+@pytest.mark.parametrize(
+    ("terminal_reason", "child_state"),
+    [
+        ("capped", "failed"),
+        ("capped", "checkpoint"),
+        ("capped", "coverage"),
+        ("saturated", "checkpoint"),
+    ],
+)
+def test_terminal_scoped_parent_preserves_unmerged_child_results(
+    tmp_path: Path, has_aggregate: bool, child_state: str, terminal_reason: str
 ) -> None:
     target = tmp_path / "target"
     (target / "src").mkdir(parents=True)
@@ -938,7 +973,7 @@ def test_capped_scoped_parent_preserves_unmerged_child_results(
             for child, directory, _ in children
         ],
         merged=[first["scanId"]] if has_aggregate else [],
-        terminal="capped",
+        terminal=terminal_reason,
     )
     saved["noNewStreak"] = 2
     saved["consecutiveErrors"] = 1

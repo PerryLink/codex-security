@@ -15,6 +15,7 @@ import {
 } from "./src/server/handoff-tools.js";
 import { registerCompactArtifactTools } from "./src/server/compact-artifact-tools.js";
 import { NativeScanHost, type NativeScanInput } from "./src/native-scan.js";
+import { ScanPermissionError } from "../../../sdk/typescript/src/scan-execution.js";
 import {
   CODEX_SANDBOX_STATE_META_CAPABILITY,
   resolveNativeParentSandbox
@@ -751,6 +752,7 @@ export function createCodexSecurityServer(): McpServer {
       }, abortSignalFromExtra(extra));
       return nativeScanCompletedResult(scan);
     } catch (error: unknown) {
+      if (error instanceof ScanPermissionError) return toolErrorResult(deepScanInvocationFailureMessage(error));
       if (startedScan) {
         const current = await runWorkbench(["get-scan", "--scan-id", startedScan.scanId]).catch(() => undefined);
         if (isJsonObject(current?.scan)) {

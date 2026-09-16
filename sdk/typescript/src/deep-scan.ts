@@ -21,7 +21,10 @@ import {
 } from "./scan-merge.js";
 import type { ScanArtifactRestorer } from "./runtime.js";
 import type { SemanticScan } from "./scan-semantics.js";
-import { ScanTransportClosedError } from "./scan-execution.js";
+import {
+  ScanPermissionError,
+  ScanTransportClosedError,
+} from "./scan-execution.js";
 
 export const DEEP_SCAN_CHECKPOINT = "artifacts/deep-scan/checkpoint.json";
 
@@ -274,7 +277,8 @@ export async function runDeepScans(
         );
         break;
       } catch (error) {
-        if (executionSignal.aborted) throw error;
+        if (executionSignal.aborted || error instanceof ScanPermissionError)
+          throw error;
         state.mergeFailures = (state.mergeFailures ?? 0) + 1;
         await save();
         if (state.mergeFailures >= settings.stopAfterConsecutiveErrors)
@@ -340,7 +344,11 @@ export async function runDeepScans(
           await save();
           return;
         } catch (error) {
-          if (error instanceof ScanCostTrackingError) externalStop.abort(error);
+          if (
+            error instanceof ScanCostTrackingError ||
+            error instanceof ScanPermissionError
+          )
+            externalStop.abort(error);
           if (discoverySignal.aborted) throw error;
           if (attempt >= retries.length) {
             if (pass.scanId !== undefined) {
@@ -464,7 +472,8 @@ export async function runDeepScans(
       signal.reason instanceof ScanCostLimitExceededError
         ? "capped"
         : executionSignal.aborted &&
-            !(executionSignal.reason instanceof ScanCostTrackingError)
+            !(executionSignal.reason instanceof ScanCostTrackingError) &&
+            !(executionSignal.reason instanceof ScanPermissionError)
           ? "canceled"
           : "failed";
     if (state.aggregate !== null) {

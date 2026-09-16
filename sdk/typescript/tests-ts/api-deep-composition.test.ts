@@ -23,7 +23,11 @@ import { CodexSecurity, type ScanOptions } from "../src/api.js";
 import type { JsonObject } from "../src/config.js";
 import type { ScanSessionEvent } from "../src/cost.js";
 import type { ScanActivity } from "../src/scan-activity.js";
-import { runWorkbench, type WorkbenchCommandOptions } from "../src/runtime.js";
+import {
+  prepareScanArtifactRestorer,
+  runWorkbench,
+  type WorkbenchCommandOptions,
+} from "../src/runtime.js";
 import { prepareSemanticScanDraft } from "../src/scan-semantics.js";
 import {
   DEEP_SCAN_CHECKPOINT,
@@ -108,15 +112,25 @@ test.each([
   { workers: 1, budget: false, native: "discovery" },
   { workers: 1, budget: false, native: "sealed" },
   { workers: 1, budget: false, trackingFailure: true },
+  { workers: 1, budget: false, artifactFailure: "directory" },
+  { workers: 1, budget: false, artifactFailure: "draft" },
 ] as {
   workers: number;
   budget: boolean;
   trackingFailure?: boolean;
+  artifactFailure?: "directory" | "draft";
   provider?: JsonObject;
   native?: "feedback" | "discovery" | "sealed";
 }[])(
   "Deep composes sealed ordinary scans and preserves a budgeted parent: %j",
-  async ({ workers, budget, provider, native, trackingFailure }) => {
+  async ({
+    workers,
+    budget,
+    provider,
+    native,
+    trackingFailure,
+    artifactFailure,
+  }) => {
     const python = Bun.which("python3") ?? Bun.which("python");
     if (python === null) throw new Error("Python is required for this test.");
     const root = await realpath(
@@ -259,6 +273,7 @@ run_workbench(state, 'set-finding-triage', '--occurrence-id', completed['finding
     let sealedArtifacts: Map<string, Buffer<ArrayBuffer>> | undefined;
     const registrations = new Map<string, JsonObject>();
     let childTurns = 0;
+    let threadCount = 0;
     const progressRuns: ScanProgress[][] = [];
     let progress: ScanProgress[];
     const workerRuns: Array<{
@@ -368,6 +383,22 @@ run_workbench(state, 'set-finding-triage', '--occurrence-id', completed['finding
           }),
           ...prepared?.client.dependencies,
           resolvePluginPython: async () => python,
+          prepareScanArtifactRestorer: async (...args) => {
+            const writer = await prepareScanArtifactRestorer(...args);
+            return {
+              ...writer,
+              async prepareDirectory(path) {
+                if (artifactFailure === "directory")
+                  throw new Error("Synthetic directory write failure.");
+                await writer.prepareDirectory(path);
+              },
+              async restore(path, contents) {
+                if (artifactFailure === "draft" && path.startsWith("drafts/"))
+                  throw new Error("Synthetic draft write failure.");
+                await writer.restore(path, contents);
+              },
+            };
+          },
           runWorkbench: async (options, args, input) => {
             const result = await runWorkbench(options, args, input);
             const id = args.includes("--scan-id")
@@ -431,6 +462,7 @@ run_workbench(state, 'set-finding-triage', '--occurrence-id', completed['finding
               threadOptions: ThreadOptions,
               savedThreadId: string | null = null,
             ) => {
+              threadCount += 1;
               const thread = {
                 id: savedThreadId,
                 async runStreamed(
@@ -828,6 +860,26 @@ run_workbench(state, 'set-finding-triage', '--occurrence-id', completed['finding
           ]),
         });
       };
+      if (artifactFailure) {
+        await expect(run()).rejects.toThrow(
+          `Synthetic ${artifactFailure} write failure.`,
+        );
+        if (artifactFailure === "directory")
+          expect([threadCount, turns.length]).toEqual([0, 0]);
+        expect(
+          commands.filter(({ command }) => command === "write-scan-draft"),
+        ).toEqual([]);
+        const parent = [...registrations.values()].find(
+          ({ mode }) => mode === "deep",
+        )!;
+        const saved = await runWorkbench(commandOptions, [
+          "get-scan",
+          "--scan-id",
+          parent["scanId"] as string,
+        ]);
+        expect(saved["scan"]).toMatchObject({ progress: { status: "failed" } });
+        return;
+      }
       if (trackingFailure) {
         await expect(run()).rejects.toBeInstanceOf(ScanCostTrackingError);
         expect(turns).toHaveLength(1);
@@ -925,6 +977,42 @@ run_workbench(state, 'set-finding-triage', '--occurrence-id', completed['finding
           ]);
         }
         client = await makeClient();
+        if (native === "discovery") {
+          const sessionPath = join(
+            codexHome,
+            "sessions",
+            `rollout-${savedExecutionThread}.jsonl`,
+          );
+          const sessionBytes = await readFile(sessionPath);
+          const checkpointPath = join(scanDir, DEEP_SCAN_CHECKPOINT);
+          const checkpointBytes = await readFile(checkpointPath);
+          const activityBefore = [threadCount, turns.length];
+          const commandCount = commands.length;
+          await rm(sessionPath);
+          try {
+            await expect(run()).rejects.toThrow("The original Codex session");
+            expect([threadCount, turns.length]).toEqual(activityBefore);
+            expect(await readFile(checkpointPath)).toEqual(checkpointBytes);
+            expect(
+              commands.slice(commandCount).map(({ command }) => command),
+            ).toEqual(["register-cli-scan", "get-cli-scan-resume"]);
+            for (const scanId of [
+              registeredScan!.scanId,
+              checkpoint.passes[1].scanId,
+            ]) {
+              const saved = await runWorkbench(commandOptions, [
+                "get-scan",
+                "--scan-id",
+                scanId,
+              ]);
+              expect(saved["scan"]).toMatchObject({
+                progress: { status: "running" },
+              });
+            }
+          } finally {
+            await writeFile(sessionPath, sessionBytes);
+          }
+        }
       }
       const result = await run();
       for (const observed of workerRuns) {

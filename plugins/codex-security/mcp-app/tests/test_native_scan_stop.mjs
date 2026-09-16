@@ -34,6 +34,8 @@ const bundle = await build({
           "./src/python_command.js": `
           export async function resolvePythonCommand() { return "fixture-python"; }
           export function missingPythonHelperMessage() {}`,
+          "../../../sdk/typescript/src/scan-execution.js": `
+          export const ScanPermissionError = fixture.ScanPermissionError;`,
           "node:child_process": `
           export function execFile() {}
           execFile[Symbol.for("nodejs.util.promisify.custom")] = (_command, args) =>
@@ -53,6 +55,7 @@ const bundle = await build({
 });
 
 function serverFor(fixture) {
+  fixture.ScanPermissionError = class ScanPermissionError extends Error {};
   const module = { exports: {} };
   new Function(
     "require",
@@ -64,8 +67,13 @@ function serverFor(fixture) {
   return module.exports.createCodexSecurityServer();
 }
 
-for (const entry of ["completed", "run-success", "run-error"]) {
-  test(`native ${entry} validates completion before reporting success`, async () => {
+for (const entry of [
+  "completed",
+  "run-success",
+  "run-error",
+  "permission-error",
+]) {
+  test(`native ${entry} preserves completion and permission errors`, async () => {
     const scan = {
       scanId: "synthetic-parent",
       scanDir: "/synthetic/scan",
@@ -96,6 +104,10 @@ for (const entry of ["completed", "run-success", "run-error"]) {
       async run() {
         runs++;
         if (entry === "run-error") throw new Error("synthetic transport error");
+        if (entry === "permission-error") {
+          scan.progress.status = "complete";
+          throw new this.ScanPermissionError("synthetic permission rejection");
+        }
         return {};
       },
     });
@@ -119,10 +131,17 @@ for (const entry of ["completed", "run-success", "run-error"]) {
       },
     );
     assert.equal(result.isError, true);
-    assert.match(result.content[0].text, /synthetic sealed artifact mismatch/);
+    assert.match(
+      result.content[0].text,
+      entry === "permission-error"
+        ? /synthetic permission rejection/
+        : /synthetic sealed artifact mismatch/,
+    );
     assert.equal(result.structuredContent, undefined);
     assert.equal(runs, entry === "completed" ? 0 : 1);
-    assert.equal(validations, 1);
+    assert.equal(validations, entry === "permission-error" ? 0 : 1);
+    if (entry === "permission-error")
+      assert.equal(scan.progress.status, "complete");
   });
 }
 

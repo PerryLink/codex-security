@@ -1,7 +1,6 @@
 import { readFile, realpath } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { Codex } from "@openai/codex-sdk";
 import { parse as parseToml } from "smol-toml";
 import {
   CodexSecurity,
@@ -10,7 +9,6 @@ import {
 } from "../../../../sdk/typescript/src/api.js";
 import {
   hasCommandAuth,
-  inlineToml,
   scanCompositionOverrides,
   scanModelProvider,
   type JsonObject,
@@ -37,6 +35,7 @@ import {
   snapshotNativeEnvironment,
 } from "./native-executable.js";
 import type { NativeParentSandbox } from "./native-permissions.js";
+import { createNativeCodex } from "./native-codex.js";
 import type { ScanResults } from "./types.js";
 
 export interface NativeScanInput {
@@ -218,17 +217,7 @@ export async function prepareNativeScan(
       codexOverrides: config,
     },
     {
-      // Raw tables preserve literal MCP server names and environment keys.
-      createCodex: ({ config, configOverrides, ...options }) =>
-        new Codex({
-          ...options,
-          configOverrides: [
-            ...Object.entries((config ?? {}) as JsonObject).map(
-              ([name, value]) => `${name}=${inlineToml(value)}`,
-            ),
-            ...(configOverrides ?? []),
-          ],
-        }),
+      createCodex: createNativeCodex,
       environment: selectedEnvironment,
       inheritedPermissions,
       prepareRuntime: async (_config, runtimeSignal) => {
