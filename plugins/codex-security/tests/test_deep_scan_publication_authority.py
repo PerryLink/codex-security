@@ -209,6 +209,7 @@ def emulate_windows_atomic_write(monkeypatch, finalizer, *, reparse_point=False)
     """Run the real Windows atomic writer with emulated handles, not native Win32 I/O."""
     backend = finalizer._windows_scan_local_files()
     paths = {}
+    pending_deletions = set()
 
     @contextmanager
     def locked_parent(scan_dir, relative_path, **kwargs):
@@ -224,12 +225,17 @@ def emulate_windows_atomic_write(monkeypatch, finalizer, *, reparse_point=False)
         os.replace(paths[handle], destination)
         paths[handle] = destination
 
+    def close_handle(handle):
+        os.close(handle)
+        if handle in pending_deletions:
+            paths[handle].unlink()
+
     monkeypatch.setattr(finalizer, "_descriptor_relative_writes_available", lambda: False)
     monkeypatch.setattr(finalizer, "_is_windows", lambda: True)
     monkeypatch.setattr(backend, "_locked_parent", locked_parent)
     monkeypatch.setattr(backend, "_validate_existing_output", lambda path: None)
     monkeypatch.setattr(backend, "_create_file", create_file)
-    monkeypatch.setattr(backend, "_close_handle", os.close)
+    monkeypatch.setattr(backend, "_close_handle", close_handle)
     monkeypatch.setattr(
         backend,
         "_attributes",
@@ -243,7 +249,7 @@ def emulate_windows_atomic_write(monkeypatch, finalizer, *, reparse_point=False)
     monkeypatch.setattr(backend, "_verify_handle_path", lambda *args: None)
     monkeypatch.setattr(backend, "_write_all", os.write)
     monkeypatch.setattr(backend, "_rename_handle", rename_handle)
-    monkeypatch.setattr(backend, "_mark_handle_for_deletion", lambda handle: paths[handle].unlink())
+    monkeypatch.setattr(backend, "_mark_handle_for_deletion", pending_deletions.add)
     return backend
 
 
