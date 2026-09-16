@@ -2,10 +2,9 @@ import { accessSync, constants as fsConstants, existsSync, promises as fs, readd
 import { createRequire } from "node:module";
 import { delimiter, dirname, isAbsolute, join, resolve, win32 } from "node:path";
 import {
-  createCodexClient,
   readCodexSessionTurn
 } from "../../../../../sdk/typescript/src/codex-session.js";
-import type { CodexOptions } from "@openai/codex-sdk";
+import { Codex, type CodexOptions } from "@openai/codex-sdk";
 import { parse as parseToml } from "smol-toml";
 import { executablePathForSpawn } from "./executable-path.js";
 import {
@@ -104,7 +103,7 @@ export class CodexSdkWorkerExecutor implements CodexWorkerExecutor {
         signal: request.signal
       });
       const prompt = await fs.readFile(request.promptPath, "utf8");
-      const codex = createCodexClient({
+      const codex = new Codex({
         ...resolved,
         codexPathOverride: executablePathForSpawn(codexPath),
         env: childEnv,
@@ -134,7 +133,7 @@ export class CodexSdkWorkerExecutor implements CodexWorkerExecutor {
         workingDirectory: request.workingDirectory
       } as const;
       const thread = request.resumeThreadId
-        ? codex.resumeThread!(request.resumeThreadId, threadOptions)
+        ? codex.resumeThread(request.resumeThreadId, threadOptions)
         : codex.startThread(threadOptions);
       const input = request.resumeThreadId
         ? request.continuationPrompt ?? prompt

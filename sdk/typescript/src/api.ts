@@ -23,10 +23,9 @@ import {
   resolve,
   sep,
 } from "node:path";
-import { type CodexOptions, type ThreadOptions } from "@openai/codex-sdk";
+import { Codex, type CodexOptions, type ThreadOptions } from "@openai/codex-sdk";
 import { z } from "incur";
 import {
-  createCodexClient,
   readCodexSessionTurn,
   type CodexSessionClient as CodexClientLike,
   type CodexSessionThread as CodexThreadLike,
@@ -437,7 +436,7 @@ interface ClientDependencies {
 }
 
 const DEFAULT_DEPENDENCIES: ClientDependencies = {
-  createCodex: createCodexClient,
+  createCodex: (options) => new Codex(options),
   environment: process.env,
 };
 
