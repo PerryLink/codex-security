@@ -29,8 +29,6 @@ import type {
 } from "./types.js";
 
 export interface CodexSdkWorkerModelSettings {
-  /** Resolved by the execution owner, including when reconstructing a scan. */
-  codexOptions?: CodexOptions;
   model?: string;
   reasoningEffort?: string;
   artifactContext?: CodexSdkWorkerArtifactContext;
@@ -61,16 +59,12 @@ export class CodexSdkWorkerExecutor implements CodexWorkerExecutor {
         );
       }
       const workerProfile = workerPermissionProfile(parentSandbox);
-      const resolved = this.modelSettings.codexOptions;
       const originalCwd = process.cwd();
-      const childEnv = await snapshotWorkerEnvironment(resolved?.env);
-      if (resolved?.apiKey !== undefined) childEnv.CODEX_API_KEY = resolved.apiKey;
-      // Snapshot per-scan selections once; a reconstructed owner can supply them.
+      const childEnv = await snapshotWorkerEnvironment();
+      // Cache per-scan selections; reconstructed workers reload the same file.
       // Native account credentials continue to refresh in the selected home.
       const modelConfig: NonNullable<CodexOptions["config"]> = {
-        ...await (this.runtimeModelConfig ??= resolved?.config
-          ? Promise.resolve(resolved.config)
-          : workerModelConfig(childEnv)),
+        ...await (this.runtimeModelConfig ??= workerModelConfig(childEnv)),
         ...(this.modelSettings.model ? { model: this.modelSettings.model } : {}),
         // The CLI can add effort levels before the pinned SDK widens ThreadOptions.
         ...(this.modelSettings.reasoningEffort
@@ -80,15 +74,12 @@ export class CodexSdkWorkerExecutor implements CodexWorkerExecutor {
       const { model_providers: _providers, ...sdkModelConfig } = modelConfig;
       const configOverrides = [
         ...modelProviderConfigOverride(modelConfig as JsonObject),
-        ...(resolved?.configOverrides ?? []),
         ...workerPermissionProfileConfigOverrides(workerProfile)
       ];
       const openAiApiKey = environmentVariable(childEnv, "OPENAI_API_KEY", process.platform)?.trim();
       const codexApiKey = environmentVariable(childEnv, "CODEX_API_KEY", process.platform)?.trim();
       const codexPath = resolveCodexPath(
-        resolved?.codexPathOverride === undefined
-          ? childEnv
-          : { ...childEnv, CODEX_CLI_PATH: resolved.codexPathOverride },
+        childEnv,
         process.platform,
         process.arch,
         originalCwd
@@ -102,8 +93,7 @@ export class CodexSdkWorkerExecutor implements CodexWorkerExecutor {
             // Older SDK/direct-plugin workers keep their home-selected provider.
             .filter(([key]) => key !== "model_providers" && modelConfig[key] !== undefined)
             .map(([key, value]) => `${key}=${inlineToml(value)}`),
-          ...configOverrides,
-          ...(resolved?.baseUrl ? [`openai_base_url=${tomlString(resolved.baseUrl)}`] : [])
+          ...configOverrides
         ],
         expectedProfile: workerProfile,
         env: childEnv,
@@ -112,7 +102,6 @@ export class CodexSdkWorkerExecutor implements CodexWorkerExecutor {
       });
       const prompt = await fs.readFile(request.promptPath, "utf8");
       const codex = new Codex({
-        ...resolved,
         codexPathOverride: executablePathForSpawn(codexPath),
         env: childEnv,
         // Codex exec reads CODEX_API_KEY; the SDK maps apiKey to that variable.
@@ -121,13 +110,12 @@ export class CodexSdkWorkerExecutor implements CodexWorkerExecutor {
         config: {
           ...sdkModelConfig,
           mcp_servers: {
-            ...(isRecord(modelConfig.mcp_servers) ? modelConfig.mcp_servers : {}),
             // Discovery workers use the bundled skills and artifacts, not the parent workbench MCP.
             // A disabled server still needs a valid transport while Codex resolves plugin configuration.
             "codex-security": { command: "node", enabled: false },
             ...this.compactArtifactServer(request)
           },
-          ...workerSubagentConfig(request.subagents, modelConfig)
+          ...workerSubagentConfig(request.subagents)
         },
         // Structured SDK config cannot preserve literal filesystem keys such as
         // ":root" or "/repo/.env"; raw overrides keep this inline TOML intact.
@@ -270,16 +258,15 @@ export class CodexSdkWorkerExecutor implements CodexWorkerExecutor {
   }
 }
 
-function workerSubagentConfig(subagents: number, config: NonNullable<CodexOptions["config"]>) {
+function workerSubagentConfig(subagents: number) {
   return {
     // V1 counts children; V2 counts the root plus its children. Keeping its
     // feature disabled lets the model choose either runtime without rejecting
     // inherited agents.max_threads configuration.
     ...(subagents > 0
-      ? { agents: { ...(isRecord(config.agents) ? config.agents : {}), max_threads: subagents } }
+      ? { agents: { max_threads: subagents } }
       : {}),
     features: {
-      ...(isRecord(config.features) ? config.features : {}),
       multi_agent_v2: {
         enabled: false,
         max_concurrent_threads_per_session: subagents + 1
@@ -304,10 +291,11 @@ function workerPermissionProfile(
   const filesystemEntries: Array<[string, TomlValue]> = [[":root", "read"]];
   const seenFilesystemKeys = new Set<string>();
 
-  for (const key of sandbox.filesystemDenies) {
+  for (const denial of sandbox.filesystemDenies) {
+    const key = typeof denial === "string" ? denial : denial.path;
     if (seenFilesystemKeys.has(key)) continue;
     seenFilesystemKeys.add(key);
-    filesystemEntries.push([key, "deny"]);
+    filesystemEntries.push([key, typeof denial === "string" ? "deny" : { ".": "deny" }]);
   }
 
   if (sandbox.globScanMaxDepth !== undefined) {

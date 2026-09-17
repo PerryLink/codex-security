@@ -5,6 +5,7 @@ import { syncBuiltinESMExports } from "node:module";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { promisify } from "node:util";
 import { build } from "esbuild";
 import { parse as parseToml, stringify as stringifyToml } from "smol-toml";
 
@@ -17,7 +18,7 @@ const bundle = await build({
   },
   stdin: {
     // Test the environment snapshot without adding a production export.
-    contents: `${await readFile(executorSource, "utf8")}\nexport { snapshotWorkerEnvironment, codexWorkerConfig };`,
+    contents: `${await readFile(executorSource, "utf8")}\nexport { snapshotWorkerEnvironment, codexWorkerConfig, codexWorkerConfigPath };`,
     loader: "ts",
     resolveDir: path.dirname(fileURLToPath(executorSource)),
     sourcefile: fileURLToPath(executorSource)
@@ -26,7 +27,7 @@ const bundle = await build({
   platform: "node",
   write: false
 });
-const { CodexSdkWorkerExecutor, resolveCodexPath, snapshotWorkerEnvironment, codexWorkerConfig } = await import(
+const { CodexSdkWorkerExecutor, resolveCodexPath, snapshotWorkerEnvironment, codexWorkerConfig, codexWorkerConfigPath } = await import(
   `data:text/javascript;base64,${Buffer.from(bundle.outputFiles[0].contents).toString("base64")}`
 );
 const errorsBundle = await build({
@@ -74,6 +75,19 @@ const deniedWorkerPermissionProfile = {
 };
 
 try {
+  await runTests();
+} finally {
+  restoreEnv("FAKE_CODEX_MARKER", previousMarker);
+  await Promise.all(temporaryRoots.map((root) => rm(root, { recursive: true, force: true })));
+}
+
+async function runTests() {
+  if (process.argv[2] === "reconstructed-worker-fixture") {
+    return await testIsolatedReconstructedWorkers(process.argv[3]);
+  }
+  if (process.argv[2] === "provider-snapshot-fixture") {
+    return await testRuntimeProviderSnapshots(process.argv[3], process.argv[4]);
+  }
   await testOpenAiCredentialsReachWorker();
   await testWorkerReasoningSummaries();
   await testWorkerProviderSelection();
@@ -143,9 +157,6 @@ try {
     await testWindowsWorkerEnvironmentPreservesMixedCaseKeys();
     await testWindowsLauncherSkipsExtensionlessNpmShim();
   }
-} finally {
-  restoreEnv("FAKE_CODEX_MARKER", previousMarker);
-  await Promise.all(temporaryRoots.map((root) => rm(root, { recursive: true, force: true })));
 }
 
 function testSpawnPermissionErrorsAreNonRetryable() {
@@ -742,12 +753,18 @@ async function testOpenAiCredentialsReachWorker() {
   }
 }
 
-async function testIsolatedReconstructedWorkers() {
+async function testIsolatedReconstructedWorkers(selectedName) {
+  if (!selectedName) {
+    await Promise.all(["first", "second"].map((name) =>
+      promisify(childProcess.execFile)(process.execPath, [fileURLToPath(import.meta.url), "reconstructed-worker-fixture", name])
+    ));
+    return;
+  }
   const previousMarker = process.env.FAKE_CODEX_MARKER;
   const originalSpawn = childProcess.spawn;
   const scans = [];
   try {
-    for (const name of ["first", "second"]) {
+    for (const name of [selectedName]) {
       const fixture = await fakeCodexFixture(deniedWorkerPermissionProfile);
       const codexHome = path.join(fixture.root, "home");
       const configPath = path.join(fixture.root, "scan config.toml");
@@ -761,7 +778,9 @@ async function testIsolatedReconstructedWorkers() {
         service_tier: name === "first" ? "flex" : "fast"
       };
       await writeFile(configPath, stringifyToml(config));
-      await writeFile(`${configPath}.workers.toml`, stringifyToml(config));
+      const workerConfigPath = codexWorkerConfigPath(configPath);
+      await mkdir(path.dirname(workerConfigPath), { recursive: true });
+      await writeFile(workerConfigPath, stringifyToml(config));
       await writeFile(promptPath, "CAPTURE_SYNTHETIC_OPENAI_AUTH NULL_USAGE\n");
       const executable = path.join(fixture.root, process.platform === "win32" ? "node.exe" : "node");
       if (process.platform === "win32") {
@@ -769,10 +788,8 @@ async function testIsolatedReconstructedWorkers() {
       } else {
         await symlink(process.execPath, executable);
       }
-      const codexOptions = {
-        codexPathOverride: executable,
-        baseUrl: `https://${name}.example.invalid/v1`,
-        env: {
+      const environment = {
+          CODEX_CLI_PATH: executable,
           PATH: path.dirname(process.execPath),
           ...(process.env.SystemRoot ? { SystemRoot: process.env.SystemRoot } : {}),
           CODEX_HOME: codexHome,
@@ -780,37 +797,31 @@ async function testIsolatedReconstructedWorkers() {
           CODEX_API_KEY: `synthetic-${name}-credential`,
           FAKE_CODEX_MARKER: fixture.markerPath,
           FAKE_CODEX_SCAN_VALUE: name
-        }
       };
+      Object.assign(process.env, environment);
       const settings = {
-        codexOptions,
         model: `fixture-${name}-override`,
         reasoningEffort: "ultra",
         parentSandbox: trustedParentSandboxWithDenials
       };
-      scans.push({ name, fixture, config, configPath, promptPath, settings, executor: new CodexSdkWorkerExecutor(settings) });
+      scans.push({ name, fixture, config, configPath, promptPath, settings, environment, executor: new CodexSdkWorkerExecutor(settings) });
     }
     childProcess.spawn = (command, args, options) => {
       const scan = scans.find((scan) => options?.env?.FAKE_CODEX_MARKER === scan.fixture.markerPath);
-      if (scan) assert.equal(command, path.toNamespacedPath(scan.settings.codexOptions.codexPathOverride));
+      if (scan) assert.equal(command, path.toNamespacedPath(scan.environment.CODEX_CLI_PATH));
       return originalSpawn(command, scan ? [scan.fixture.executablePath, ...args] : args, options);
     };
     syncBuiltinESMExports();
 
     for (const phase of ["fresh", "resume", "reconstructed"]) {
       for (const scan of scans) {
-        scan.settings.codexOptions.env.CODEX_API_KEY = `synthetic-${scan.name}-${phase}-credential`;
-        scan.settings.codexOptions.env.FAKE_CODEX_SCAN_VALUE = `${scan.name}-${phase}`;
+        scan.environment.CODEX_API_KEY = `synthetic-${scan.name}-${phase}-credential`;
+        scan.environment.FAKE_CODEX_SCAN_VALUE = `${scan.name}-${phase}`;
+        Object.assign(process.env, scan.environment);
       }
       if (phase === "reconstructed") {
         for (const scan of scans) {
-          // The caller restores recorded selections. Its old config file need
-          // not exist; current credentials still come from the selected home/env.
-          await rm(scan.configPath);
-          scan.executor = new CodexSdkWorkerExecutor({
-            ...scan.settings,
-            codexOptions: { ...scan.settings.codexOptions, config: scan.config }
-          });
+          scan.executor = new CodexSdkWorkerExecutor(scan.settings);
         }
       }
       for (const kind of ["discovery", "dedup"]) {
@@ -825,8 +836,8 @@ async function testIsolatedReconstructedWorkers() {
           assert.equal(result.threadId, resumeThreadId ?? "fixture-thread-id");
           const child = JSON.parse(await readFile(scan.fixture.markerPath, "utf8"));
           const preflight = JSON.parse(await readFile(scan.fixture.preflightMarkerPath, "utf8"));
-          assert.equal(await realpath(child.executable), await realpath(scan.settings.codexOptions.codexPathOverride));
-          assert.equal(child.codexHome, scan.settings.codexOptions.env.CODEX_HOME);
+          assert.equal(await realpath(child.executable), await realpath(scan.environment.CODEX_CLI_PATH));
+          assert.equal(child.codexHome, scan.environment.CODEX_HOME);
           assert.equal(preflight.codexHome, child.codexHome);
           assert.equal(child.scanValue, `${scan.name}-${phase}`);
           assert.equal(child.configPath, scan.configPath);
@@ -840,9 +851,6 @@ async function testIsolatedReconstructedWorkers() {
           assert.equal(child.argv.includes('model_reasoning_effort="ultra"'), true);
           assert.equal(preflight.argv.includes('model_reasoning_effort="ultra"'), true);
           assert.equal(preflight.argv.includes(`model=${JSON.stringify(scan.settings.model)}`), true);
-          const baseUrl = `openai_base_url=${JSON.stringify(scan.settings.codexOptions.baseUrl)}`;
-          assert.equal(child.argv.includes(baseUrl), true);
-          assert.equal(preflight.argv.includes(baseUrl), true);
           assertReadOnlyWorkerPolicy(child.argv);
           assertWorkerSubagentPolicy(child.argv, scan.name === "first" ? 0 : 2);
           assert.equal(workerPermissionProfileOverride(child.argv).includes('"/repo/.env"="deny"'), true);
@@ -863,18 +871,25 @@ async function testIsolatedReconstructedWorkers() {
   }
 }
 
-async function testRuntimeProviderSnapshots() {
-  const sharedHome = await mkdtemp(path.join(tmpdir(), "shared-worker-home-"));
-  temporaryRoots.push(sharedHome);
+async function testRuntimeProviderSnapshots(selectedName, sharedHome) {
+  if (!selectedName) {
+    sharedHome = await mkdtemp(path.join(tmpdir(), "shared-worker-home-"));
+    temporaryRoots.push(sharedHome);
+    await Promise.all(["openrouter", "fireworks", "command-auth", "cloud.production", "cloud production", "shared-default", "shared-default-configured", "openai", "shared-external"].map((name) =>
+      promisify(childProcess.execFile)(process.execPath, [fileURLToPath(import.meta.url), "provider-snapshot-fixture", name, sharedHome])
+    ));
+    return;
+  }
   const originalSpawn = childProcess.spawn;
   const previousMarker = process.env.FAKE_CODEX_MARKER;
   const scans = [];
   try {
-    for (const name of ["openrouter", "fireworks", "command-auth", "cloud.production", "cloud production", "shared-default", "shared-default-configured", "openai", "shared-external"]) {
+    for (const name of [selectedName]) {
       const configPath = path.join(sharedHome, `${name}.toml`);
+      const workerConfigPath = codexWorkerConfigPath(configPath);
       const permissionProfile = {
         ...deniedWorkerPermissionProfile,
-        filesystem: { ...deniedWorkerPermissionProfile.filesystem, [`${configPath}.workers.toml`]: "deny" }
+        filesystem: { ...deniedWorkerPermissionProfile.filesystem, [workerConfigPath]: "deny" }
       };
       const fixture = await fakeCodexFixture(permissionProfile);
       const promptPath = path.join(fixture.root, "prompt.md");
@@ -918,17 +933,21 @@ async function testRuntimeProviderSnapshots() {
         ? { model_provider: "openai", model_reasoning_summary: "concise" }
         : { model_provider: provider, model_providers: { [provider]: { base_url: "https://default.example.test/v1", env_key: `${provider.toUpperCase()}_API_KEY` } } };
       await writeFile(configPath, stringifyToml(preflight));
-      await writeFile(`${configPath}.workers.toml`, stringifyToml(codexWorkerConfig(input)));
       await writeFile(promptPath, "NULL_USAGE");
       const codexHome = name.startsWith("shared-") ? sharedHome : path.join(fixture.root, "home");
       await mkdir(codexHome, { recursive: true });
+      await writeFile(workerConfigPath, stringifyToml(codexWorkerConfig(input)));
       // Simulate a later session replacing the shared home configuration.
-      await writeFile(path.join(codexHome, "config.toml"), stringifyToml(config));
+      await writeFile(path.join(codexHome, "config.toml"), 'model_provider = "changed-home-provider"\n');
+      const environment = { CODEX_CLI_PATH: process.execPath, CODEX_HOME: codexHome, CODEX_SECURITY_CONFIG_PATH: configPath, FAKE_CODEX_MARKER: fixture.markerPath, FAKE_CODEX_WORKER_CONFIG: workerConfigPath, SYNTHETIC_PROVIDER_HEADER: `synthetic-${name}-header-env`, ...(definition.env_key ? { [definition.env_key]: `synthetic-${name}-env-key` } : {}), FAKE_CODEX_PROVIDER_ENV_KEYS: JSON.stringify(["SYNTHETIC_PROVIDER_HEADER", ...(definition.env_key ? [definition.env_key] : [])]) };
+      Object.assign(process.env, environment);
       const settings = {
-        codexOptions: { codexPathOverride: process.execPath, env: { CODEX_HOME: codexHome, CODEX_SECURITY_CONFIG_PATH: configPath, FAKE_CODEX_MARKER: fixture.markerPath, FAKE_CODEX_WORKER_CONFIG: `${configPath}.workers.toml`, SYNTHETIC_PROVIDER_HEADER: `synthetic-${name}-header-env`, ...(definition.env_key ? { [definition.env_key]: `synthetic-${name}-env-key` } : {}), FAKE_CODEX_PROVIDER_ENV_KEYS: JSON.stringify(["SYNTHETIC_PROVIDER_HEADER", ...(definition.env_key ? [definition.env_key] : [])]) } },
-        model: "worker-model", reasoningEffort: "ultra", parentSandbox: { ...trustedParentSandboxWithDenials, filesystemDenies: [...trustedParentSandboxWithDenials.filesystemDenies, `${configPath}.workers.toml`] }
+        model: "worker-model", reasoningEffort: "ultra", parentSandbox: {
+          ...trustedParentSandboxWithDenials,
+          filesystemDenies: [...trustedParentSandboxWithDenials.filesystemDenies, workerConfigPath]
+        }
       };
-      scans.push({ name, permissionProfile, fixture, configPath, promptPath, config, input, auth, settings, executor: new CodexSdkWorkerExecutor(settings) });
+      scans.push({ name, permissionProfile, fixture, configPath, promptPath, config, input, auth, settings, environment, workerConfigPath, executor: new CodexSdkWorkerExecutor(settings) });
     }
     childProcess.spawn = (command, args, options) => {
       const scan = scans.find((scan) => options?.env?.FAKE_CODEX_MARKER === scan.fixture.markerPath);
@@ -938,7 +957,7 @@ async function testRuntimeProviderSnapshots() {
     for (const phase of ["fresh", "resume", "reconstructed"]) {
       if (phase === "reconstructed") {
         for (const scan of scans) {
-          await writeFile(`${scan.configPath}.workers.toml`, stringifyToml(codexWorkerConfig(scan.input)));
+          await writeFile(scan.workerConfigPath, stringifyToml(codexWorkerConfig(scan.input)));
           scan.executor = new CodexSdkWorkerExecutor(scan.settings);
         }
       }
@@ -957,8 +976,8 @@ async function testRuntimeProviderSnapshots() {
             assert.equal(JSON.stringify(child).includes(`synthetic-${scan.name}-unrelated-token`), false);
             assert.deepEqual(parseToml(child.workerConfig), phase === "resume" ? { model_provider: "changed-after-launch" } : scan.config);
             assert.deepEqual(child.providerAuthentication, Object.fromEntries(
-              JSON.parse(scan.settings.codexOptions.env.FAKE_CODEX_PROVIDER_ENV_KEYS)
-                .map((key) => [key, scan.settings.codexOptions.env[key]])
+              JSON.parse(scan.environment.FAKE_CODEX_PROVIDER_ENV_KEYS)
+                .map((key) => [key, scan.environment[key]])
             ));
             assert.deepEqual(overrides.model_providers, scan.config.model_providers, `${scan.name} ${phase} ${kind}`);
             for (const [key, value] of Object.entries(scan.auth)) {
@@ -967,7 +986,7 @@ async function testRuntimeProviderSnapshots() {
             assert.equal(overrides.model_reasoning_effort, "ultra");
             assert.equal(overrides.model_reasoning_summary, "concise");
             assert.equal(overrides.service_tier, "flex");
-            assert.equal(child.codexHome, scan.settings.codexOptions.env.CODEX_HOME);
+            assert.equal(child.codexHome, scan.environment.CODEX_HOME);
           }
           const child = JSON.parse(await readFile(scan.fixture.markerPath, "utf8"));
           assertFlagPair(child.argv, "--model", "worker-model");
@@ -979,7 +998,7 @@ async function testRuntimeProviderSnapshots() {
         if (failures.length) throw new AggregateError(failures.map((outcome) => outcome.reason), "Worker runtime provider controls failed");
       }
       if (phase === "fresh") {
-        for (const scan of scans) await writeFile(`${scan.configPath}.workers.toml`, 'model_provider = "changed-after-launch"\n');
+        for (const scan of scans) await writeFile(scan.workerConfigPath, 'model_provider = "changed-after-launch"\n');
       }
     }
   } finally {
@@ -992,7 +1011,7 @@ async function testRuntimeProviderSnapshots() {
 async function testWorkerProviderSelection() {
   const fixture = await fakeCodexFixture();
   const saved = Object.fromEntries(
-    ["CODEX_CLI_PATH", "CODEX_SECURITY_CONFIG_PATH", "OPENAI_API_KEY", "CODEX_API_KEY"].map((name) => [name, process.env[name]])
+    ["CODEX_CLI_PATH", "CODEX_HOME", "CODEX_SECURITY_CONFIG_PATH", "OPENAI_API_KEY", "CODEX_API_KEY"].map((name) => [name, process.env[name]])
   );
   const originalSpawn = childProcess.spawn;
   try {
@@ -1001,7 +1020,10 @@ async function testWorkerProviderSelection() {
     const configPath = path.join(fixture.root, "scan config.toml");
     const promptPath = path.join(fixture.root, "prompt.md");
     await writeFile(configPath, 'model_provider = "fixture-provider"\n');
-    await writeFile(`${configPath}.workers.toml`, 'model_provider = "fixture-provider"\n');
+    const workerConfigPath = codexWorkerConfigPath(configPath);
+    await mkdir(path.dirname(workerConfigPath), { recursive: true });
+    await writeFile(workerConfigPath, 'model_provider = "fixture-provider"\n');
+    process.env.CODEX_HOME = fixture.root;
     await writeFile(promptPath, "fixture provider selection");
     process.env.CODEX_CLI_PATH = process.execPath;
     process.env.CODEX_SECURITY_CONFIG_PATH = configPath;

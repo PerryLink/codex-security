@@ -97,6 +97,15 @@ assert.deepEqual(resolveDeepWorkerParentSandbox(extra({
   globScanMaxDepth: 3
 });
 
+for (const deniedPath of ["/repo/*.env", "/repo/?.env", "/repo/temp[1]"]) {
+  assert.deepEqual(resolveDeepWorkerParentSandbox(extra({
+    ...pinnedReadOnly,
+    file_system: { type: "restricted", entries: [rootRead, {
+      path: { type: "path", path: deniedPath }, access: "deny"
+    }] }
+  })), { filesystemDenies: [{ path: deniedPath }] });
+}
+
 assert.throws(
   () => resolveDeepWorkerParentSandbox(extra({
     ...pinnedReadOnly,
@@ -214,7 +223,7 @@ for (const invalid of [
       ]
     }
   }),
-  ...["", "relative/private", "/repo/*.env", "/repo/?.env", "/repo/[literal]"].map((deniedPath) => extra({
+  ...["", "relative/private"].map((deniedPath) => extra({
     ...pinnedReadOnly,
     file_system: {
       type: "restricted",
