@@ -124,12 +124,12 @@ export class CodexSdkWorkerExecutor implements CodexWorkerExecutor {
       const thread = request.resumeThreadId
         ? codex.resumeThread(request.resumeThreadId, threadOptions)
         : codex.startThread(threadOptions);
-      const continuation = request.resumeThreadId
+      const baseInput = request.resumeThreadId
         ? request.continuationPrompt ?? prompt
         : prompt;
       const input = request.kind === "discovery" && this.modelSettings.artifactContext && request.artifactContext
-        ? `${continuation.trimEnd()}\n\n${scratchInstructions(scratch)}\n`
-        : continuation;
+        ? `${baseInput.trimEnd()}\n\n${scratchInstructions(scratch)}\n`
+        : baseInput;
       const controller = new AbortController();
       const forwardAbort = () => controller.abort(request.signal.reason);
       if (request.signal.aborted) {
