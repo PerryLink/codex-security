@@ -643,7 +643,7 @@ describe("live scan cost tracking", () => {
       try {
         await tracker.refresh();
         expect(workers).toEqual([]);
-        const path = await writeSession(home, "worker-thread", {});
+        const path = join(parse(parent).dir, "rollout-worker-thread.jsonl");
         const metadata =
           JSON.stringify({
             type: "session_meta",
