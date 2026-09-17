@@ -53,6 +53,10 @@ const trustedParentSandboxWithDenials = Object.freeze({
     "/repo/.env",
     "/repo/**/.secret",
     "/repo/**/*.pem",
+    "/repo/temp[1]",
+    { path: "/repo/temp[1]" },
+    "/repo/secret[1]",
+    { path: "/repo/secret[1]" },
     "/repo/.env"
   ],
   globScanMaxDepth: 3
@@ -69,6 +73,9 @@ const deniedWorkerPermissionProfile = {
     "/repo/.env": "deny",
     "/repo/**/.secret": "deny",
     "/repo/**/*.pem": "deny",
+    "/repo/temp[1]": { ".": "deny" },
+    "/repo/secret[1]": { ".": "deny" },
+    "/": { "repo/temp[1]": "deny", "repo/secret[1]": "deny" },
     glob_scan_max_depth: 3
   },
   network: { enabled: false }
@@ -675,9 +682,9 @@ async function testSdkInvocationAndThreadCapture() {
     assertFlagPair(invocation.argv, "--model", "gpt-5.6-luna");
     assert.equal(invocation.argv.includes('model_reasoning_effort="xhigh"'), true);
     assertReadOnlyWorkerPolicy(invocation.argv);
-    assert.equal(
-      workerPermissionProfileOverride(invocation.argv),
-      'permissions.codex_security_deep_scan_worker={extends=":read-only",filesystem={":root"="read","/repo/.env"="deny","/repo/**/.secret"="deny","/repo/**/*.pem"="deny",glob_scan_max_depth=3},network={enabled=false}}'
+    assert.deepEqual(
+      parseToml(workerPermissionProfileOverride(invocation.argv)).permissions.codex_security_deep_scan_worker,
+      deniedWorkerPermissionProfile
     );
     assertWorkerSubagentPolicy(invocation.argv, 3);
     assertFlagPair(invocation.argv, "--cd", workingDirectory);
@@ -853,7 +860,12 @@ async function testIsolatedReconstructedWorkers(selectedName) {
           assert.equal(preflight.argv.includes(`model=${JSON.stringify(scan.settings.model)}`), true);
           assertReadOnlyWorkerPolicy(child.argv);
           assertWorkerSubagentPolicy(child.argv, scan.name === "first" ? 0 : 2);
-          assert.equal(workerPermissionProfileOverride(child.argv).includes('"/repo/.env"="deny"'), true);
+          for (const invocation of [child, preflight]) {
+            assert.deepEqual(
+              parseToml(workerPermissionProfileOverride(invocation.argv)).permissions.codex_security_deep_scan_worker,
+              deniedWorkerPermissionProfile
+            );
+          }
           assert.equal(child.argv.includes("resume"), resumeThreadId !== undefined);
           assert.equal(child.stdin.includes("continuation"), resumeThreadId !== undefined);
         }));

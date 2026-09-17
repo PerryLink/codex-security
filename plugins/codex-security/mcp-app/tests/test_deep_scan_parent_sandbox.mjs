@@ -104,6 +104,14 @@ for (const deniedPath of ["/repo/*.env", "/repo/?.env", "/repo/temp[1]"]) {
       path: { type: "path", path: deniedPath }, access: "deny"
     }] }
   })), { filesystemDenies: [{ path: deniedPath }] });
+  assert.deepEqual(resolveDeepWorkerParentSandbox(extra({
+    ...pinnedReadOnly,
+    file_system: { type: "restricted", entries: [rootRead, {
+      path: { type: "glob_pattern", pattern: deniedPath }, access: "deny"
+    }, {
+      path: { type: "path", path: deniedPath }, access: "deny"
+    }] }
+  })), { filesystemDenies: [deniedPath, { path: deniedPath }] });
 }
 
 assert.throws(

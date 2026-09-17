@@ -1,6 +1,6 @@
 import { accessSync, constants as fsConstants, existsSync, promises as fs, readdirSync, statSync } from "node:fs";
 import { createRequire } from "node:module";
-import { delimiter, dirname, isAbsolute, join, resolve, win32 } from "node:path";
+import { delimiter, dirname, isAbsolute, join, parse, resolve, win32 } from "node:path";
 import {
   readCodexSessionTurn
 } from "../../../../../sdk/typescript/src/codex-session.js";
@@ -288,18 +288,33 @@ type TomlObject = { [key: string]: TomlValue };
 function workerPermissionProfile(
   sandbox: DeepWorkerParentSandbox
 ): TomlObject {
-  const filesystemEntries: Array<[string, TomlValue]> = [[":root", "read"]];
-  const seenFilesystemKeys = new Set<string>();
+  const filesystemEntries = new Map<string, TomlValue>([[":root", "read"]]);
+  const literalPaths = new Set(sandbox.filesystemDenies.flatMap(
+    (denial) => typeof denial === "string" ? [] : [denial.path]
+  ));
+  const collidingGlobs = new Set<string>();
 
   for (const denial of sandbox.filesystemDenies) {
     const key = typeof denial === "string" ? denial : denial.path;
-    if (seenFilesystemKeys.has(key)) continue;
-    seenFilesystemKeys.add(key);
-    filesystemEntries.push([key, typeof denial === "string" ? "deny" : { ".": "deny" }]);
+    if (typeof denial === "string" && literalPaths.has(key)) {
+      collidingGlobs.add(key);
+    } else {
+      filesystemEntries.set(key, typeof denial === "string" ? "deny" : { ".": "deny" });
+    }
+  }
+
+  // Scoped glob keys keep both meanings without duplicate filesystem TOML keys.
+  for (const pattern of collidingGlobs) {
+    const root = parse(pattern).root;
+    const scope = filesystemEntries.get(root);
+    filesystemEntries.set(root, {
+      ...(scope === undefined ? {} : typeof scope === "object" ? scope : { ".": scope }),
+      [pattern.slice(root.length)]: "deny"
+    });
   }
 
   if (sandbox.globScanMaxDepth !== undefined) {
-    filesystemEntries.push(["glob_scan_max_depth", sandbox.globScanMaxDepth]);
+    filesystemEntries.set("glob_scan_max_depth", sandbox.globScanMaxDepth);
   }
 
   return {
