@@ -14,8 +14,7 @@ import { DeepScanWorkerRunner } from "./worker-runner.js";
 import type {
   AcceptedDiscovery,
   DedupOutcome,
-  DiscoveryOutcome,
-  SuccessfulDedupOutcome
+  DiscoveryOutcome
 } from "./worker-runner.js";
 import {
   boundedDeepScanErrorPair,
@@ -43,15 +42,9 @@ type SchedulerSettlement =
   | { status: "fulfilled"; outcome: SchedulerOutcome }
   | { status: "rejected"; error: unknown };
 
-type AcceptedReducer = Omit<SuccessfulDedupOutcome, "result">;
-
 interface SchedulerResult {
   reason: DeepScanTerminalReason;
   omittedWorkerIds: string[];
-  canceledWorkerIds: string[];
-  accepted: AcceptedDiscovery[];
-  mergedWorkerIds: string[];
-  reducers: AcceptedReducer[];
   result?: DeepReductionInput;
 }
 
@@ -576,19 +569,12 @@ export class DeepScanCoordinator {
         .filter((worker) => worker.kind === "discovery" && worker.mergeState === "merged")
         .map((worker) => worker.id)
     );
-    const mergedDiscoveries: AcceptedDiscovery[] = recovered.filter((worker) => (
-      mergedIds.has(worker.id)
-    ));
-    const canceledWorkerIds = (this.state.persistedWorkers ?? [])
-      .filter((worker) => worker.kind === "discovery" && worker.status === "canceled")
-      .map((worker) => worker.id);
     const omittedWorkerIds: string[] = [];
     const recoveredReducers = await this.recoverCompletedReducers(recovered);
-    const reducerOutcomes = recoveredReducers.reducers;
     let latestResult = recoveredReducers.result;
     let buffer: AcceptedDiscovery[] = recovered.filter((worker) => !mergedIds.has(worker.id));
     let reducer: Promise<DedupOutcome> | undefined;
-    let previousReducerResultPath = reducerOutcomes.at(-1)?.resultPath;
+    let previousReducerResultPath = recoveredReducers.resultPath;
     let dispatched = this.state.dispatchedCount;
     let workerSequence = Math.max(
       dispatched,
@@ -674,16 +660,12 @@ export class DeepScanCoordinator {
         const workerId = entries[index]?.[0];
         if (workerId) active.delete(workerId);
         if (result.status === "rejected") {
-          if (workerId) removeValue(canceledWorkerIds, workerId);
           firstFailure ??= result.reason;
           continue;
         }
         const outcome = result.value;
         if (outcome.status === "failed") {
-          if (outcome.replaceableFailureKind) {
-            canceledWorkerIds.push(outcome.workerId);
-          } else {
-            removeValue(canceledWorkerIds, outcome.workerId);
+          if (!outcome.replaceableFailureKind) {
             firstFailure ??= outcome.error;
           }
         } else if (outcome.status === "succeeded") {
@@ -695,9 +677,6 @@ export class DeepScanCoordinator {
           } else if (!buffer.some((worker) => worker.id === outcome.worker.id)) {
             buffer.push(outcome.worker);
           }
-          removeValue(canceledWorkerIds, outcome.worker.id);
-        } else {
-          canceledWorkerIds.push(outcome.workerId);
         }
       }
       return firstFailure;
@@ -717,10 +696,7 @@ export class DeepScanCoordinator {
       }
       this.state = outcome.run;
       previousReducerResultPath = outcome.resultPath;
-      mergedDiscoveries.push(...outcome.consumed);
-      const { result: acceptedResult, ...metadata } = outcome;
-      latestResult = acceptedResult;
-      reducerOutcomes.push(metadata);
+      latestResult = outcome.result;
       return undefined;
     };
 
@@ -805,7 +781,6 @@ export class DeepScanCoordinator {
             const consecutiveErrors = outcome.consecutiveErrors
               ?? (this.state.consecutiveErrors ?? 0) + 1;
             this.state = { ...this.state, consecutiveErrors };
-            canceledWorkerIds.push(outcome.workerId);
             this.log({
               event: "discovery_worker_replaced",
               scanId: this.state.scanId,
@@ -832,7 +807,6 @@ export class DeepScanCoordinator {
           throw outcome.error;
         }
         if (outcome.status === "canceled") {
-          canceledWorkerIds.push(outcome.workerId);
           if (
             !this.abortController.signal.aborted
             && !this.discoveryAbortController.signal.aborted
@@ -873,17 +847,13 @@ export class DeepScanCoordinator {
       reducerFailures = 0;
       this.state = outcome.run;
       previousReducerResultPath = outcome.resultPath;
-      mergedDiscoveries.push(...outcome.consumed);
-      const { result: acceptedResult, ...metadata } = outcome;
-      latestResult = acceptedResult;
-      reducerOutcomes.push(metadata);
+      latestResult = outcome.result;
       if (
         !this.discoveryDeadlineReached
         && outcome.run.noNewStreak >= config.stopAfterNoNew
         && buffer.length === 0
       ) {
         stopReason = "saturated";
-        canceledWorkerIds.push(...active.keys());
         this.abortController.abort("deep_scan_saturated");
       }
     }
@@ -904,10 +874,6 @@ export class DeepScanCoordinator {
     return {
       reason: stopReason,
       omittedWorkerIds: unique(omittedWorkerIds),
-      canceledWorkerIds: unique(canceledWorkerIds),
-      accepted,
-      mergedWorkerIds: unique(mergedDiscoveries.map((worker) => worker.id)),
-      reducers: reducerOutcomes,
       result: latestResult,
     };
   }
@@ -939,10 +905,10 @@ export class DeepScanCoordinator {
 
   private async recoverCompletedReducers(
     discoveries: AcceptedDiscovery[]
-  ): Promise<{ reducers: AcceptedReducer[]; result?: DeepReductionInput }> {
+  ): Promise<{ resultPath?: string; result?: DeepReductionInput }> {
     const discoveriesById = new Map(discoveries.map((worker) => [worker.id, worker]));
     const inputs = this.state.persistedDedupInputs ?? [];
-    const outcomes: AcceptedReducer[] = [];
+    let resultPath: string | undefined;
     let latestResult: DeepReductionInput | undefined;
     const completedReducers = (this.state.persistedWorkers ?? [])
       .filter((worker) => worker.kind === "dedup" && worker.status === "succeeded")
@@ -950,7 +916,6 @@ export class DeepScanCoordinator {
         workerLabelSequence(left, "dedup") - workerLabelSequence(right, "dedup")
         || left.id.localeCompare(right.id)
       ));
-    let noNewStreak = 0;
     for (const worker of completedReducers) {
       if (!worker.resultManifestPath) {
         throw new Error(`Completed reducer ${worker.id} has no persisted result manifest.`);
@@ -962,28 +927,17 @@ export class DeepScanCoordinator {
       if (consumed.length === 0 || consumed.some((value) => !value)) {
         throw new Error(`Completed reducer ${worker.id} has incomplete persisted inputs.`);
       }
-      const accepted = consumed as AcceptedDiscovery[];
-      const { newFindings, result } = await validateReducerArtifacts({
+      const { result } = await validateReducerArtifacts({
         artifacts: this.artifacts,
         artifactDir: worker.artifactDir,
         resultPath: worker.resultManifestPath,
         reducerId: worker.id,
-        previousReducerResultPath: outcomes.at(-1)?.resultPath
+        previousReducerResultPath: resultPath
       }, this.state.scanId);
       latestResult = result;
-      noNewStreak = newFindings > 0 ? 0 : noNewStreak + accepted.length;
-      outcomes.push({
-        type: "dedup",
-        id: worker.id,
-        consumed: accepted,
-        resultPath: worker.resultManifestPath,
-        newFindings,
-        attempt: worker.attempt,
-        ...(worker.threadId ? { threadId: worker.threadId } : {}),
-        run: { ...this.state, noNewStreak }
-      });
+      resultPath = worker.resultManifestPath;
     }
-    return { reducers: outcomes, result: latestResult };
+    return { resultPath, result: latestResult };
   }
 
   private reducerReady(
@@ -1089,12 +1043,6 @@ function workerLabelSequence(worker: PersistedDeepScanWorker, kind: "discovery" 
 
 function unique(values: string[]): string[] {
   return [...new Set(values)];
-}
-
-function removeValue(values: string[], value: string): void {
-  for (let index = values.length - 1; index >= 0; index -= 1) {
-    if (values[index] === value) values.splice(index, 1);
-  }
 }
 
 function cloneState(state: DeepScanRunState): DeepScanRunState {
