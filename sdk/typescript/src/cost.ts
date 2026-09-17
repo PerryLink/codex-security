@@ -121,6 +121,7 @@ export class ScanCostTracker {
   readonly #workerProgress = new Map<string, number>();
   readonly #reportedProgress = new Set<string>();
   #threadId: string | null = null;
+  #observingWorkers = true;
   #timer: NodeJS.Timeout | null = null;
   #pending: Promise<void> = Promise.resolve();
   #snapshot: ScanCostSnapshot = { usage: null, cost: null };
@@ -197,7 +198,11 @@ export class ScanCostTracker {
       this.#timer = null;
     }
     if (fallbackUsage !== undefined) this.recordUsage(fallbackUsage);
-    await this.refresh();
+    try {
+      await this.refresh();
+    } finally {
+      this.#observingWorkers = false;
+    }
     if (this.#receipts.size > 0 || this.#snapshot.usage !== null)
       return this.#snapshot;
     const cost = estimateScanCost(this.#options.model, fallbackUsage);
@@ -292,7 +297,8 @@ export class ScanCostTracker {
         if (worker === undefined) {
           worker = this.#workers.size + 1;
           this.#workers.set(threadId, worker);
-          this.#options.onWorkerEvent?.({ kind: "observed", worker });
+          if (this.#observingWorkers)
+            this.#options.onWorkerEvent?.({ kind: "observed", worker });
         }
       }
       for (const event of session.events?.splice(0) ?? []) {

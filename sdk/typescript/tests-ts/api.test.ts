@@ -4493,13 +4493,14 @@ describe("CodexSecurity orchestration", () => {
   );
 
   test.each([
-    ["partial coverage", "partial", false],
-    ["unknown coverage", "unknown", false],
-    ["a failed scan", "failed", false],
-    ["a failed scan and follow-up", "failed", true],
+    ["partial coverage", "partial", false, false],
+    ["unknown coverage", "unknown", false, false],
+    ["a failed scan", "failed", false, false],
+    ["a failed scan and follow-up", "failed", true, false],
+    ["an interrupted follow-up", "partial", false, true],
   ] as const)(
     "runs post-scan instructions after %s",
-    async (_scenario, outcome, followUpFails) => {
+    async (_scenario, outcome, followUpFails, cancelFollowUp) => {
       const root = await temporaryDirectory();
       const repository = join(root, "repository");
       const codexHome = join(root, "codex-home");
@@ -4512,6 +4513,7 @@ describe("CodexSecurity orchestration", () => {
       const workers: ScanWorkerEvent[] = [];
       const observerErrors: string[] = [];
       const scanFails = outcome === "failed";
+      const controller = new AbortController();
 
       const client = new TestClient(
         {},
@@ -4552,6 +4554,7 @@ describe("CodexSecurity orchestration", () => {
                   );
                   return { events: completedEvents() };
                 }
+                if (prompts.length === 2 && cancelFollowUp) controller.abort();
                 if (prompts.length === 2 && !followUpFails) {
                   return { events: completedEvents() };
                 }
@@ -4576,6 +4579,7 @@ describe("CodexSecurity orchestration", () => {
 
       const result = client.run(repository, {
         postScanPrompt: "Record the scan cost.",
+        signal: controller.signal,
         onWarning: (warning) => warnings.push(warning),
         onWorkerEvent: (event) => {
           workers.push(event);
@@ -4583,7 +4587,9 @@ describe("CodexSecurity orchestration", () => {
         },
         onObserverError: (observer) => observerErrors.push(observer),
       });
-      if (scanFails) {
+      if (cancelFollowUp) {
+        await expect(result).rejects.toBeInstanceOf(ScanInterruptedError);
+      } else if (scanFails) {
         await expect(result).rejects.toThrow("The scan failed.");
       } else {
         expect((await result).coverage.completeness).toBe(outcome);
