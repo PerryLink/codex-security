@@ -172,6 +172,57 @@ test("native waiters join one ordinary scan and detaching leaves it running", as
   assert.equal(closes, 1);
 });
 
+for (const outcome of ["completed", "failed"]) {
+  test(`native cleanup preserves the ${outcome} scan outcome and drains before rejoining`, async (t) => {
+    const closing = Promise.withResolvers();
+    const releaseClose = Promise.withResolvers();
+    const primaryError = new Error("Synthetic startup failure");
+    const cleanupError = new Error("Synthetic bootstrap cleanup failure");
+    const result = { scanDir: "sealed-parent" };
+    const warnings = [];
+    t.mock.method(console, "warn", (...args) => {
+      warnings.push(args);
+      if (warnings.length === 2) throw new Error("Synthetic warning failure");
+    });
+    let preparations = 0;
+    const host = new NativeScanHost(async () => {
+      preparations++;
+      return {
+        options: { mode: "deep" },
+        client: {
+          async run() {
+            if (outcome === "failed") throw primaryError;
+            return result;
+          },
+          async close() {
+            closing.resolve();
+            await releaseClose.promise;
+          },
+        },
+      };
+    });
+    const first = host.run(input());
+    const joined = host.run(input());
+    let settled = false;
+    void first.then(() => { settled = true; }, () => { settled = true; });
+    await closing.promise;
+    assert.equal(settled, false);
+    assert.equal(preparations, 1);
+    releaseClose.reject(cleanupError);
+    for (const pending of [first, joined]) {
+      if (outcome === "failed") await assert.rejects(pending, (error) => error === primaryError);
+      else assert.equal(await pending, result);
+    }
+    assert.equal(warnings.length, 1);
+    assert.equal(warnings[0][1], cleanupError);
+    const next = host.run(input());
+    if (outcome === "failed") await assert.rejects(next, (error) => error === primaryError);
+    else assert.equal(await next, result);
+    assert.equal(preparations, 2);
+    assert.equal(warnings.length, 2);
+  });
+}
+
 test("native cancellation drains only its parent; shutdown drains the rest", async () => {
   const started = new Map();
   const closed = [];

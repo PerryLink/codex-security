@@ -84,7 +84,13 @@ export class NativeScanHost {
               signal: controller.signal,
             });
           } finally {
-            await client.close();
+            try {
+              await client.close();
+            } catch (error) {
+              try {
+                console.warn("Could not clean up the native scan:", error);
+              } catch {}
+            }
           }
         })
         .finally(() => this.active.delete(input.scan.scanId));
