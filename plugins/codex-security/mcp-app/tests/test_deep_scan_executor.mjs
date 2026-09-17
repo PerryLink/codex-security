@@ -769,6 +769,7 @@ async function testIsolatedReconstructedWorkers(selectedName) {
   }
   const previousMarker = process.env.FAKE_CODEX_MARKER;
   const originalSpawn = childProcess.spawn;
+  const children = [];
   const scans = [];
   try {
     for (const name of [selectedName]) {
@@ -816,7 +817,9 @@ async function testIsolatedReconstructedWorkers(selectedName) {
     childProcess.spawn = (command, args, options) => {
       const scan = scans.find((scan) => options?.env?.FAKE_CODEX_MARKER === scan.fixture.markerPath);
       if (scan) assert.equal(command, path.toNamespacedPath(scan.environment.CODEX_CLI_PATH));
-      return originalSpawn(command, scan ? [scan.fixture.executablePath, ...args] : args, options);
+      const child = originalSpawn(command, scan ? [scan.fixture.executablePath, ...args] : args, options);
+      if (scan) children.push(child);
+      return child;
     };
     syncBuiltinESMExports();
 
@@ -880,6 +883,15 @@ async function testIsolatedReconstructedWorkers(selectedName) {
     childProcess.spawn = originalSpawn;
     syncBuiltinESMExports();
     restoreEnv("FAKE_CODEX_MARKER", previousMarker);
+    // The SDK removes child listeners before the copied executable is safe to delete on Windows.
+    await Promise.all(children.map((child) => {
+      if (child.stdout.closed && child.stderr.closed
+        && (child.exitCode !== null || child.signalCode !== null)) return;
+      return new Promise((resolve) => {
+        child.once("close", resolve);
+        if (child.exitCode === null && child.signalCode === null) child.kill();
+      });
+    }));
   }
 }
 
