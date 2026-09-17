@@ -4461,6 +4461,8 @@ describe("CodexSecurity orchestration", () => {
       await mkdir(scanDir, { mode: 0o700 });
       const prompts: string[] = [];
       const warnings: string[] = [];
+      const workers: ScanWorkerEvent[] = [];
+      const observerErrors: string[] = [];
       const scanFails = outcome === "failed";
 
       const client = new TestClient(
@@ -4476,6 +4478,27 @@ describe("CodexSecurity orchestration", () => {
               id: "thread-1",
               async runStreamed(prompt: string) {
                 prompts.push(prompt);
+                async function* withWorkerEvents(
+                  events: AsyncGenerator<ThreadEvent>,
+                ) {
+                  yield {
+                    type: "worker.spawned",
+                    dispatch_id: "scan-worker",
+                    worker_thread_id: "worker-1",
+                  };
+                  if (prompts.length === 2) {
+                    yield {
+                      type: "worker.spawned",
+                      dispatch_id: "follow-up-worker",
+                      worker_thread_id: "worker-2",
+                    };
+                    yield {
+                      type: "worker.spawn_failed",
+                      dispatch_id: "failed-follow-up-worker",
+                    };
+                  }
+                  yield* events;
+                }
                 if (prompts.length === 1 && !scanFails) {
                   await copyCompletedScan(root);
                   const coveragePath = join(scanDir, "coverage.json");
@@ -4493,10 +4516,10 @@ describe("CodexSecurity orchestration", () => {
                       createHash("sha256").update(coverage).digest("hex"),
                     ),
                   );
-                  return { events: completedEvents() };
+                  return { events: withWorkerEvents(completedEvents()) };
                 }
                 if (prompts.length === 2 && !followUpFails) {
-                  return { events: completedEvents() };
+                  return { events: withWorkerEvents(completedEvents()) };
                 }
                 async function* failedEvents(): AsyncGenerator<ThreadEvent> {
                   yield {
@@ -4509,7 +4532,7 @@ describe("CodexSecurity orchestration", () => {
                     },
                   };
                 }
-                return { events: failedEvents() };
+                return { events: withWorkerEvents(failedEvents()) };
               },
             }),
           }),
@@ -4519,6 +4542,11 @@ describe("CodexSecurity orchestration", () => {
       const result = client.run(repository, {
         postScanPrompt: "Record the scan cost.",
         onWarning: (warning) => warnings.push(warning),
+        onWorkerEvent: (event) => {
+          workers.push(event);
+          throw new Error("optional worker observer failed");
+        },
+        onObserverError: (observer) => observerErrors.push(observer),
       });
       if (scanFails) {
         await expect(result).rejects.toThrow("The scan failed.");
@@ -4527,6 +4555,16 @@ describe("CodexSecurity orchestration", () => {
       }
       expect(prompts.at(-1)).toBe("Record the scan cost.");
       expect(prompts).toHaveLength(2);
+      expect(workers).toEqual([
+        { kind: "spawned", worker: 1 },
+        { kind: "spawned", worker: 2 },
+        { kind: "spawn_failed" },
+      ]);
+      expect(observerErrors).toEqual([
+        "onWorkerEvent",
+        "onWorkerEvent",
+        "onWorkerEvent",
+      ]);
       expect(warnings).toEqual(
         followUpFails
           ? [

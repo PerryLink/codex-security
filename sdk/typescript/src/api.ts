@@ -1208,6 +1208,7 @@ export class CodexSecurity {
     let targetPathsFile: string | null = null;
     let knowledgeBase: PreparedKnowledgeBase | null = null;
     let costTracker: ScanCostTracker | null = null;
+    const workerTracker = new ScanWorkerTracker();
     let deepProgressTracker: DeepScanProgressTracker | null = null;
     let releaseCredentialHome: (() => Promise<void>) | null = null;
     let scanFailure = false;
@@ -1446,7 +1447,6 @@ export class CodexSecurity {
           `Could not track scan activity: ${errorMessage(error)}`,
         );
       };
-      const workerTracker = new ScanWorkerTracker();
       const tracker = new ScanCostTracker({
         workerTracker,
         codexHome: runtime.codexHome,
@@ -2389,6 +2389,15 @@ export class CodexSecurity {
       if (runPostScan !== null && !signal.aborted) {
         try {
           for await (const event of (await runPostScan()).events) {
+            const workerEvent = workerTracker.eventFromRuntime(event);
+            if (workerEvent !== null) {
+              notifyObserver(
+                "onWorkerEvent",
+                options.onWorkerEvent,
+                options.onObserverError,
+                workerEvent,
+              );
+            }
             if (event.type === "turn.failed") {
               throw new CodexSecurityError(turnFailureMessage(event["error"]));
             }
