@@ -159,9 +159,40 @@ Options for `security.run(repository, options)` and
 | `expectedPluginVersion`                     | Required original plugin version when replaying a scan.                             |
 | `signal`                                    | `AbortSignal` to cancel a scan.                                                     |
 
-Follow scans with `onWorkerStatus` and `onReconnect`. `onSessionEvent` receives
-saved events with thread IDs and worker numbers. Deep scans can additionally use
-`onDeepProgress` for durable independent-review counts: `completed`, `active`,
+Follow scans with `onWorkerEvent` and `onReconnect`. `onWorkerEvent` receives
+runtime spawn outcomes from the scan's main agent:
+
+```ts
+await security.run(repository, {
+  onWorkerEvent(event) {
+    if (event.kind === "spawned") {
+      console.log(`Worker ${event.worker} started`);
+    } else {
+      console.log("A worker could not be started");
+    }
+  },
+});
+```
+
+The callback contains only `kind` and, for successful spawns, a scan-local `worker`
+number matching `onActivity` and `onSessionEvent`. Duplicate notifications for a
+dispatch are suppressed within a run. It reports live outcomes, not historical
+workers on resume or workers launched by other workers. A spawn does not identify
+a scan phase or mean file review has started. Notifications are not awaited as a
+pre-dispatch gate; use `maxCostUsd` or `signal` for cancellation. Observer failures
+go to `onObserverError` without stopping the scan.
+
+This callback requires a Codex runtime that emits `worker.spawned` and
+`worker.spawn_failed`. The currently pinned Codex 0.154.0 does not emit these
+events; the SDK dependency must be upgraded with the runtime change before this
+callback ships.
+
+`onWorkerStatus` remains available for tool-derived preflight status and
+**best-effort** phase dispatch counts from model-emitted text markers. A missing
+dispatch status does not mean delegation was skipped. `onSessionEvent` receives
+saved events with thread IDs and worker numbers and can contain source code or
+credentials. Deep scans report their independent jobs through `onDeepProgress`:
+`completed`, `active`,
 and `maximum`. The maximum is a configured cap, not a percentage denominator.
 `ScanOptions` lists all callbacks.
 

@@ -163,6 +163,7 @@ import {
   type ScanProgress,
   type ScanWorkerStatus,
 } from "./worker-progress.js";
+import { ScanWorkerTracker, type ScanWorkerEvent } from "./worker-events.js";
 import { CODEX_SECURITY_THREAD_SOURCES } from "./thread-source.js";
 import { CODEX_EXECUTABLE_VERSION, CODEX_SDK_VERSION } from "./version.js";
 import {
@@ -298,7 +299,14 @@ export interface ScanOptions extends ScanSettings {
   onSessionEvent?: (event: ScanSessionEvent) => void;
   onProgress?: (progress: ScanProgress) => void;
   onDeepProgress?: (progress: DeepScanProgress) => void;
+  /** Preflight status and best-effort, model-reported phase dispatch counts. */
   onWorkerStatus?: (status: ScanWorkerStatus) => void;
+  /**
+   * Live runtime spawn outcomes from the scan's main agent, once per dispatch.
+   * Worker numbers match onActivity/onSessionEvent. This is an observer, not a
+   * pre-dispatch gate; use maxCostUsd or signal for cancellation.
+   */
+  onWorkerEvent?: (event: ScanWorkerEvent) => void;
   onWarning?: (warning: string, details?: ScanWarningDetails) => void;
   onObserverError?: (observer: ScanObserverName, error: unknown) => void;
   signal?: AbortSignal;
@@ -393,6 +401,7 @@ type ScanObserverName =
   | "onProgress"
   | "onDeepProgress"
   | "onWorkerStatus"
+  | "onWorkerEvent"
   | "onStage"
   | "onWarning";
 
@@ -1437,7 +1446,9 @@ export class CodexSecurity {
           `Could not track scan activity: ${errorMessage(error)}`,
         );
       };
+      const workerTracker = new ScanWorkerTracker();
       const tracker = new ScanCostTracker({
+        workerTracker,
         codexHome: runtime.codexHome,
         model,
         repository: repo,
@@ -2092,6 +2103,8 @@ export class CodexSecurity {
           reportProgress(progress);
         },
         onWorkerStatus: options.onWorkerStatus,
+        onWorkerEvent: options.onWorkerEvent,
+        workerTracker,
         onWarning: options.onWarning,
         onObserverError: options.onObserverError,
       });
@@ -2164,6 +2177,8 @@ export class CodexSecurity {
             model,
             onReconnect: options.onReconnect,
             onWorkerStatus: options.onWorkerStatus,
+            onWorkerEvent: options.onWorkerEvent,
+            workerTracker,
             onObserverError: options.onObserverError,
           });
           checkOpen();
@@ -3634,6 +3649,8 @@ interface ScanEventRunOptions {
   onActivity?: (activity: ScanActivity) => void;
   onProgress?: (progress: ScanProgress) => void;
   onWorkerStatus?: (status: ScanWorkerStatus) => void;
+  onWorkerEvent?: (event: ScanWorkerEvent) => void;
+  workerTracker?: ScanWorkerTracker;
   onWarning?: (warning: string) => void;
   onObserverError?: (observer: ScanObserverName, error: unknown) => void;
 }
@@ -3642,6 +3659,7 @@ interface ScanEventRunOptions {
 export async function runScanEvents(
   options: ScanEventRunOptions,
 ): Promise<ScanResult> {
+  const workerTracker = options.workerTracker ?? new ScanWorkerTracker();
   let scanStarted = false;
   let tacStatusReported = false;
   try {
@@ -3692,6 +3710,15 @@ export async function runScanEvents(
             options.onProgress,
             options.onObserverError,
             progress,
+          );
+        }
+        const workerEvent = workerTracker.eventFromRuntime(event);
+        if (workerEvent !== null) {
+          notifyObserver(
+            "onWorkerEvent",
+            options.onWorkerEvent,
+            options.onObserverError,
+            workerEvent,
           );
         }
         const workerStatus = workerStatusFromEvent(event);

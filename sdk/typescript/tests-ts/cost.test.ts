@@ -20,6 +20,7 @@ import type { ScanActivity } from "../src/scan-activity.js";
 import { formatTokenUsage, tokenUsage } from "../src/cost-model.js";
 import { readScanLogs } from "../src/scan-logs.js";
 import { sessionParentThreadId } from "../src/scan-sessions.js";
+import { ScanWorkerTracker } from "../src/worker-events.js";
 import type { ScanProgress } from "../src/worker-progress.js";
 import { PLUGIN_ROOT as BUNDLED_PLUGIN_ROOT } from "./plugin-root.js";
 import {
@@ -608,6 +609,43 @@ describe("live scan cost tracking", () => {
         cacheWriteInputTokens: 0,
         outputTokens: 30,
         estimatedUsd: 0.00488,
+      });
+    } finally {
+      await tracker.stop();
+    }
+  });
+
+  test("uses runtime worker numbers for saved session events", async () => {
+    const home = await codexHome();
+    await writeSession(home, "scan-thread", { input_tokens: 10 });
+    await writeSession(home, "worker-a", { input_tokens: 10 }, "scan-thread");
+    await writeSession(home, "worker-b", { input_tokens: 10 }, "scan-thread");
+    const workerTracker = new ScanWorkerTracker();
+    for (const threadId of ["worker-b", "worker-a"]) {
+      workerTracker.eventFromRuntime({
+        type: "worker.spawned",
+        dispatch_id: threadId,
+        worker_thread_id: threadId,
+      });
+    }
+    const events: ScanSessionEvent[] = [];
+    const tracker = new ScanCostTracker({
+      workerTracker,
+      codexHome: home,
+      model: "gpt-5.6-sol",
+      onSessionEvent: (event) => events.push(event),
+    });
+    tracker.start("scan-thread");
+    try {
+      await tracker.refresh();
+      expect(
+        Object.fromEntries(
+          events.map(({ threadId, worker }) => [threadId, worker]),
+        ),
+      ).toEqual({
+        "scan-thread": undefined,
+        "worker-a": 2,
+        "worker-b": 1,
       });
     } finally {
       await tracker.stop();

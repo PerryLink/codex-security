@@ -19,6 +19,7 @@ import {
   scanProgressUpdatesFromEvent,
   type ScanProgress,
 } from "./worker-progress.js";
+import { ScanWorkerTracker } from "./worker-events.js";
 
 export { estimateScanCost, formatUsd, type ScanCost } from "./cost-model.js";
 
@@ -60,6 +61,7 @@ interface SessionUsage {
 }
 
 interface ScanCostTrackerOptions {
+  workerTracker?: ScanWorkerTracker;
   codexHome: string;
   model: string;
   repository?: string;
@@ -109,7 +111,7 @@ export class ScanCostTracker {
   readonly #options: ScanCostTrackerOptions;
   readonly #sessions = new Map<string, SessionUsage>();
   readonly #receipts = new Map<string, ScanTokenUsage | null>();
-  readonly #workers = new Map<string, number>();
+  readonly #workerTracker: ScanWorkerTracker;
   readonly #workerProgress = new Map<string, number>();
   readonly #reportedProgress = new Set<string>();
   #threadId: string | null = null;
@@ -122,6 +124,7 @@ export class ScanCostTracker {
 
   public constructor(options: ScanCostTrackerOptions) {
     this.#options = options;
+    this.#workerTracker = options.workerTracker ?? new ScanWorkerTracker();
     this.#expectedFilesTotal = options.expectedFilesTotal;
   }
 
@@ -279,8 +282,7 @@ export class ScanCostTracker {
       }
       let worker: number | undefined;
       if (threadId !== this.#threadId) {
-        worker = this.#workers.get(threadId) ?? this.#workers.size + 1;
-        this.#workers.set(threadId, worker);
+        worker = this.#workerTracker.workerNumber(threadId);
       }
       for (const event of session.events?.splice(0) ?? []) {
         this.#options.onSessionEvent?.({

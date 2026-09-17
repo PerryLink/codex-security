@@ -38,6 +38,7 @@ import {
   type ScanOptions,
   type ScanProgress,
   type ScanSessionEvent,
+  type ScanWorkerEvent,
   ScanInterruptedError,
 } from "../src/index.js";
 import {
@@ -3604,6 +3605,7 @@ describe("CodexSecurity orchestration", () => {
     await mkdir(scanDir, { mode: 0o700 });
     const updates: ScanProgress[] = [];
     const sessionEvents: ScanSessionEvent[] = [];
+    const workers: ScanWorkerEvent[] = [];
     const observerErrors: ScanObserverName[] = [];
     const usage = { input_tokens: 100, output_tokens: 10 };
     const client = new TestClient(
@@ -3678,7 +3680,23 @@ describe("CodexSecurity orchestration", () => {
                   })}\n`,
                 );
               }
-              return { events: completedEvents() };
+              async function* events() {
+                for await (const event of completedEvents()) {
+                  yield event;
+                  if (event.type === "turn.started") {
+                    yield {
+                      type: "worker.spawned",
+                      dispatch_id: "spawn-1",
+                      worker_thread_id: "worker-thread",
+                    };
+                    yield {
+                      type: "worker.spawn_failed",
+                      dispatch_id: "spawn-2",
+                    };
+                  }
+                }
+              }
+              return { events: events() };
             },
           }),
         }),
@@ -3687,6 +3705,7 @@ describe("CodexSecurity orchestration", () => {
 
     const result = await client.run(repository, {
       onProgress: (progress) => updates.push(progress),
+      onWorkerEvent: (event) => workers.push(event),
       onSessionEvent: (event) => {
         sessionEvents.push(event);
         if (sessionEvents.length === 1) {
@@ -3711,6 +3730,17 @@ describe("CodexSecurity orchestration", () => {
         ),
       ),
     ).toEqual(new Set(["thread-1:null", "worker-thread:thread-1"]));
+    expect(workers).toEqual([
+      { kind: "spawned", worker: 1 },
+      { kind: "spawn_failed" },
+    ]);
+    expect(
+      new Set(
+        sessionEvents
+          .filter((event) => event.threadId === "worker-thread")
+          .map((event) => event.worker),
+      ),
+    ).toEqual(new Set([1]));
     expect(observerErrors).toEqual(["onSessionEvent"]);
     await client.close();
   });
