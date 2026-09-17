@@ -119,6 +119,8 @@ test.each(
             name: "Synthetic provider",
             base_url: `https://${provider}.example.test/v1`,
             wire_api: "responses",
+            experimental_bearer_token: `synthetic-${name}-token`,
+            http_headers: { Authorization: `synthetic-${name}-header` },
             ...(name === "command-auth"
               ? {
                   auth: {
@@ -160,13 +162,30 @@ test.each(
         },
         prepareRuntime: async () => ({ ...preparedRuntime(home), configPath }),
         resolvePluginPython: async () => "/managed/python",
-        createCodex: () => ({
+        createCodex: (options) => ({
           startThread: () => ({
             id: null,
             async runStreamed() {
               const runtime = parseToml(
                 await readFile(`${configPath}.workers.toml`, "utf8"),
               ) as JsonObject;
+              const permissionOverride = options.configOverrides?.find(
+                (value) =>
+                  value.startsWith(
+                    "permissions.codex_security_scan.filesystem=",
+                  ),
+              );
+              expect(permissionOverride).toBeDefined();
+              expect(parseToml(permissionOverride!)["permissions"]).toEqual({
+                codex_security_scan: {
+                  filesystem: {
+                    ":root": "read",
+                    ":workspace_roots": "write",
+                    [home]: "read",
+                    [`${configPath}.workers.toml`]: { ".": "deny" },
+                  },
+                },
+              });
               expect(runtime["model_provider"]).toBe(provider);
               expect(runtime["model_providers"]).toEqual(
                 name === "default"

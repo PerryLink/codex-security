@@ -295,7 +295,7 @@ function workerSubagentConfig(subagents: number, config: NonNullable<CodexOption
   };
 }
 
-type TomlValue = string | number | boolean | TomlValue[] | TomlObject;
+type TomlValue = string | number | boolean | TomlObject;
 type TomlObject = { [key: string]: TomlValue };
 
 function workerPermissionProfile(
@@ -334,7 +334,6 @@ function tomlInlineValue(value: TomlValue): string {
   if (typeof value === "string") return tomlString(value);
   if (typeof value === "number") return String(value);
   if (typeof value === "boolean") return value ? "true" : "false";
-  if (Array.isArray(value)) return `[${value.map(tomlInlineValue).join(",")}]`;
   return `{${Object.entries(value)
     .map(([key, entry]) => `${tomlKey(key)}=${tomlInlineValue(entry)}`)
     .join(",")}}`;

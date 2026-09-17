@@ -871,8 +871,12 @@ async function testRuntimeProviderSnapshots() {
   const scans = [];
   try {
     for (const name of ["openrouter", "fireworks", "command-auth", "cloud.production", "cloud production", "shared-default", "shared-default-configured", "openai", "shared-external"]) {
-      const fixture = await fakeCodexFixture(deniedWorkerPermissionProfile);
-      const configPath = path.join(fixture.root, "config-preflight.toml");
+      const configPath = path.join(sharedHome, `${name}.toml`);
+      const permissionProfile = {
+        ...deniedWorkerPermissionProfile,
+        filesystem: { ...deniedWorkerPermissionProfile.filesystem, [`${configPath}.workers.toml`]: "deny" }
+      };
+      const fixture = await fakeCodexFixture(permissionProfile);
       const promptPath = path.join(fixture.root, "prompt.md");
       const provider = name.startsWith("shared-default") ? "openai" : name === "shared-external" ? "openrouter" : name.startsWith("cloud") ? "amazon-bedrock" : name === "command-auth" ? "openrouter" : name;
       const definition = provider === "amazon-bedrock"
@@ -922,9 +926,9 @@ async function testRuntimeProviderSnapshots() {
       await writeFile(path.join(codexHome, "config.toml"), stringifyToml(config));
       const settings = {
         codexOptions: { codexPathOverride: process.execPath, env: { CODEX_HOME: codexHome, CODEX_SECURITY_CONFIG_PATH: configPath, FAKE_CODEX_MARKER: fixture.markerPath, FAKE_CODEX_WORKER_CONFIG: `${configPath}.workers.toml`, SYNTHETIC_PROVIDER_HEADER: `synthetic-${name}-header-env`, ...(definition.env_key ? { [definition.env_key]: `synthetic-${name}-env-key` } : {}), FAKE_CODEX_PROVIDER_ENV_KEYS: JSON.stringify(["SYNTHETIC_PROVIDER_HEADER", ...(definition.env_key ? [definition.env_key] : [])]) } },
-        model: "worker-model", reasoningEffort: "ultra", parentSandbox: trustedParentSandboxWithDenials
+        model: "worker-model", reasoningEffort: "ultra", parentSandbox: { ...trustedParentSandboxWithDenials, filesystemDenies: [...trustedParentSandboxWithDenials.filesystemDenies, `${configPath}.workers.toml`] }
       };
-      scans.push({ name, fixture, configPath, promptPath, config, input, auth, settings, executor: new CodexSdkWorkerExecutor(settings) });
+      scans.push({ name, permissionProfile, fixture, configPath, promptPath, config, input, auth, settings, executor: new CodexSdkWorkerExecutor(settings) });
     }
     childProcess.spawn = (command, args, options) => {
       const scan = scans.find((scan) => options?.env?.FAKE_CODEX_MARKER === scan.fixture.markerPath);
@@ -948,6 +952,7 @@ async function testRuntimeProviderSnapshots() {
             for (let i = 0; i < child.argv.length; i++) {
               if (["-c", "--config"].includes(child.argv[i])) Object.assign(overrides, parseToml(child.argv[++i]));
             }
+            assert.deepEqual(overrides.permissions.codex_security_deep_scan_worker, scan.permissionProfile);
             assert.equal(overrides.model_provider, scan.config.model_provider, `${scan.name} ${phase} ${kind}`);
             assert.equal(JSON.stringify(child).includes(`synthetic-${scan.name}-unrelated-token`), false);
             assert.deepEqual(parseToml(child.workerConfig), phase === "resume" ? { model_provider: "changed-after-launch" } : scan.config);

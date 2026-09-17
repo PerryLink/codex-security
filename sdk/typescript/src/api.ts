@@ -2650,6 +2650,12 @@ export class CodexSecurity {
     if (session.safetyIdentifier !== undefined) {
       environment[SAFETY_IDENTIFIER_ENV] = session.safetyIdentifier;
     }
+    if (runtime.configPath !== undefined) {
+      configOverrides = [
+        `permissions.${SCAN_PERMISSION_PROFILE}.filesystem=${inlineToml(scanFilesystemPermissions(session.runtimeHome, codexWorkerConfigPath(runtime.configPath)))}`,
+        ...configOverrides,
+      ];
+    }
     const sdkCodexConfig = { ...(config ?? sessionConfig) };
     // Projects and permissions already live in generated TOML files; the SDK
     // cannot safely encode their path and selector keys as dotted overrides.
@@ -4473,19 +4479,27 @@ export function scanRuntimeCodexConfig(
     permissions: {
       ...configuredPermissions,
       [SCAN_PERMISSION_PROFILE]: {
-        filesystem: {
-          ":root": "read",
-          ":workspace_roots": "write",
-          ...(protectedCredentialHome === undefined
-            ? {}
-            : { [protectedCredentialHome]: "read" }),
-        },
+        filesystem: scanFilesystemPermissions(protectedCredentialHome),
       },
       [POLICY_PERMISSION_PROFILE]: {
         filesystem: policyFilesystemPermissions(),
         network: { enabled: false },
       },
     },
+  };
+}
+
+function scanFilesystemPermissions(
+  credentialHome?: string,
+  workerConfigPath?: string,
+): JsonObject {
+  return {
+    ":root": "read",
+    ":workspace_roots": "write",
+    ...(credentialHome === undefined ? {} : { [credentialHome]: "read" }),
+    ...(workerConfigPath === undefined
+      ? {}
+      : { [workerConfigPath]: { ".": "deny" } }),
   };
 }
 
