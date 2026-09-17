@@ -13,6 +13,10 @@ Investigate the proposed code or code changes for technically plausible security
 
 Standard and Deep discovery workers follow their self-contained coordinator prompts; they do not invoke this skill. For an explicit standalone repository-discovery request, apply the relevant checklist below directly to the authorized current source without running the diff-only workflow or starting another scan.
 
+## Rust Review
+
+When the reviewed code or its directly supporting unsafe abstractions are Rust, read `../unsafe-rust-review/SKILL.md` and its upstream method in security-review mode. Use it within the current discovery pass, preserving diff scope, candidate recording, and the existing output contract. A change to safe Rust can invalidate an unsafe invariant elsewhere; follow those supporting paths. Pass the resolved skill path and available local dependency/std contract sources to delegated Rust reviewers explicitly. Return concrete soundness candidates for the existing validation phase; missing safety comments alone are not candidates.
+
 ## Artifact Resolution
 
 The path references in this skill are the default locations for this phase.
