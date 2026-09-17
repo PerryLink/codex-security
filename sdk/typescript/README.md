@@ -159,42 +159,40 @@ Options for `security.run(repository, options)` and
 | `expectedPluginVersion`                     | Required original plugin version when replaying a scan.                             |
 | `signal`                                    | `AbortSignal` to cancel a scan.                                                     |
 
-Follow scans with `onWorkerEvent` and `onReconnect`. `onWorkerEvent` receives
-runtime spawn outcomes from the scan's main agent:
+Follow scans with `onWorkerEvent` and `onReconnect`. `onWorkerEvent` reports
+persisted worker sessions discovered by the SDK's existing session tracker,
+independently of model-emitted status markers:
 
 ```ts
 await security.run(repository, {
   onWorkerEvent(event) {
-    if (event.kind === "spawned") {
-      console.log(`Worker ${event.worker} started`);
-    } else {
-      console.log("A worker could not be started");
-    }
+    console.log(`Worker ${event.worker} observed`);
   },
 });
 ```
 
-The callback contains only `kind` and, for successful spawns, a scan-local `worker`
-number matching `onActivity` and `onSessionEvent`. Duplicate notifications for a
-dispatch are suppressed within a run. It reports live outcomes, not historical
-workers on resume or workers launched by other workers. A spawn does not identify
-a scan phase or mean file review has started. Notifications are not awaited as a
-pre-dispatch gate; use `maxCostUsd` or `signal` for cancellation. Observer failures
-go to `onObserverError` without stopping the scan.
+The callback contains only `{ kind: "observed", worker: number }`. The scan-local
+worker number matches `onActivity` and `onSessionEvent`; no prompts, raw thread
+IDs, or session contents are exposed. Each session is reported once per run,
+including nested workers and scan-associated validation or Deep Scan sessions.
+On resume, already persisted workers can be reported again. Observation ends
+with scan cost tracking, before `postScanPrompt`.
 
-This callback requires a Codex runtime that emits `worker.spawned` and
-`worker.spawn_failed`. The currently pinned Codex 0.154.0 does not emit these
-events; the SDK dependency must be upgraded with the runtime change before this
-callback ships.
+This works with the bundled Codex version. Persistence and polling can delay
+notification, and missing notifications do not prove that delegation was skipped.
+An observed session does not establish that a worker just started or that file
+review has begun. The callback does not report failed spawn attempts, phase names,
+or planned counts, and cannot act as a pre-dispatch gate. Use `maxCostUsd` or
+`signal` for cancellation. Observer failures go to `onObserverError` without
+stopping the scan.
 
 `onWorkerStatus` remains available for tool-derived preflight status and
 **best-effort** phase dispatch counts from model-emitted text markers. A missing
 dispatch status does not mean delegation was skipped. `onSessionEvent` receives
 saved events with thread IDs and worker numbers and can contain source code or
-credentials. Deep scans report their independent jobs through `onDeepProgress`:
-`completed`, `active`,
-and `maximum`. The maximum is a configured cap, not a percentage denominator.
-`ScanOptions` lists all callbacks.
+credentials. Deep scans additionally expose durable independent-review counts
+through `onDeepProgress`: `completed`, `active`, and `maximum`. The maximum is a
+configured cap, not a percentage denominator. `ScanOptions` lists all callbacks.
 
 `preflight` and CLI `--dry-run` check local inputs without starting Codex or
 using the network. They don't authenticate, verify model access, resolve Python,

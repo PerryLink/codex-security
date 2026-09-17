@@ -67,6 +67,7 @@ import {
   ScanCostTracker,
   type ScanCost,
   type ScanSessionEvent,
+  type ScanWorkerEvent,
 } from "./cost.js";
 import {
   DeepScanProgressTracker,
@@ -163,7 +164,6 @@ import {
   type ScanProgress,
   type ScanWorkerStatus,
 } from "./worker-progress.js";
-import { ScanWorkerTracker, type ScanWorkerEvent } from "./worker-events.js";
 import { CODEX_SECURITY_THREAD_SOURCES } from "./thread-source.js";
 import { CODEX_EXECUTABLE_VERSION, CODEX_SDK_VERSION } from "./version.js";
 import {
@@ -302,9 +302,11 @@ export interface ScanOptions extends ScanSettings {
   /** Preflight status and best-effort, model-reported phase dispatch counts. */
   onWorkerStatus?: (status: ScanWorkerStatus) => void;
   /**
-   * Live runtime spawn outcomes from the scan's main agent, once per dispatch.
-   * Worker numbers match onActivity/onSessionEvent. This is an observer, not a
-   * pre-dispatch gate; use maxCostUsd or signal for cancellation.
+   * Reports each persisted worker session once when discovered during this run.
+   * Worker numbers match onActivity/onSessionEvent. Includes saved workers on
+   * resume; observation ends before postScanPrompt. Persistence and polling can
+   * delay delivery. Does not report failed spawns, phase, or planned counts and
+   * cannot gate dispatch; use maxCostUsd or signal for cancellation.
    */
   onWorkerEvent?: (event: ScanWorkerEvent) => void;
   onWarning?: (warning: string, details?: ScanWarningDetails) => void;
@@ -1208,7 +1210,6 @@ export class CodexSecurity {
     let targetPathsFile: string | null = null;
     let knowledgeBase: PreparedKnowledgeBase | null = null;
     let costTracker: ScanCostTracker | null = null;
-    const workerTracker = new ScanWorkerTracker();
     let deepProgressTracker: DeepScanProgressTracker | null = null;
     let releaseCredentialHome: (() => Promise<void>) | null = null;
     let scanFailure = false;
@@ -1448,7 +1449,6 @@ export class CodexSecurity {
         );
       };
       const tracker = new ScanCostTracker({
-        workerTracker,
         codexHome: runtime.codexHome,
         model,
         repository: repo,
@@ -1463,6 +1463,16 @@ export class CodexSecurity {
                   options.onActivity,
                   options.onObserverError,
                   activity,
+                ),
+        onWorkerEvent:
+          options.onWorkerEvent === undefined
+            ? undefined
+            : (event) =>
+                notifyObserver(
+                  "onWorkerEvent",
+                  options.onWorkerEvent,
+                  options.onObserverError,
+                  event,
                 ),
         onSessionEvent:
           options.onSessionEvent === undefined
@@ -2103,8 +2113,6 @@ export class CodexSecurity {
           reportProgress(progress);
         },
         onWorkerStatus: options.onWorkerStatus,
-        onWorkerEvent: options.onWorkerEvent,
-        workerTracker,
         onWarning: options.onWarning,
         onObserverError: options.onObserverError,
       });
@@ -2177,8 +2185,6 @@ export class CodexSecurity {
             model,
             onReconnect: options.onReconnect,
             onWorkerStatus: options.onWorkerStatus,
-            onWorkerEvent: options.onWorkerEvent,
-            workerTracker,
             onObserverError: options.onObserverError,
           });
           checkOpen();
@@ -2389,15 +2395,6 @@ export class CodexSecurity {
       if (runPostScan !== null && !signal.aborted) {
         try {
           for await (const event of (await runPostScan()).events) {
-            const workerEvent = workerTracker.eventFromRuntime(event);
-            if (workerEvent !== null) {
-              notifyObserver(
-                "onWorkerEvent",
-                options.onWorkerEvent,
-                options.onObserverError,
-                workerEvent,
-              );
-            }
             if (event.type === "turn.failed") {
               throw new CodexSecurityError(turnFailureMessage(event["error"]));
             }
@@ -3658,8 +3655,6 @@ interface ScanEventRunOptions {
   onActivity?: (activity: ScanActivity) => void;
   onProgress?: (progress: ScanProgress) => void;
   onWorkerStatus?: (status: ScanWorkerStatus) => void;
-  onWorkerEvent?: (event: ScanWorkerEvent) => void;
-  workerTracker?: ScanWorkerTracker;
   onWarning?: (warning: string) => void;
   onObserverError?: (observer: ScanObserverName, error: unknown) => void;
 }
@@ -3668,7 +3663,6 @@ interface ScanEventRunOptions {
 export async function runScanEvents(
   options: ScanEventRunOptions,
 ): Promise<ScanResult> {
-  const workerTracker = options.workerTracker ?? new ScanWorkerTracker();
   let scanStarted = false;
   let tacStatusReported = false;
   try {
@@ -3719,15 +3713,6 @@ export async function runScanEvents(
             options.onProgress,
             options.onObserverError,
             progress,
-          );
-        }
-        const workerEvent = workerTracker.eventFromRuntime(event);
-        if (workerEvent !== null) {
-          notifyObserver(
-            "onWorkerEvent",
-            options.onWorkerEvent,
-            options.onObserverError,
-            workerEvent,
           );
         }
         const workerStatus = workerStatusFromEvent(event);

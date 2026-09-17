@@ -3680,23 +3680,7 @@ describe("CodexSecurity orchestration", () => {
                   })}\n`,
                 );
               }
-              async function* events() {
-                for await (const event of completedEvents()) {
-                  yield event;
-                  if (event.type === "turn.started") {
-                    yield {
-                      type: "worker.spawned",
-                      dispatch_id: "spawn-1",
-                      worker_thread_id: "worker-thread",
-                    };
-                    yield {
-                      type: "worker.spawn_failed",
-                      dispatch_id: "spawn-2",
-                    };
-                  }
-                }
-              }
-              return { events: events() };
+              return { events: completedEvents() };
             },
           }),
         }),
@@ -3730,10 +3714,7 @@ describe("CodexSecurity orchestration", () => {
         ),
       ),
     ).toEqual(new Set(["thread-1:null", "worker-thread:thread-1"]));
-    expect(workers).toEqual([
-      { kind: "spawned", worker: 1 },
-      { kind: "spawn_failed" },
-    ]);
+    expect(workers).toEqual([{ kind: "observed", worker: 1 }]);
     expect(
       new Set(
         sessionEvents
@@ -3744,6 +3725,73 @@ describe("CodexSecurity orchestration", () => {
     expect(observerErrors).toEqual(["onSessionEvent"]);
     await client.close();
   });
+
+  test.each(["none", "sync", "async"] as const)(
+    "observes workers before scan completion with %s observer errors",
+    async (failure) => {
+      const root = await temporaryDirectory();
+      const repository = join(root, "repository");
+      const codexHome = join(root, "codex-home");
+      const scanDir = join(root, "scan");
+      await mkdir(repository);
+      await mkdir(codexHome);
+      await mkdir(scanDir, { mode: 0o700 });
+      const observed = Promise.withResolvers<void>();
+      const workers: ScanWorkerEvent[] = [];
+      const errors: ScanObserverName[] = [];
+      const client = new TestClient(
+        {},
+        {
+          environment: {},
+          prepareRuntime: async () => preparedRuntime(codexHome),
+          resolvePluginPython: async () => "/managed/python",
+          prepareOutputDir: async () => scanDir,
+          repositoryRevision: async () => "deadbeef",
+          createCodex: () => ({
+            startThread: () => ({
+              id: "thread-1",
+              async runStreamed() {
+                await copyCompletedScan(root);
+                await writeUsageSession(codexHome, "thread-1", {});
+                async function* events(): AsyncGenerator<ThreadEvent> {
+                  for await (const event of completedEvents()) {
+                    yield event;
+                    if (event.type === "turn.started") {
+                      await writeUsageSession(
+                        codexHome,
+                        "worker-thread",
+                        {},
+                        "thread-1",
+                      );
+                      await observed.promise;
+                    }
+                  }
+                }
+                return { events: events() };
+              },
+            }),
+          }),
+        },
+      );
+      try {
+        const result = await client.run(repository, {
+          onWorkerEvent: (event) => {
+            workers.push(event);
+            observed.resolve();
+            if (failure === "sync") throw new Error("Optional observer failed");
+            if (failure === "async")
+              return Promise.reject(new Error("Optional observer failed"));
+          },
+          onObserverError: (observer) => errors.push(observer),
+        });
+        expect(result.threadId).toBe("thread-1");
+        expect(workers).toEqual([{ kind: "observed", worker: 1 }]);
+        expect(errors).toEqual(failure === "none" ? [] : ["onWorkerEvent"]);
+      } finally {
+        await client.close();
+      }
+    },
+  );
 
   test("provides only reviewed false positives to validation as a scan artifact", async () => {
     const root = await temporaryDirectory();
@@ -4478,27 +4526,13 @@ describe("CodexSecurity orchestration", () => {
               id: "thread-1",
               async runStreamed(prompt: string) {
                 prompts.push(prompt);
-                async function* withWorkerEvents(
-                  events: AsyncGenerator<ThreadEvent>,
-                ) {
-                  yield {
-                    type: "worker.spawned",
-                    dispatch_id: "scan-worker",
-                    worker_thread_id: "worker-1",
-                  };
-                  if (prompts.length === 2) {
-                    yield {
-                      type: "worker.spawned",
-                      dispatch_id: "follow-up-worker",
-                      worker_thread_id: "worker-2",
-                    };
-                    yield {
-                      type: "worker.spawn_failed",
-                      dispatch_id: "failed-follow-up-worker",
-                    };
-                  }
-                  yield* events;
-                }
+                await writeUsageSession(codexHome, "thread-1", {});
+                await writeUsageSession(
+                  codexHome,
+                  `worker-${prompts.length}`,
+                  {},
+                  "thread-1",
+                );
                 if (prompts.length === 1 && !scanFails) {
                   await copyCompletedScan(root);
                   const coveragePath = join(scanDir, "coverage.json");
@@ -4516,12 +4550,13 @@ describe("CodexSecurity orchestration", () => {
                       createHash("sha256").update(coverage).digest("hex"),
                     ),
                   );
-                  return { events: withWorkerEvents(completedEvents()) };
+                  return { events: completedEvents() };
                 }
                 if (prompts.length === 2 && !followUpFails) {
-                  return { events: withWorkerEvents(completedEvents()) };
+                  return { events: completedEvents() };
                 }
                 async function* failedEvents(): AsyncGenerator<ThreadEvent> {
+                  yield { type: "thread.started", thread_id: "thread-1" };
                   yield {
                     type: "turn.failed",
                     error: {
@@ -4532,7 +4567,7 @@ describe("CodexSecurity orchestration", () => {
                     },
                   };
                 }
-                return { events: withWorkerEvents(failedEvents()) };
+                return { events: failedEvents() };
               },
             }),
           }),
@@ -4555,16 +4590,8 @@ describe("CodexSecurity orchestration", () => {
       }
       expect(prompts.at(-1)).toBe("Record the scan cost.");
       expect(prompts).toHaveLength(2);
-      expect(workers).toEqual([
-        { kind: "spawned", worker: 1 },
-        { kind: "spawned", worker: 2 },
-        { kind: "spawn_failed" },
-      ]);
-      expect(observerErrors).toEqual([
-        "onWorkerEvent",
-        "onWorkerEvent",
-        "onWorkerEvent",
-      ]);
+      expect(workers).toEqual([{ kind: "observed", worker: 1 }]);
+      expect(observerErrors).toEqual(["onWorkerEvent"]);
       expect(warnings).toEqual(
         followUpFails
           ? [

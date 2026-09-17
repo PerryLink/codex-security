@@ -19,9 +19,15 @@ import {
   scanProgressUpdatesFromEvent,
   type ScanProgress,
 } from "./worker-progress.js";
-import { ScanWorkerTracker } from "./worker-events.js";
 
 export { estimateScanCost, formatUsd, type ScanCost } from "./cost-model.js";
+
+/** A persisted worker session discovered during this run. Contains no model text. */
+export interface ScanWorkerEvent {
+  kind: "observed";
+  /** Scan-local number shared with activity and session observers. */
+  worker: number;
+}
 
 export interface ScanSessionEvent {
   threadId: string;
@@ -61,7 +67,6 @@ interface SessionUsage {
 }
 
 interface ScanCostTrackerOptions {
-  workerTracker?: ScanWorkerTracker;
   codexHome: string;
   model: string;
   repository?: string;
@@ -72,6 +77,7 @@ interface ScanCostTrackerOptions {
   onActivity?: (activity: ScanActivity) => void;
   onProgress?: (progress: ScanProgress) => void;
   onSessionEvent?: (event: ScanSessionEvent) => void;
+  onWorkerEvent?: (event: ScanWorkerEvent) => void;
   onError?: (error: unknown) => void;
 }
 
@@ -111,7 +117,7 @@ export class ScanCostTracker {
   readonly #options: ScanCostTrackerOptions;
   readonly #sessions = new Map<string, SessionUsage>();
   readonly #receipts = new Map<string, ScanTokenUsage | null>();
-  readonly #workerTracker: ScanWorkerTracker;
+  readonly #workers = new Map<string, number>();
   readonly #workerProgress = new Map<string, number>();
   readonly #reportedProgress = new Set<string>();
   #threadId: string | null = null;
@@ -124,7 +130,6 @@ export class ScanCostTracker {
 
   public constructor(options: ScanCostTrackerOptions) {
     this.#options = options;
-    this.#workerTracker = options.workerTracker ?? new ScanWorkerTracker();
     this.#expectedFilesTotal = options.expectedFilesTotal;
   }
 
@@ -147,7 +152,8 @@ export class ScanCostTracker {
       this.#options.onCost === undefined &&
       this.#options.onActivity === undefined &&
       this.#options.onProgress === undefined &&
-      this.#options.onSessionEvent === undefined
+      this.#options.onSessionEvent === undefined &&
+      this.#options.onWorkerEvent === undefined
     ) {
       return;
     }
@@ -282,7 +288,12 @@ export class ScanCostTracker {
       }
       let worker: number | undefined;
       if (threadId !== this.#threadId) {
-        worker = this.#workerTracker.workerNumber(threadId);
+        worker = this.#workers.get(threadId);
+        if (worker === undefined) {
+          worker = this.#workers.size + 1;
+          this.#workers.set(threadId, worker);
+          this.#options.onWorkerEvent?.({ kind: "observed", worker });
+        }
       }
       for (const event of session.events?.splice(0) ?? []) {
         this.#options.onSessionEvent?.({

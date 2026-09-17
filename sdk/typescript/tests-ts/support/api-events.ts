@@ -46,8 +46,6 @@ type ScanEventOptions = Pick<
   | "onTrustedAccessStatus"
   | "onWarning"
   | "onWorkerStatus"
-  | "onWorkerEvent"
-  | "workerTracker"
 > & { abortController?: AbortController };
 
 export function createApiTestFixtures() {
@@ -105,7 +103,7 @@ export async function* completedEvents(
 
 export function runEvents(
   scanDir: string,
-  events: Parameters<typeof runScanEvents>[0]["events"],
+  events: AsyncGenerator<ThreadEvent>,
   options: ScanEventOptions = {},
 ): ReturnType<typeof runScanEvents> {
   const { abortController = new AbortController(), ...observers } = options;

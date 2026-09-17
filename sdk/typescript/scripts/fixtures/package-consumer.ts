@@ -113,8 +113,8 @@ const options: ScanOptions = {
     progress.filesCompleted satisfies number;
   },
   onWorkerEvent(event: ScanWorkerEvent) {
-    if (event.kind === "spawned") event.worker satisfies number;
-    else event.kind satisfies "spawn_failed";
+    event.kind satisfies "observed";
+    event.worker satisfies number;
   },
 };
 
