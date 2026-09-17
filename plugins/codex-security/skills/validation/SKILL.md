@@ -13,7 +13,7 @@ Take candidate findings from discovery and produce the strongest evidence-backed
 
 ## Rust Validation
 
-For Rust candidates, read `../unsafe-rust-review/SKILL.md` and its upstream method in security-review mode. Apply its environment preparation, safe-caller reasoning, Miri/sanitizer reproduction, and bug-versus-vulnerability distinction within this validation phase. Preserve the existing candidate dispositions and artifact contract; do not start another scan or report. Pass the resolved methodology path and relevant local contract sources to any delegated Rust validator.
+For Rust candidates, read `../unsafe-rust-review/SKILL.md` and its upstream method in security-review mode. Add its environment preparation, safe-caller reasoning, Miri/sanitizer reproduction, and bug-versus-vulnerability distinction to this validation phase. Continue validating Rust candidates of every applicable vulnerability class under the existing workflow. Preserve the existing candidate dispositions and artifact contract; do not start another scan or report. Pass the resolved methodology path and relevant local contract sources to any delegated Rust validator.
 
 ## Artifact Resolution
 

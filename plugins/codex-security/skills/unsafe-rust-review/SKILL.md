@@ -5,7 +5,7 @@ description: Review Rust unsafe code and safe abstractions for soundness, undefi
 
 # Unsafe Rust Review
 
-Read [the upstream review method](references/unsafe-rust-review.md) and apply its proof obligations to the actual code, including safe callers, callbacks, traits, constructors, mutation, drop, and panic paths. This skill supplies Rust methodology; the calling workflow retains its target, permissions, scan ownership, reporting format, and validation responsibilities. Do not start another scan or produce a second set of scan reports.
+Read [the upstream review method](references/unsafe-rust-review.md) and apply its proof obligations to the actual code, including safe callers, callbacks, traits, constructors, mutation, drop, and panic paths. During an existing security scan, add these soundness checks to the full security review of Rust files. Continue the calling workflow's other vulnerability checks, including application logic and trust boundaries. The calling workflow retains its target, permissions, scan ownership, reporting format, and validation responsibilities. Do not start another scan or produce a second set of scan reports.
 
 ## Review intent
 
@@ -23,7 +23,7 @@ Preparation is subject to existing network and execution permissions. `cargo fet
 
 ## Reproduce and validate
 
-For each concrete candidate, trace the triggering safe API or external-input path, the violated contract, and the strongest counterevidence. The Standard scan owner, including each Deep worker running its own Standard audit, performs runtime validation in its authorized execution workspace; its source-review subagents return candidates and proposed reproductions. Diff validation follows its existing owner and artifact workflow. Read-only or offline execution restrictions remain in force; this skill does not elevate a worker or authorize network access.
+For each concrete candidate, trace the triggering safe API or external-input path, the violated contract, and the strongest counterevidence. The calling workflow's validation owner performs runtime validation in its authorized execution workspace; source-review subagents return candidates and proposed reproductions. Read-only or offline execution restrictions remain in force; this skill does not elevate a worker or authorize network access.
 
 Attempt a minimal reproduction against the actual library or application when runtime validation can clarify a concrete candidate. Prefer an existing test harness or a small consumer using the real dependency. Use Miri for Rust UB that it can model, and ASan or another applicable sanitizer for native/FFI or unsupported paths. Preserve the reviewed code in a disposable copy and capture the input, command, selected toolchain/features/target, and observed result. Miri needs a compatible nightly toolchain and may need setup before an offline run. Its unsupported operations, FFI limitations, or setup failures are not a clean validation result. A passing run covers that execution, not all inputs or a proof of soundness.
 

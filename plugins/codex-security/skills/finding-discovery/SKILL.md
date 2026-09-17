@@ -15,7 +15,7 @@ Standard and Deep discovery workers follow their self-contained coordinator prom
 
 ## Rust Review
 
-When the reviewed code or its directly supporting unsafe abstractions are Rust, read `../unsafe-rust-review/SKILL.md` and its upstream method in security-review mode. Use it within the current discovery pass, preserving diff scope, candidate recording, and the existing output contract. A change to safe Rust can invalidate an unsafe invariant elsewhere; follow those supporting paths. Pass the resolved skill path and available local dependency/std contract sources to delegated Rust reviewers explicitly. Return concrete soundness candidates for the existing validation phase; missing safety comments alone are not candidates.
+When the reviewed code or its directly supporting unsafe abstractions are Rust, read `../unsafe-rust-review/SKILL.md` and its upstream method in security-review mode. Add its soundness checks to the current discovery pass's full security review of Rust files, preserving diff scope, candidate recording, and the existing output contract. Continue all other applicable vulnerability checks. A change to safe Rust can invalidate an unsafe invariant elsewhere; follow those supporting paths. Pass the resolved skill path and available local dependency/std contract sources to delegated Rust reviewers explicitly. Return concrete soundness candidates for the existing validation phase; missing safety comments alone are not candidates.
 
 ## Artifact Resolution
 
