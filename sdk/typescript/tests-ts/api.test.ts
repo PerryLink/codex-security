@@ -2215,6 +2215,73 @@ describe("CodexSecurity orchestration", () => {
     await client.close();
   });
 
+  test.each(["complete", "failed"])(
+    "preserves the %s scan outcome when execution lock cleanup fails",
+    async (outcome) => {
+      const root = await temporaryDirectory();
+      const repository = join(root, "repository");
+      const codexHome = join(root, "codex-home");
+      const scanDir = join(root, "scan");
+      const knowledgeBase = join(root, "context.txt");
+      await Promise.all([mkdir(repository), mkdir(codexHome)]);
+      await writeFile(knowledgeBase, "Synthetic project context.\n");
+      const failure = new Error("Synthetic scan failure.");
+      const warnings: string[] = [];
+      const observerErrors: string[] = [];
+      let preparedKnowledgeBase: string | undefined;
+      const client = new TestClient(
+        {},
+        {
+          environment: {},
+          prepareRuntime: async () => preparedRuntime(codexHome),
+          resolvePluginPython: async () => "/managed/python",
+          repositoryRevision: async () => "deadbeef",
+          acquireScanExecution: async () => () => {
+            throw new Error("Synthetic execution lock cleanup failure.");
+          },
+          createCodex: (options: CodexOptions) => ({
+            startThread: () => ({
+              id: null,
+              async runStreamed() {
+                preparedKnowledgeBase =
+                  options.env?.["CODEX_SECURITY_KNOWLEDGE_BASE"];
+                if (outcome === "failed") throw failure;
+                await copyCompletedScan(root);
+                return { events: completedEvents() };
+              },
+            }),
+          }),
+        },
+      );
+      try {
+        const result = client.run(repository, {
+          knowledgeBasePaths: [knowledgeBase],
+          outputDir: scanDir,
+          onWarning: (warning) => {
+            warnings.push(warning);
+            throw new Error("Synthetic warning observer failure.");
+          },
+          onObserverError: (_observer, error) => {
+            observerErrors.push((error as Error).message);
+          },
+        });
+        if (outcome === "failed") await expect(result).rejects.toBe(failure);
+        else
+          expect((await result).manifest.scan.id).toBe("scan_example_001");
+        expect(warnings).toContain(
+          "Could not clean up after the Codex Security scan: Synthetic execution lock cleanup failure.",
+        );
+        expect(observerErrors).toContain("Synthetic warning observer failure.");
+        expect(preparedKnowledgeBase).toBeDefined();
+        await expect(stat(preparedKnowledgeBase!)).rejects.toMatchObject({
+          code: "ENOENT",
+        });
+      } finally {
+        await client.close();
+      }
+    },
+  );
+
   test("rejects overlapping scan output before runtime initialization", async () => {
     const root = await temporaryDirectory();
     const repository = join(root, "repository");

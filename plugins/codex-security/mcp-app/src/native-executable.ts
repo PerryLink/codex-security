@@ -9,7 +9,9 @@ export async function snapshotNativeEnvironment(): Promise<Record<string, string
       .map(([name, value]) => [process.platform === "win32" ? name.toUpperCase() : name, value])
   );
   const codexHome = environment.CODEX_HOME;
-  if (codexHome !== undefined && codexHome.length > 0) {
+  if (codexHome !== undefined && codexHome.length > 0 && !codexHome.trim()) {
+    delete environment.CODEX_HOME;
+  } else if (codexHome !== undefined && codexHome.length > 0) {
     // Resolve symlink/.. paths before consumers normalize them or change cwd.
     environment.CODEX_HOME = await fs.realpath(codexHome);
   }
