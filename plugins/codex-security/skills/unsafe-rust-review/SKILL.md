@@ -33,4 +33,4 @@ Connect a Miri or sanitizer failure to the actual violated Rust or native contra
 
 Use the calling workflow's existing evidence and artifact storage. A standalone review that creates retained artifacts follows [artifact storage](../../references/artifact-storage.md); a review answered only in chat needs no artifact collection. Keep proposed reproduction steps distinct from executed results.
 
-The detailed method is vendored from Google's `rust-skills` project. See [upstream attribution and update notes](references/UPSTREAM.md) and its [Apache 2.0 license](references/LICENSE.txt).
+The detailed method is vendored from Google's `rust-skills` project. See [upstream attribution, licensing, and update notes](references/UPSTREAM.md).

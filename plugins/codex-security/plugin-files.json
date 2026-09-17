@@ -139,7 +139,6 @@
     "skills/triage-finding/references/triage-result-contract.md",
     "skills/unsafe-rust-review/SKILL.md",
     "skills/unsafe-rust-review/agents/openai.yaml",
-    "skills/unsafe-rust-review/references/LICENSE.txt",
     "skills/unsafe-rust-review/references/UPSTREAM.md",
     "skills/unsafe-rust-review/references/unsafe-rust-review.md",
     "skills/validation/SKILL.md",

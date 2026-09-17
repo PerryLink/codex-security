@@ -3,7 +3,7 @@ name: unsafe-rust-review
 description: Write and review unsafe Rust `# Safety` documentation and safety comments (e.g., `// safety:` or `/// safety:` in any capitalization) as proof obligations grounded in the Rust Reference, standard library documentation, trusted opted-in dependency contracts, and explicit project invariants.
 ---
 
-<!-- Vendored from google/rust-skills at 4b4f8b25d19c5ad3ad78b23c4c55ac35adad75a3. Prose line wrapping was changed for this repository; wording and fenced examples are unchanged. See UPSTREAM.md and LICENSE.txt. -->
+<!-- Vendored from google/rust-skills at 4b4f8b25d19c5ad3ad78b23c4c55ac35adad75a3. Prose line wrapping was changed for this repository; wording and fenced examples are unchanged. See UPSTREAM.md for attribution and licensing. -->
 
 # Unsafe Rust Safety Documentation and Commenting Skill
 
