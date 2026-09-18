@@ -216,7 +216,10 @@ async function testScanGuidance(runtime, runtimePluginRoot, runtimeLabel) {
       assert.ok(text.startsWith(`${originalContextText}\n\n`), `${label}: append to original text`);
       const skillPath = path.join(runtimePluginRoot, "skills", "unsafe-rust-review", "SKILL.md");
       assert.ok(path.isAbsolute(skillPath));
-      assert.ok(text.includes(skillPath), `${label}: name the runtime's absolute Rust skill path`);
+      assert.ok(
+        text.match(/"(?:[^"\\]|\\.)*"/g)?.some((quoted) => JSON.parse(quoted) === skillPath),
+        `${label}: name the runtime's absolute Rust skill path`
+      );
       const guidance = text.slice(originalContextText.length);
       assert.match(guidance, /supplement/i, `${label}: methodology supplements the scan workflow`);
       assert.match(guidance, /read/i, `${label}: instruct the reviewer to read the methodology`);
