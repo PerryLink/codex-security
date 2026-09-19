@@ -8,6 +8,7 @@
 - bump the codex group across 3 directories with 2 updates ([#968](https://github.com/openai/codex-security/pull/968))
 - build the native runtime without the SDK ([#965](https://github.com/openai/codex-security/pull/965))
 - set up Python for Windows package verification ([#966](https://github.com/openai/codex-security/pull/966))
+- report full-output scan failures as errors ([#971](https://github.com/openai/codex-security/pull/971))
 <!-- release-section: highlights:end -->
 
 <!-- release-section: upgrades:start -->
