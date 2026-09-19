@@ -7,6 +7,7 @@
 - bump ruff from 0.16.6 to 0.16.7 in /plugins/codex-security ([#967](https://github.com/openai/codex-security/pull/967))
 - bump the codex group across 3 directories with 2 updates ([#968](https://github.com/openai/codex-security/pull/968))
 - build the native runtime without the SDK ([#965](https://github.com/openai/codex-security/pull/965))
+- set up Python for Windows package verification ([#966](https://github.com/openai/codex-security/pull/966))
 <!-- release-section: highlights:end -->
 
 <!-- release-section: upgrades:start -->
