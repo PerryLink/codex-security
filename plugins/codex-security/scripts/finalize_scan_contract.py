@@ -1217,6 +1217,31 @@ def _populate_unsealed_artifact_envelope(
         coverage["excludePaths"] = copy.deepcopy(scope["excludePaths"])
 
 
+def _populate_unsealed_coverage_warnings(
+    coverage: dict[str, Any], completion_warnings: list[str] | None
+) -> None:
+    """Seal run-level completion warnings into the coverage document.
+
+    Run warnings reach only the sealing callers, and the SARIF projection reads
+    sealed documents alone. Recording them here is what makes a completed run's
+    warnings -- target drift above all -- visible to every export path.
+    """
+
+    warnings = _completion_warning_strings(completion_warnings)
+    if warnings:
+        coverage["warnings"] = warnings
+    else:
+        coverage.pop("warnings", None)
+
+
+def _completion_warning_strings(warnings: list[str] | None) -> list[str]:
+    recorded: list[str] = []
+    for warning in warnings or []:
+        if isinstance(warning, str) and warning.strip() and warning not in recorded:
+            recorded.append(warning)
+    return recorded
+
+
 def _normalize_unsealed_open_questions(coverage: dict[str, Any]) -> None:
     """Keep only schema-valid optional open-question rows without inventing content."""
 
@@ -2418,6 +2443,32 @@ def _read_sealed_scan(
     return manifest, findings, coverage, findings_bytes
 
 
+def _sarif_invocation(
+    execution_successful: bool, notifications: list[dict[str, Any]]
+) -> dict[str, Any]:
+    return {
+        "executionSuccessful": execution_successful,
+        "toolExecutionNotifications": notifications,
+    }
+
+
+def _sarif_notifications(coverage: dict[str, Any], run_warnings: list[str]) -> list[dict[str, Any]]:
+    """Merge sealed run warnings into the deferred-coverage notifications.
+
+    Discarded findings and coverage recovery warnings already reach SARIF as
+    deferred rows, so only warnings with no deferred row of their own are added,
+    which keeps one notification per warning.
+    """
+
+    deferred = coverage["deferred"]
+    deferred_reasons = {item["reason"] for item in deferred}
+    return [
+        {"level": "warning", "message": {"text": warning}}
+        for warning in run_warnings
+        if warning not in deferred_reasons
+    ] + [{"level": "warning", "message": {"text": item["reason"]}} for item in deferred]
+
+
 def build_sarif_projection(
     scan_dir: Path, source_root: Path | None = None, schema_dir: Path | None = None
 ) -> dict[str, Any]:
@@ -2432,17 +2483,12 @@ def build_sarif_projection(
     manifest, findings, coverage, _ = _read_sealed_scan(scan_dir, schema_dir, "SARIF projection")
     sarif = build_sarif(manifest, findings, source_root)
     execution_successful = manifest["scan"]["status"] == "completed"
-    if not execution_successful or coverage["completeness"] != "complete":
+    run_warnings = _completion_warning_strings(coverage.get("warnings"))
+    if not execution_successful or coverage["completeness"] != "complete" or run_warnings:
         run = sarif["runs"][0]
         run["properties"]["codexSecurityCoverageCompleteness"] = coverage["completeness"]
         run["invocations"] = [
-            {
-                "executionSuccessful": execution_successful,
-                "toolExecutionNotifications": [
-                    {"level": "warning", "message": {"text": item["reason"]}}
-                    for item in coverage["deferred"]
-                ],
-            }
+            _sarif_invocation(execution_successful, _sarif_notifications(coverage, run_warnings))
         ]
     _validate_sarif(sarif)
     return sarif
@@ -2769,6 +2815,7 @@ def _prepare_scan_finalization(
             report_markdown_bytes,
         )
 
+    _populate_unsealed_coverage_warnings(coverage, completion_warnings)
     findings_bytes = _contract_json_bytes("findings.json", findings)
     coverage_bytes = _contract_json_bytes("coverage.json", coverage)
     report_markdown_bytes = _generate_report_projection(manifest, findings, coverage)
