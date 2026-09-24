@@ -87,6 +87,25 @@ def test_deep_completion_seals_target_drift_warning(tmp_path: Path) -> None:
     ]
 
 
+def test_deep_completion_reseals_warning_after_preparation(tmp_path: Path) -> None:
+    state_dir, scan_id, scan_dir = _start_deep_scan_with_draft_findings(tmp_path)
+    run_workbench(state_dir, "prepare-scan-completion", "--scan-id", scan_id)
+    manifest_path = scan_dir / "scan-manifest.json"
+    prepared_manifest = manifest_path.read_bytes()
+    (tmp_path / "target" / "changed.txt").write_text("changed after preparation")
+
+    completed = run_workbench(state_dir, "complete-scan", "--scan-id", scan_id)["scan"]
+
+    warning = completed["warnings"][0]
+    coverage = json.loads((scan_dir / "coverage.json").read_text())
+    sarif = json.loads((scan_dir / "exports" / "results.sarif").read_text())
+    assert prepared_manifest != manifest_path.read_bytes()
+    assert coverage["warnings"] == [warning]
+    assert sarif["runs"][0]["invocations"][0]["toolExecutionNotifications"] == [
+        {"level": "warning", "message": {"text": warning}}
+    ]
+
+
 def test_warning_detected_after_preparation_reaches_sarif(
     tmp_path: Path, workbench_api: dict[str, Any], monkeypatch: Any
 ) -> None:

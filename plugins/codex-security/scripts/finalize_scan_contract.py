@@ -2769,26 +2769,31 @@ def _prepare_scan_finalization(
     )
     _require_derived_writeup_files(scan_dir, findings)
     _require_hardening_portfolio_file(scan_dir, scan)
+    if refresh_completion_warnings is not None:
+        refresh_completion_warnings()
     if was_sealed:
         _validate_sealed_coverage_receipts(scan, coverage)
         _validate_manifest(manifest)
         validate_against_schema(manifest, schema_dir / "scan-manifest.schema.json")
         validate_against_schema(findings_for_validation, schema_dir / "findings.schema.json")
         validate_against_schema(coverage, schema_dir / "coverage.schema.json")
-        report_markdown_bytes = _generate_report_projection(manifest, findings, coverage)
-        _validate_report_output_paths(scan_dir)
-        return (
-            scan_dir,
-            schema_dir,
-            manifest,
-            findings,
-            coverage,
-            was_sealed,
-            report_markdown_bytes,
-        )
+        if not any(
+            warning not in coverage.get("warnings", [])
+            for warning in _completion_warning_strings(completion_warnings)
+        ):
+            report_markdown_bytes = _generate_report_projection(manifest, findings, coverage)
+            _validate_report_output_paths(scan_dir)
+            return (
+                scan_dir,
+                schema_dir,
+                manifest,
+                findings,
+                coverage,
+                was_sealed,
+                report_markdown_bytes,
+            )
+        was_sealed = False
 
-    if refresh_completion_warnings is not None:
-        refresh_completion_warnings()
     warnings = _completion_warning_strings(
         [*coverage.get("warnings", []), *(completion_warnings or [])]
     )
