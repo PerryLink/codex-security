@@ -2442,9 +2442,8 @@ def build_sarif_projection(
         run["properties"]["codexSecurityCoverageCompleteness"] = coverage["completeness"]
         deferred_reasons = [item["reason"] for item in coverage["deferred"]]
         notification_reasons = [
-            *(warning for warning in run_warnings if warning not in deferred_reasons),
-            *deferred_reasons,
-        ]
+            warning for warning in run_warnings if warning not in deferred_reasons
+        ] + deferred_reasons
         run["invocations"] = [
             {
                 "executionSuccessful": execution_successful,
@@ -2771,10 +2770,7 @@ def _prepare_scan_finalization(
         validate_against_schema(manifest, schema_dir / "scan-manifest.schema.json")
         validate_against_schema(findings_for_validation, schema_dir / "findings.schema.json")
         validate_against_schema(coverage, schema_dir / "coverage.schema.json")
-        if not any(
-            warning not in coverage.get("warnings", [])
-            for warning in _unique_warnings(completion_warnings)
-        ):
+        if all(warning in coverage.get("warnings", []) for warning in completion_warnings or []):
             report_markdown_bytes = _generate_report_projection(manifest, findings, coverage)
             _validate_report_output_paths(scan_dir)
             return (

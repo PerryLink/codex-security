@@ -1543,7 +1543,9 @@ def complete_scan_locked(
             if scan["mode"] != "deep" and current_manifest_path is not None and not already_sealed
             else None,
         )
-        snapshots = saved_results._snapshot_published_outputs(scan_dir) if already_sealed else {}
+        snapshots = saved_results._snapshot_published_outputs(
+            scan_dir, ARTIFACTS.values() if already_sealed else ()
+        )
         wrote = True
         try:
             manifest, findings, _ = _write_prepared_scan_finalization(prepared)

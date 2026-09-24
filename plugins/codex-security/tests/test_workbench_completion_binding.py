@@ -135,6 +135,24 @@ def test_reseal_failure_preserves_prepared_scan(
     writer_globals["build_sarif_projection"](scan_dir)
 
 
+def test_reseal_keeps_optional_sarif_export_failure_optional(tmp_path: Path) -> None:
+    state_dir, scan_id, scan_dir = _start_deep_scan_with_draft_findings(tmp_path)
+    run_workbench(state_dir, "prepare-scan-completion", "--scan-id", scan_id)
+    sarif_path = scan_dir / "exports" / "results.sarif"
+    sarif_path.unlink()
+    outside = tmp_path / "unrelated.sarif"
+    outside.write_text("unchanged")
+    sarif_path.symlink_to(outside)
+    (tmp_path / "target" / "changed.txt").write_text("changed after preparation")
+
+    run_workbench(state_dir, "complete-scan", "--scan-id", scan_id)
+
+    assert (
+        json.loads((scan_dir / "scan-manifest.json").read_text())["scan"]["status"] == "completed"
+    )
+    assert outside.read_text() == "unchanged"
+
+
 def test_warning_detected_after_preparation_reaches_sarif(
     tmp_path: Path, workbench_api: dict[str, Any], monkeypatch: Any
 ) -> None:
