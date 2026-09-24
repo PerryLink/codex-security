@@ -10,6 +10,7 @@ from contextlib import closing
 from pathlib import Path
 from typing import Any
 
+import pytest
 from workbench_test_support import (
     create_saved_workspace,
     initialize_git_repository,
@@ -104,6 +105,34 @@ def test_deep_completion_reseals_warning_after_preparation(tmp_path: Path) -> No
     assert sarif["runs"][0]["invocations"][0]["toolExecutionNotifications"] == [
         {"level": "warning", "message": {"text": warning}}
     ]
+
+
+def test_reseal_failure_preserves_prepared_scan(
+    tmp_path: Path, workbench_api: dict[str, Any], monkeypatch: Any
+) -> None:
+    state_dir, scan_id, scan_dir = _start_deep_scan_with_draft_findings(tmp_path)
+    run_workbench(state_dir, "prepare-scan-completion", "--scan-id", scan_id)
+    original_manifest = (scan_dir / "scan-manifest.json").read_bytes()
+    original_coverage = (scan_dir / "coverage.json").read_bytes()
+    (tmp_path / "target" / "changed.txt").write_text("changed after preparation")
+    monkeypatch.setenv("CODEX_SECURITY_STATE_DIR", str(state_dir))
+
+    writer_globals = workbench_api["_write_prepared_scan_finalization"].__globals__
+    write_json = writer_globals["_write_scan_local_json"]
+
+    def fail_manifest(directory: Path, name: str, payload: Any) -> None:
+        if name == "scan-manifest.json":
+            raise writer_globals["ContractError"]("synthetic manifest write failure")
+        write_json(directory, name, payload)
+
+    monkeypatch.setitem(writer_globals, "_write_scan_local_json", fail_manifest)
+    with closing(workbench_api["connect"]()) as connection:
+        with pytest.raises(SystemExit, match="synthetic manifest write failure"):
+            workbench_api["complete_scan_locked"](connection, scan_id, None, None)
+
+    assert (scan_dir / "scan-manifest.json").read_bytes() == original_manifest
+    assert (scan_dir / "coverage.json").read_bytes() == original_coverage
+    writer_globals["build_sarif_projection"](scan_dir)
 
 
 def test_warning_detected_after_preparation_reaches_sarif(

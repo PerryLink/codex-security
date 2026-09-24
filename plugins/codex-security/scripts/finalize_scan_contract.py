@@ -1217,12 +1217,8 @@ def _populate_unsealed_artifact_envelope(
         coverage["excludePaths"] = copy.deepcopy(scope["excludePaths"])
 
 
-def _completion_warning_strings(warnings: list[str] | None) -> list[str]:
-    recorded: list[str] = []
-    for warning in warnings or []:
-        if isinstance(warning, str) and warning.strip() and warning not in recorded:
-            recorded.append(warning)
-    return recorded
+def _unique_warnings(warnings: list[str] | None) -> list[str]:
+    return list(dict.fromkeys(warnings or []))
 
 
 def _normalize_unsealed_open_questions(coverage: dict[str, Any]) -> None:
@@ -2440,24 +2436,22 @@ def build_sarif_projection(
     manifest, findings, coverage, _ = _read_sealed_scan(scan_dir, schema_dir, "SARIF projection")
     sarif = build_sarif(manifest, findings, source_root)
     execution_successful = manifest["scan"]["status"] == "completed"
-    run_warnings = _completion_warning_strings(coverage.get("warnings"))
+    run_warnings = _unique_warnings(coverage.get("warnings"))
     if not execution_successful or coverage["completeness"] != "complete" or run_warnings:
         run = sarif["runs"][0]
         run["properties"]["codexSecurityCoverageCompleteness"] = coverage["completeness"]
-        deferred_reasons = {item["reason"] for item in coverage["deferred"]}
-        notifications = [
-            {"level": "warning", "message": {"text": warning}}
-            for warning in run_warnings
-            if warning not in deferred_reasons
+        deferred_reasons = [item["reason"] for item in coverage["deferred"]]
+        notification_reasons = [
+            *(warning for warning in run_warnings if warning not in deferred_reasons),
+            *deferred_reasons,
         ]
-        notifications.extend(
-            {"level": "warning", "message": {"text": item["reason"]}}
-            for item in coverage["deferred"]
-        )
         run["invocations"] = [
             {
                 "executionSuccessful": execution_successful,
-                "toolExecutionNotifications": notifications,
+                "toolExecutionNotifications": [
+                    {"level": "warning", "message": {"text": reason}}
+                    for reason in notification_reasons
+                ],
             }
         ]
     _validate_sarif(sarif)
@@ -2779,7 +2773,7 @@ def _prepare_scan_finalization(
         validate_against_schema(coverage, schema_dir / "coverage.schema.json")
         if not any(
             warning not in coverage.get("warnings", [])
-            for warning in _completion_warning_strings(completion_warnings)
+            for warning in _unique_warnings(completion_warnings)
         ):
             report_markdown_bytes = _generate_report_projection(manifest, findings, coverage)
             _validate_report_output_paths(scan_dir)
@@ -2794,9 +2788,7 @@ def _prepare_scan_finalization(
             )
         was_sealed = False
 
-    warnings = _completion_warning_strings(
-        [*coverage.get("warnings", []), *(completion_warnings or [])]
-    )
+    warnings = _unique_warnings([*coverage.get("warnings", []), *(completion_warnings or [])])
     if warnings:
         coverage["warnings"] = warnings
     else:
